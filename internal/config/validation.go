@@ -64,6 +64,10 @@ func (configuration Config) Validate() error {
 	)
 	validationErrors = append(
 		validationErrors,
+		validateSourceAddressPolicy(configuration.SourceAddressPolicy)...,
+	)
+	validationErrors = append(
+		validationErrors,
 		validateEmulationAddressGuardCompatibility(
 			configuration.Emulation,
 			configuration.AddressGuard,
@@ -296,6 +300,69 @@ func validateEmulation(configuration EmulationConfig) ValidationErrors {
 		validationErrors,
 		validateAddressList("emulation.virtual_source_addresses", configuration.VirtualSourceAddresses)...,
 	)
+
+	return validationErrors
+}
+
+func validateSourceAddressPolicy(configuration SourceAddressPolicyConfig) ValidationErrors {
+	validationErrors := make(ValidationErrors, 0)
+
+	reservationMode := strings.TrimSpace(configuration.ReservationMode)
+	if reservationMode == "" {
+		reservationMode = SourceAddressReservationModeSoft
+	}
+
+	switch reservationMode {
+	case SourceAddressReservationModeSoft, SourceAddressReservationModeDisabled:
+	default:
+		validationErrors = append(validationErrors, ValidationError{
+			Code:    "source_address_policy.reservation_mode.invalid",
+			Field:   "source_address_policy.reservation_mode",
+			Message: "reservation mode must be either soft or disabled",
+		})
+	}
+
+	validationErrors = append(
+		validationErrors,
+		validateAddressList(
+			"source_address_policy.allowed_addresses",
+			configuration.AllowedAddresses,
+		)...,
+	)
+	validationErrors = append(
+		validationErrors,
+		validateAddressList(
+			"source_address_policy.blocked_addresses",
+			configuration.BlockedAddresses,
+		)...,
+	)
+	validationErrors = append(
+		validationErrors,
+		validateAddressList(
+			"source_address_policy.soft_reserved_addresses",
+			configuration.SoftReservedAddresses,
+		)...,
+	)
+
+	blockedAddressSet := buildAddressSet(configuration.BlockedAddresses)
+	overlapAddressSet := make(map[uint8]struct{})
+
+	for _, allowedAddress := range configuration.AllowedAddresses {
+		if _, blocked := blockedAddressSet[allowedAddress]; !blocked {
+			continue
+		}
+
+		if _, alreadyReported := overlapAddressSet[allowedAddress]; alreadyReported {
+			continue
+		}
+
+		validationErrors = append(validationErrors, ValidationError{
+			Code:    "source_address_policy.address.overlap",
+			Field:   "source_address_policy",
+			Message: fmt.Sprintf("address 0x%02X cannot be both allowed and blocked", allowedAddress),
+		})
+		overlapAddressSet[allowedAddress] = struct{}{}
+	}
 
 	return validationErrors
 }

@@ -190,6 +190,53 @@ func TestValidateRejectsDisabledPoliciesWithData(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidSourceAddressPolicy(t *testing.T) {
+	configuration := validConfiguration()
+	configuration.SourceAddressPolicy = SourceAddressPolicyConfig{
+		ReservationMode:       "strict",
+		AllowedAddresses:      []uint8{0x31, 0x31, 0x00},
+		BlockedAddresses:      []uint8{0x31},
+		SoftReservedAddresses: []uint8{0xFF},
+	}
+
+	expectedErrors := ValidationErrors{
+		{
+			Code:    "source_address_policy.reservation_mode.invalid",
+			Field:   "source_address_policy.reservation_mode",
+			Message: "reservation mode must be either soft or disabled",
+		},
+		{
+			Code:    "address.duplicate",
+			Field:   "source_address_policy.allowed_addresses[1]",
+			Message: "address 0x31 is duplicated",
+		},
+		{
+			Code:    "address.invalid_reserved",
+			Field:   "source_address_policy.allowed_addresses[2]",
+			Message: "address 0x00 is reserved",
+		},
+		{
+			Code:    "address.invalid_reserved",
+			Field:   "source_address_policy.soft_reserved_addresses[0]",
+			Message: "address 0xFF is reserved",
+		},
+		{
+			Code:    "source_address_policy.address.overlap",
+			Field:   "source_address_policy",
+			Message: "address 0x31 cannot be both allowed and blocked",
+		},
+	}
+
+	actualErrors, ok := Validate(configuration).(ValidationErrors)
+	if !ok {
+		t.Fatalf("expected ValidationErrors type")
+	}
+
+	if !reflect.DeepEqual(actualErrors, expectedErrors) {
+		t.Fatalf("unexpected validation errors:\nexpected: %#v\nactual: %#v", expectedErrors, actualErrors)
+	}
+}
+
 func validConfiguration() Config {
 	return Config{
 		Southbound: SouthboundConfig{
@@ -218,6 +265,9 @@ func validConfiguration() Config {
 		Emulation: EmulationConfig{
 			Enabled:                true,
 			VirtualSourceAddresses: []uint8{0x21},
+		},
+		SourceAddressPolicy: SourceAddressPolicyConfig{
+			ReservationMode: SourceAddressReservationModeSoft,
 		},
 	}
 }

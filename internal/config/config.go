@@ -5,15 +5,19 @@ import "time"
 const (
 	SouthboundTransportSerial = "serial"
 	SouthboundTransportTCP    = "tcp"
+
+	SourceAddressReservationModeSoft     = "soft"
+	SourceAddressReservationModeDisabled = "disabled"
 )
 
 type Config struct {
-	Southbound   SouthboundConfig
-	Northbound   NorthboundConfig
-	Clients      ClientsConfig
-	Scheduler    SchedulerConfig
-	AddressGuard AddressGuardConfig
-	Emulation    EmulationConfig
+	Southbound          SouthboundConfig
+	Northbound          NorthboundConfig
+	Clients             ClientsConfig
+	Scheduler           SchedulerConfig
+	AddressGuard        AddressGuardConfig
+	Emulation           EmulationConfig
+	SourceAddressPolicy SourceAddressPolicyConfig
 }
 
 type SouthboundConfig struct {
@@ -55,4 +59,11 @@ type AddressGuardConfig struct {
 type EmulationConfig struct {
 	Enabled                bool
 	VirtualSourceAddresses []uint8
+}
+
+type SourceAddressPolicyConfig struct {
+	AllowedAddresses      []uint8
+	BlockedAddresses      []uint8
+	SoftReservedAddresses []uint8
+	ReservationMode       string
 }
