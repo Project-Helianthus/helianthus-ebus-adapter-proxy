@@ -29,6 +29,7 @@
 - Lease manager tests must cover `Acquire`/`Renew`/`Release`/`Expire` lifecycle behavior, including `ExpiresAt <= now` boundary behavior.
 - Lease conflict tests must assert stable conflict codes for address contention, duplicate owner acquire, missing owner lease, and expired owner lease.
 - Lease concurrency tests must cover simultaneous lease contention (single address and multi-address pools) and assert one active winner per address.
+- Compatibility harness tests must prove identical direct-vs-proxy request/response exchanges for representative ebusd command sets under deterministic local topology.
 - Prefer deterministic assertions (stable counters/order, injected clocks) over sleep-based timing assertions.
 
 ## Terminology

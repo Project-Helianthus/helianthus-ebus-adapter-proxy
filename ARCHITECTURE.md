@@ -29,6 +29,15 @@
 6. Build scheduler candidates from per-session queue depth and choose next writer via `AdaptiveScheduler`.
 7. Route selected frames through domain/proxy orchestration toward upstream publication.
 
+## Compatibility harness path (M4)
+
+1. Start a deterministic local mock adapter endpoint that accepts representative ENH requests.
+2. Start a local proxy endpoint that forwards command/response bytes to the adapter endpoint.
+3. Run the same command set directly against the adapter endpoint.
+4. Re-run the same command set against the proxy endpoint without changing command payloads (only `host:port` changes).
+5. Compare request/response pairs byte-for-byte and emit stable pass/fail lines.
+6. Report final `RESULT: PASS|FAIL` to prove or reject config-only migration behavior.
+
 ## Session behavior
 
 - Northbound listeners expose deterministic lifecycle hooks: connect, disconnect, error.
