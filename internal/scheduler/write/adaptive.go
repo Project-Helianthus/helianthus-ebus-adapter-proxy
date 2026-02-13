@@ -10,6 +10,12 @@ type Candidate struct {
 	QueueDepth int
 }
 
+type SessionQueueSnapshot struct {
+	SessionID     uint64
+	Connected     bool
+	OutboundDepth int
+}
+
 type Options struct {
 	StarvationAfter int
 }
@@ -154,4 +160,26 @@ func normalizeCandidates(candidates []Candidate) []Candidate {
 	})
 
 	return normalized
+}
+
+func CandidatesFromSessionQueueSnapshots(
+	snapshots []SessionQueueSnapshot,
+) []Candidate {
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	candidates := make([]Candidate, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if !snapshot.Connected {
+			continue
+		}
+
+		candidates = append(candidates, Candidate{
+			SessionID:  snapshot.SessionID,
+			QueueDepth: snapshot.OutboundDepth,
+		})
+	}
+
+	return normalizeCandidates(candidates)
 }
