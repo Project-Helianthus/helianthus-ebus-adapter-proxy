@@ -12,12 +12,28 @@ PROHIBITED_TERMS=(
   "blacklist"
 )
 
+if command -v rg >/dev/null 2>&1; then
+  search_prohibited_term() {
+    local term="$1"
+    rg -n -i -w \
+      --hidden \
+      --glob '!.git' \
+      --glob '!scripts/terminology-gate.sh' \
+      "${term}" .
+  }
+else
+  search_prohibited_term() {
+    local term="$1"
+    grep -R -n -i -w -E \
+      --binary-files=without-match \
+      --exclude-dir='.git' \
+      --exclude='terminology-gate.sh' \
+      "${term}" .
+  }
+fi
+
 for term in "${PROHIBITED_TERMS[@]}"; do
-  if rg -n -i -w \
-    --hidden \
-    --glob '!.git' \
-    --glob '!scripts/terminology-gate.sh' \
-    "${term}" .; then
+  if search_prohibited_term "${term}"; then
     echo "Terminology gate failed: found prohibited term '${term}'."
     exit 1
   fi
