@@ -44,6 +44,13 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Recent-activity guard blocks addresses observed within the configured activity window for new leases; at the exact window boundary the address becomes eligible again.
 - When every candidate is filtered only by recent activity, selection returns `ErrRecentlyActiveAddress`; otherwise exhaustion returns `ErrNoSourceAddressAvailable`.
 
+## M4 integration path map (#14/#15/#16/#17)
+
+- Issue #14 (`scripts/run-ebusd-compat-harness.sh`): validates config-only ebusd migration and emits `RESULT: PASS|FAIL` in `.verify/issue14/ebusd-compat-harness.log`.
+- Issue #15 (`scripts/run-gateway-direct-proxy-smoke.sh`): validates gateway `enh://`/`ens://` direct-proxy transport and emits `PASS|FAIL: gateway path readiness profile=...`.
+- Issue #16 (HA add-on linkage): aligns `proxy_profile` + `proxy_endpoint` semantics with `../helianthus-ha-addon/README.md` and `../helianthus-ha-addon/SMOKE_RUNBOOK.md`.
+- Issue #17 (`scripts/run-ha-integration-dual-topology-smoke.sh`): validates coexistence (`ebusd` + adapter-proxy) and requires `CHECK_DUAL_TOPOLOGY_PATH` readiness markers.
+
 ## ebusd compatibility harness (M4)
 
 - Goal: prove config-only migration for ebusd clients by switching only `host:port` from direct adapter endpoint to proxy endpoint.
@@ -83,9 +90,7 @@ RESULT: FAIL (proxy responses diverge from direct endpoint)
 - Smoke profile templates for gateway live in:
   - `profiles/gateway-direct-proxy/agent-local.enh.md`
   - `profiles/gateway-direct-proxy/agent-local.ens.md`
-- HA add-on proxy topology profile references (aligned with `d3vi1/helianthus-ha-addon#30` / PR `#31`) live in:
-  - `../helianthus-ha-addon/README.md` (transition config includes `proxy_profile` and `proxy_endpoint`)
-  - `../helianthus-ha-addon/SMOKE_RUNBOOK.md` (proxy topology + deterministic smoke checklist)
+- HA add-on profile linkage details are tracked in issue #16 section below.
 - Cross-repo smoke runner:
   - `scripts/run-gateway-direct-proxy-smoke.sh`
 - Dual-topology smoke notes:
@@ -140,6 +145,25 @@ Deterministic failure shape for gateway path readiness:
 FAIL: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://127.0.0.1:<port> (see <repo>/.verify/issue15/gateway-smoke-<profile>.log)
 ```
 
+## HA add-on proxy profile linkage (M4, issue #16)
+
+- Coordination target: `d3vi1/helianthus-ha-addon#30` / PR `#31`.
+- Cross-repo profile configuration and smoke runbook live in:
+  - `../helianthus-ha-addon/README.md`
+  - `../helianthus-ha-addon/SMOKE_RUNBOOK.md`
+- Deterministic checklist markers must include:
+  - `[PASS] CHECK_LOG_PROXY_PROFILE :: ...`
+  - `[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...`
+
+Cross-repo setup:
+
+```bash
+cd ../helianthus-ha-addon
+git checkout main
+git pull --ff-only origin main
+cd ../helianthus-ebus-adapter-proxy
+```
+
 HA add-on proxy marker checklist (ENH example):
 
 ```bash
@@ -156,8 +180,8 @@ python3 scripts/smoke_addon_checklist.py \
 Expected proxy marker checks in checklist output:
 
 ```text
-PASS CHECK_LOG_PROXY_PROFILE ...
-PASS CHECK_LOG_PROXY_ENDPOINT ...
+[PASS] CHECK_LOG_PROXY_PROFILE :: ...
+[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...
 ```
 
 ## HA integration dual-topology smoke path (M4, issue #17)

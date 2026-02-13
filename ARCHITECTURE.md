@@ -38,6 +38,16 @@
 5. Compare request/response pairs byte-for-byte and emit stable pass/fail lines.
 6. Report final `RESULT: PASS|FAIL` to prove or reject config-only migration behavior.
 
+## Integration runtime flow and readiness markers (M4)
+
+1. Run issue #14 harness (`scripts/run-ebusd-compat-harness.sh`) to prove config-only direct-to-proxy endpoint switch for ebusd commands.
+2. Treat `RESULT: PASS ...` as readiness for compatibility; `RESULT: FAIL ...` is a hard stop for integration rollout.
+3. Run issue #15 gateway smoke (`scripts/run-gateway-direct-proxy-smoke.sh --profile <enh|ens>`) against `../helianthus-ebusgateway` to validate proxy transport profile wiring.
+4. Treat `PASS: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://...` as gateway readiness; the corresponding `FAIL: gateway path readiness ...` line is the deterministic failure contract.
+5. Run issue #16 add-on linkage checks via `../helianthus-ha-addon/scripts/smoke_addon_checklist.py` and require checklist markers `[PASS] CHECK_LOG_PROXY_PROFILE :: ...` and `[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...`.
+6. Run issue #17 dual-topology smoke (`scripts/run-ha-integration-dual-topology-smoke.sh`) against `../helianthus-ha-integration` to verify coexistence path (`ebusd` endpoint + proxy endpoint).
+7. Treat `[PASS] CHECK_DUAL_TOPOLOGY_PATH :: ...`, `PASS: gateway readiness dual-topology path ...`, and `OVERALL PASS` as the readiness marker set; any `[FAIL] CHECK_DUAL_TOPOLOGY_PATH :: ...` or wrapper `FAIL: gateway readiness dual-topology path ...` line is gate-failing.
+
 ## Session behavior
 
 - Northbound listeners expose deterministic lifecycle hooks: connect, disconnect, error.

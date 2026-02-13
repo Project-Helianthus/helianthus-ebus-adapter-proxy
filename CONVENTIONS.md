@@ -32,6 +32,14 @@
 - Compatibility harness tests must prove identical direct-vs-proxy request/response exchanges for representative ebusd command sets under deterministic local topology.
 - Prefer deterministic assertions (stable counters/order, injected clocks) over sleep-based timing assertions.
 
+## M4 smoke marker expectations
+
+- `scripts/run-ebusd-compat-harness.sh` must leave `.verify/issue14/ebusd-compat-harness.log` with deterministic terminal marker `RESULT: PASS ...` on success (or `RESULT: FAIL ...` on mismatch).
+- `scripts/run-gateway-direct-proxy-smoke.sh` must leave `.verify/issue15/gateway-smoke-<profile>.log` and emit deterministic readiness lines `PASS: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://...` or `FAIL: gateway path readiness ...`.
+- HA add-on linkage checks (issue #16) run in `../helianthus-ha-addon/scripts/smoke_addon_checklist.py`; proxy topology validation must assert `[PASS] CHECK_LOG_PROXY_PROFILE :: ...` and `[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...`.
+- `scripts/run-ha-integration-dual-topology-smoke.sh` must leave `.verify/issue17/ha-dual-topology-<profile>.log`, parse `CHECK_DUAL_TOPOLOGY_PATH`, and emit deterministic wrapper markers `PASS|FAIL: gateway readiness dual-topology path ...`.
+- Dual-topology verification must require both marker layers: checklist marker (`[PASS] CHECK_DUAL_TOPOLOGY_PATH :: ...`) and overall marker (`OVERALL PASS`) from `../helianthus-ha-integration/scripts/run-ha-dual-topology-smoke.sh`.
+
 ## Terminology
 
 - Preferred terms: `initiator`, `target`, `allow`, `block`.
