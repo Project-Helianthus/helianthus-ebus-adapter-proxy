@@ -22,8 +22,20 @@ required_patterns=(
 	"PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh\\|ens>://127.0.0.1:<port>"
 )
 
+if command -v rg >/dev/null 2>&1; then
+	pattern_exists() {
+		local pattern="$1"
+		rg -q -n "${pattern}" "${RUNBOOK_FILE}"
+	}
+else
+	pattern_exists() {
+		local pattern="$1"
+		grep -E -q -n "${pattern}" "${RUNBOOK_FILE}"
+	}
+fi
+
 for pattern in "${required_patterns[@]}"; do
-	if ! rg -q -n "${pattern}" "${RUNBOOK_FILE}"; then
+	if ! pattern_exists "${pattern}"; then
 		echo "FAIL: runbook marker missing -> ${pattern}"
 		exit 1
 	fi
