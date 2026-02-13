@@ -18,8 +18,11 @@ required_patterns=(
 	"## Operator smoke procedures"
 	"RESULT: PASS \\(config-only migration verified; no ebusd patch required\\)"
 	"PASS: gateway path readiness profile=<enh\\|ens> endpoint=<enh\\|ens>://127.0.0.1:<port>"
+	"FAIL: gateway path readiness profile=<enh\\|ens> endpoint=<enh\\|ens>://\\.\\.\\."
 	"\\[PASS\\] CHECK_DUAL_TOPOLOGY_PATH :: mode=coexistence_ready ..."
+	"\\[FAIL\\] CHECK_DUAL_TOPOLOGY_PATH :: \\.\\.\\."
 	"PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh\\|ens>://127.0.0.1:<port>"
+	"FAIL: gateway readiness dual-topology path \\.\\.\\."
 	"PASS: ha integration dual-topology smoke completed for proxy profile <enh\\|ens>"
 )
 
