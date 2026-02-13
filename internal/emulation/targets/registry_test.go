@@ -251,6 +251,11 @@ func TestNewRegistryFromConfigCanEnableBuiltInVR90Profile(t *testing.T) {
 	if selection.Mode != RouteModePassthrough {
 		t.Fatalf("expected passthrough route for non-VR90 target address, got %s", selection.Mode)
 	}
+
+	profiles := registry.Profiles()
+	if len(profiles) != 1 {
+		t.Fatalf("expected only one profile after built-in override, got %d", len(profiles))
+	}
 }
 
 func TestNewRegistryFromConfigRejectsBuiltInVR90AddressOverride(t *testing.T) {
@@ -266,6 +271,48 @@ func TestNewRegistryFromConfigRejectsBuiltInVR90AddressOverride(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTargetAddressConflict) {
 		t.Fatalf("expected built-in profile address conflict, got %v", err)
+	}
+}
+
+func TestNewRegistryFromConfigRejectsDuplicateUserDefinedProfileNames(t *testing.T) {
+	_, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
+		TargetProfiles: []config.EmulatedTargetProfileConfig{
+			{
+				Name:          "vr71",
+				TargetAddress: 0x31,
+				Enabled:       true,
+			},
+			{
+				Name:          "VR71",
+				TargetAddress: 0x32,
+				Enabled:       false,
+			},
+		},
+	})
+	if !errors.Is(err, ErrTargetProfileNameConflict) {
+		t.Fatalf("expected duplicate profile name conflict, got %v", err)
+	}
+}
+
+func TestNewRegistryFromConfigRejectsDuplicateBuiltInOverrides(t *testing.T) {
+	_, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
+		TargetProfiles: []config.EmulatedTargetProfileConfig{
+			{
+				Name:          "vr90",
+				TargetAddress: BuiltInProfileVR90TargetAddress,
+				Enabled:       true,
+			},
+			{
+				Name:          "VR90",
+				TargetAddress: BuiltInProfileVR90TargetAddress,
+				Enabled:       false,
+			},
+		},
+	})
+	if !errors.Is(err, ErrTargetProfileNameConflict) {
+		t.Fatalf("expected duplicate built-in override name conflict, got %v", err)
 	}
 }
 

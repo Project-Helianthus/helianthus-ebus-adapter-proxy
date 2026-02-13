@@ -11,10 +11,11 @@ func NewRegistryFromConfig(
 	emulationConfiguration config.EmulationConfig,
 ) (*Registry, error) {
 	profiles := defaultProfiles()
-	profileIndexByName := make(map[string]int, len(profiles))
+	builtInProfileIndexByName := make(map[string]int, len(profiles))
+	builtInOverrides := make(map[string]struct{}, len(profiles))
 
 	for profileIndex, profile := range profiles {
-		profileIndexByName[profileNameKey(profile.Name)] = profileIndex
+		builtInProfileIndexByName[profileNameKey(profile.Name)] = profileIndex
 	}
 
 	registryEnabled := emulationConfiguration.Enabled
@@ -32,8 +33,11 @@ func NewRegistryFromConfig(
 		}
 
 		targetProfileNameKey := profileNameKey(profile.Name)
-		if existingProfileIndex, found := profileIndexByName[targetProfileNameKey]; found {
+		if existingProfileIndex, found := builtInProfileIndexByName[targetProfileNameKey]; found {
 			defaultProfile := profiles[existingProfileIndex]
+			if _, overridden := builtInOverrides[targetProfileNameKey]; overridden {
+				return nil, fmt.Errorf("%w: %q", ErrTargetProfileNameConflict, strings.TrimSpace(profile.Name))
+			}
 			if defaultProfile.TargetAddress != profile.TargetAddress {
 				return nil, fmt.Errorf(
 					"%w: %q requires target address 0x%02X (got 0x%02X)",
@@ -46,11 +50,11 @@ func NewRegistryFromConfig(
 
 			profile.Name = defaultProfile.Name
 			profiles[existingProfileIndex] = profile
+			builtInOverrides[targetProfileNameKey] = struct{}{}
 			continue
 		}
 
 		profiles = append(profiles, profile)
-		profileIndexByName[targetProfileNameKey] = len(profiles) - 1
 	}
 
 	if !registryEnabled {
