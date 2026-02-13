@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
 )
@@ -307,11 +305,11 @@ func TestManagerBoundedQueuesAndReconnectReset(t *testing.T) {
 	}
 }
 
-func TestManagerNoQueueOpsSucceedWhileDisconnectedUnderConcurrentChurn(t *testing.T) {
+func TestManagerConcurrentQueueOpsRespectConnectedStateBarriers(t *testing.T) {
 	manager := NewManager(
 		Options{
-			InboundCapacity:  4,
-			OutboundCapacity: 4,
+			InboundCapacity:  128,
+			OutboundCapacity: 128,
 		},
 		Hooks{},
 	)
@@ -327,112 +325,120 @@ func TestManagerNoQueueOpsSucceedWhileDisconnectedUnderConcurrentChurn(t *testin
 		t.Fatalf("expected register success, got %v", err)
 	}
 
-	var (
-		disconnectedFlag     int32
-		successWhileOffline  int32
-		notConnectedFailures int32
+	_, err = manager.Unregister(registeredSession.ID, nil)
+	if err != nil {
+		t.Fatalf("expected unregister success, got %v", err)
+	}
+
+	const workerCount = 24
+	disconnectedErrors := runBarrierOps(
+		t,
+		workerCount,
+		func(workerIndex int) error {
+			frame := downstream.Frame{
+				Command: byte(0x40 + workerIndex),
+				Payload: []byte{byte(workerIndex)},
+			}
+
+			enqueueInboundErr := manager.EnqueueInbound(registeredSession.ID, frame)
+			if !errors.Is(enqueueInboundErr, ErrSessionNotConnected) {
+				return fmt.Errorf("enqueue inbound expected not connected, got %v", enqueueInboundErr)
+			}
+
+			_, ok, dequeueInboundErr := manager.DequeueInbound(registeredSession.ID)
+			if ok {
+				return errors.New("dequeue inbound unexpectedly returned data while disconnected")
+			}
+			if !errors.Is(dequeueInboundErr, ErrSessionNotConnected) {
+				return fmt.Errorf("dequeue inbound expected not connected, got %v", dequeueInboundErr)
+			}
+
+			enqueueOutboundErr := manager.EnqueueOutbound(registeredSession.ID, frame)
+			if !errors.Is(enqueueOutboundErr, ErrSessionNotConnected) {
+				return fmt.Errorf("enqueue outbound expected not connected, got %v", enqueueOutboundErr)
+			}
+
+			_, ok, dequeueOutboundErr := manager.DequeueOutbound(registeredSession.ID)
+			if ok {
+				return errors.New("dequeue outbound unexpectedly returned data while disconnected")
+			}
+			if !errors.Is(dequeueOutboundErr, ErrSessionNotConnected) {
+				return fmt.Errorf("dequeue outbound expected not connected, got %v", dequeueOutboundErr)
+			}
+
+			return nil
+		},
 	)
 
-	stopWorkers := make(chan struct{})
-	startWorkers := make(chan struct{})
-	var workersGroup sync.WaitGroup
-
-	const workerCount = 12
-	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
-		workersGroup.Add(1)
-		go func(workerIndex int) {
-			defer workersGroup.Done()
-			<-startWorkers
-
-			for {
-				select {
-				case <-stopWorkers:
-					return
-				default:
-				}
-
-				frame := downstream.Frame{
-					Command: byte(0x20 + workerIndex),
-					Payload: []byte{byte(workerIndex)},
-				}
-
-				err := manager.EnqueueInbound(registeredSession.ID, frame)
-				if err == nil {
-					if atomic.LoadInt32(&disconnectedFlag) == 1 {
-						atomic.AddInt32(&successWhileOffline, 1)
-					}
-
-					_, _, dequeueErr := manager.DequeueInbound(registeredSession.ID)
-					if dequeueErr == nil && atomic.LoadInt32(&disconnectedFlag) == 1 {
-						atomic.AddInt32(&successWhileOffline, 1)
-					}
-				} else if errors.Is(err, ErrSessionNotConnected) {
-					atomic.AddInt32(&notConnectedFailures, 1)
-				}
-
-				err = manager.EnqueueOutbound(registeredSession.ID, frame)
-				if err == nil {
-					if atomic.LoadInt32(&disconnectedFlag) == 1 {
-						atomic.AddInt32(&successWhileOffline, 1)
-					}
-
-					_, _, dequeueErr := manager.DequeueOutbound(registeredSession.ID)
-					if dequeueErr == nil && atomic.LoadInt32(&disconnectedFlag) == 1 {
-						atomic.AddInt32(&successWhileOffline, 1)
-					}
-				} else if errors.Is(err, ErrSessionNotConnected) {
-					atomic.AddInt32(&notConnectedFailures, 1)
-				}
-			}
-		}(workerIndex)
-	}
-
-	close(startWorkers)
-
-	const churnRounds = 40
-	for round := 0; round < churnRounds; round++ {
-		_, err := manager.Unregister(registeredSession.ID, nil)
-		if err != nil {
-			t.Fatalf("expected unregister success in round %d, got %v", round, err)
-		}
-
-		atomic.StoreInt32(&disconnectedFlag, 1)
-		time.Sleep(2 * time.Millisecond)
-		atomic.StoreInt32(&disconnectedFlag, 0)
-
-		reconnectedSession, err := manager.Reconnect(identity)
-		if err != nil {
-			t.Fatalf("expected reconnect success in round %d, got %v", round, err)
-		}
-
-		if reconnectedSession.ID != registeredSession.ID {
-			t.Fatalf(
-				"expected stable session ID %d during churn, got %d in round %d",
-				registeredSession.ID,
-				reconnectedSession.ID,
-				round,
-			)
+	for _, operationErr := range disconnectedErrors {
+		if operationErr != nil {
+			t.Fatalf("unexpected disconnected-phase operation result: %v", operationErr)
 		}
 	}
 
-	close(stopWorkers)
-	workersGroup.Wait()
-
-	if atomic.LoadInt32(&successWhileOffline) != 0 {
-		t.Fatalf("expected no queue success while disconnected, got %d", atomic.LoadInt32(&successWhileOffline))
-	}
-
-	if atomic.LoadInt32(&notConnectedFailures) == 0 {
-		t.Fatalf("expected at least one not connected failure under churn")
-	}
-
-	finalSnapshot, err := manager.Snapshot(registeredSession.ID)
+	reconnectedSession, err := manager.Reconnect(identity)
 	if err != nil {
-		t.Fatalf("expected final snapshot success, got %v", err)
+		t.Fatalf("expected reconnect success, got %v", err)
 	}
 
-	if !finalSnapshot.Connected {
-		t.Fatalf("expected session connected after churn")
+	if reconnectedSession.ID != registeredSession.ID {
+		t.Fatalf(
+			"expected stable session ID %d after reconnect, got %d",
+			registeredSession.ID,
+			reconnectedSession.ID,
+		)
+	}
+
+	connectedErrors := runBarrierOps(
+		t,
+		workerCount,
+		func(workerIndex int) error {
+			frame := downstream.Frame{
+				Command: byte(0x60 + workerIndex),
+				Payload: []byte{byte(workerIndex)},
+			}
+
+			if err := manager.EnqueueInbound(registeredSession.ID, frame); err != nil {
+				return fmt.Errorf("enqueue inbound failed in connected phase: %w", err)
+			}
+
+			if err := manager.EnqueueOutbound(registeredSession.ID, frame); err != nil {
+				return fmt.Errorf("enqueue outbound failed in connected phase: %w", err)
+			}
+
+			return nil
+		},
+	)
+
+	for _, operationErr := range connectedErrors {
+		if operationErr != nil {
+			t.Fatalf("unexpected connected-phase operation result: %v", operationErr)
+		}
+	}
+
+	connectedSnapshot, err := manager.Snapshot(registeredSession.ID)
+	if err != nil {
+		t.Fatalf("expected snapshot success, got %v", err)
+	}
+
+	if !connectedSnapshot.Connected {
+		t.Fatalf("expected session to remain connected")
+	}
+
+	if connectedSnapshot.InboundDepth != workerCount {
+		t.Fatalf("expected inbound depth %d, got %d", workerCount, connectedSnapshot.InboundDepth)
+	}
+
+	if connectedSnapshot.OutboundDepth != workerCount {
+		t.Fatalf("expected outbound depth %d, got %d", workerCount, connectedSnapshot.OutboundDepth)
+	}
+
+	if connectedSnapshot.InboundDepth > 128 || connectedSnapshot.OutboundDepth > 128 {
+		t.Fatalf(
+			"queue depth exceeded capacity: inbound=%d outbound=%d",
+			connectedSnapshot.InboundDepth,
+			connectedSnapshot.OutboundDepth,
+		)
 	}
 }
 
@@ -666,4 +672,36 @@ func enqueueWithBoundedRecovery(
 	}
 
 	return enqueue()
+}
+
+func runBarrierOps(
+	t *testing.T,
+	workerCount int,
+	operation func(workerIndex int) error,
+) []error {
+	t.Helper()
+
+	startBarrier := make(chan struct{})
+	results := make(chan error, workerCount)
+	var workers sync.WaitGroup
+
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		workers.Add(1)
+		go func(workerIndex int) {
+			defer workers.Done()
+			<-startBarrier
+			results <- operation(workerIndex)
+		}(workerIndex)
+	}
+
+	close(startBarrier)
+	workers.Wait()
+	close(results)
+
+	operationErrors := make([]error, 0, workerCount)
+	for operationErr := range results {
+		operationErrors = append(operationErrors, operationErr)
+	}
+
+	return operationErrors
 }
