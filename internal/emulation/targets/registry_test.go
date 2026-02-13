@@ -188,6 +188,87 @@ func TestNewRegistryFromConfigBuildsProfileRegistry(t *testing.T) {
 	}
 }
 
+func TestNewRegistryFromConfigIncludesBuiltInVR90ProfileDisabledByDefault(t *testing.T) {
+	registry, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("expected profile registry initialization success, got %v", err)
+	}
+
+	profile, found := registry.LookupByName("vr90")
+	if !found {
+		t.Fatalf("expected built-in VR90 profile to be available")
+	}
+
+	if profile.Name != BuiltInProfileVR90Name {
+		t.Fatalf("expected built-in VR90 profile name %q, got %q", BuiltInProfileVR90Name, profile.Name)
+	}
+
+	if profile.TargetAddress != BuiltInProfileVR90TargetAddress {
+		t.Fatalf(
+			"expected built-in VR90 target address 0x%02X, got 0x%02X",
+			BuiltInProfileVR90TargetAddress,
+			profile.TargetAddress,
+		)
+	}
+
+	if profile.Enabled {
+		t.Fatalf("expected built-in VR90 profile disabled by default")
+	}
+
+	selection := registry.SelectRoute(BuiltInProfileVR90TargetAddress)
+	if selection.Mode != RouteModePassthrough {
+		t.Fatalf("expected passthrough route for disabled built-in VR90 profile, got %s", selection.Mode)
+	}
+}
+
+func TestNewRegistryFromConfigCanEnableBuiltInVR90Profile(t *testing.T) {
+	registry, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
+		TargetProfiles: []config.EmulatedTargetProfileConfig{
+			{
+				Name:          "vr90",
+				TargetAddress: BuiltInProfileVR90TargetAddress,
+				Enabled:       true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected profile registry initialization success, got %v", err)
+	}
+
+	selection := registry.SelectRoute(BuiltInProfileVR90TargetAddress)
+	if selection.Mode != RouteModeEmulated {
+		t.Fatalf("expected emulated route for configured and enabled built-in VR90 profile, got %s", selection.Mode)
+	}
+
+	if selection.Profile.Name != BuiltInProfileVR90Name {
+		t.Fatalf("expected selected built-in profile name %q, got %q", BuiltInProfileVR90Name, selection.Profile.Name)
+	}
+
+	selection = registry.SelectRoute(BuiltInProfileVR90TargetAddress + 1)
+	if selection.Mode != RouteModePassthrough {
+		t.Fatalf("expected passthrough route for non-VR90 target address, got %s", selection.Mode)
+	}
+}
+
+func TestNewRegistryFromConfigRejectsBuiltInVR90AddressOverride(t *testing.T) {
+	_, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
+		TargetProfiles: []config.EmulatedTargetProfileConfig{
+			{
+				Name:          "vr90",
+				TargetAddress: BuiltInProfileVR90TargetAddress + 1,
+				Enabled:       true,
+			},
+		},
+	})
+	if !errors.Is(err, ErrTargetAddressConflict) {
+		t.Fatalf("expected built-in profile address conflict, got %v", err)
+	}
+}
+
 func TestNewRegistryFromConfigHonorsGlobalEmulationDisable(t *testing.T) {
 	registry, err := NewRegistryFromConfig(config.EmulationConfig{
 		Enabled: false,

@@ -12,7 +12,7 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
   - `internal/northbound/ens`: concurrent ENS listener sessions with metrics and lifecycle hooks.
 - Domain contracts and proxy orchestration in `internal/domain/*` and `internal/proxy`.
 - Source-address policy and lease lifecycle components in `internal/sourcepolicy`.
-- Emulated target profile registry in `internal/emulation/targets` with runtime enable/disable and deterministic route selection.
+- Emulated target profile registry in `internal/emulation/targets` with a built-in VR90 profile (disabled by default), runtime enable/disable, and deterministic route selection.
 - CI workflow that runs tests, vet, and terminology checks.
 - Repository guardrail and architecture documents.
 
