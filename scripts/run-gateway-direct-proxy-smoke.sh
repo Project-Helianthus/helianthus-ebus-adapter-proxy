@@ -36,9 +36,19 @@ Options:
 USAGE
 }
 
+require_value() {
+	local option="$1"
+	if [[ $# -lt 2 ]]; then
+		echo "missing value for ${option}"
+		usage
+		exit 2
+	fi
+}
+
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--gateway-repo)
+			require_value "$1" "$@"
 			GATEWAY_REPO="$2"
 			shift 2
 			;;
@@ -47,6 +57,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--profile)
+			require_value "$1" "$@"
 			PROFILE="$2"
 			shift 2
 			;;
@@ -55,6 +66,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--proxy-host)
+			require_value "$1" "$@"
 			PROXY_HOST="$2"
 			shift 2
 			;;
@@ -63,6 +75,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--proxy-port)
+			require_value "$1" "$@"
 			PROXY_PORT="$2"
 			shift 2
 			;;
@@ -71,6 +84,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--source-address)
+			require_value "$1" "$@"
 			SOURCE_ADDRESS="$2"
 			shift 2
 			;;
@@ -79,6 +93,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--enh-timeout-sec)
+			require_value "$1" "$@"
 			ENH_TIMEOUT_SEC="$2"
 			shift 2
 			;;
@@ -87,6 +102,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--scan-timeout-sec)
+			require_value "$1" "$@"
 			SCAN_TIMEOUT_SEC="$2"
 			shift 2
 			;;
@@ -95,6 +111,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--method-timeout-sec)
+			require_value "$1" "$@"
 			METHOD_TIMEOUT_SEC="$2"
 			shift 2
 			;;
@@ -103,6 +120,7 @@ while [[ $# -gt 0 ]]; do
 			shift
 			;;
 		--log-dir)
+			require_value "$1" "$@"
 			LOG_DIR="$2"
 			shift 2
 			;;
@@ -195,6 +213,9 @@ fi
 
 restore_agent_local() {
 	if [[ "${KEEP_AGENT_LOCAL}" -eq 1 ]]; then
+		if [[ -n "${AGENT_LOCAL_BACKUP}" && -f "${AGENT_LOCAL_BACKUP}" ]]; then
+			rm -f "${AGENT_LOCAL_BACKUP}"
+		fi
 		return
 	fi
 
