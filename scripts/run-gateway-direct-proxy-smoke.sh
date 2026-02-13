@@ -266,10 +266,14 @@ printf 'Dual topology separation: keep ebusd on %s, gateway on dedicated source 
 printf 'Smoke log: %s/%s\n' "${ROOT_DIR}" "${SMOKE_LOG}"
 printf '\n'
 
-(
+if (
 	cd "${GATEWAY_REPO}"
 	export GOWORK=off
 	EBUS_SMOKE=1 go run ./cmd/smoke
-) | tee "${SMOKE_LOG}"
-
-printf '\nPASS: gateway smoke profile %s completed against %s:%s\n' "${PROFILE}" "${PROXY_HOST}" "${PROXY_PORT}"
+) | tee "${SMOKE_LOG}"; then
+	printf '\nPASS: gateway smoke profile %s completed against %s:%s\n' "${PROFILE}" "${PROXY_HOST}" "${PROXY_PORT}"
+	printf 'PASS: gateway path readiness profile=%s endpoint=%s://%s:%s\n' "${PROFILE}" "${PROFILE}" "${PROXY_HOST}" "${PROXY_PORT}"
+else
+	printf '\nFAIL: gateway path readiness profile=%s endpoint=%s://%s:%s (see %s/%s)\n' "${PROFILE}" "${PROFILE}" "${PROXY_HOST}" "${PROXY_PORT}" "${ROOT_DIR}" "${SMOKE_LOG}"
+	exit 1
+fi
