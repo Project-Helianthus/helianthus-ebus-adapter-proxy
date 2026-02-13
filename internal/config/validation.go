@@ -285,6 +285,11 @@ func validateEmulation(configuration EmulationConfig) ValidationErrors {
 			})
 		}
 
+		validationErrors = append(
+			validationErrors,
+			validateEmulationTargetProfiles(configuration.TargetProfiles)...,
+		)
+
 		return validationErrors
 	}
 
@@ -300,6 +305,69 @@ func validateEmulation(configuration EmulationConfig) ValidationErrors {
 		validationErrors,
 		validateAddressList("emulation.virtual_source_addresses", configuration.VirtualSourceAddresses)...,
 	)
+	validationErrors = append(
+		validationErrors,
+		validateEmulationTargetProfiles(configuration.TargetProfiles)...,
+	)
+
+	return validationErrors
+}
+
+func validateEmulationTargetProfiles(
+	targetProfiles []EmulatedTargetProfileConfig,
+) ValidationErrors {
+	validationErrors := make(ValidationErrors, 0)
+	seenNames := make(map[string]struct{})
+	seenAddresses := make(map[uint8]struct{})
+	overlapAddresses := make(map[uint8]struct{})
+
+	for index, targetProfile := range targetProfiles {
+		nameField := fmt.Sprintf("emulation.target_profiles[%d].name", index)
+		trimmedName := strings.TrimSpace(targetProfile.Name)
+
+		if trimmedName == "" {
+			validationErrors = append(validationErrors, ValidationError{
+				Code:    "emulation.target_profiles.name.required",
+				Field:   nameField,
+				Message: "target profile name is required",
+			})
+		} else {
+			normalizedName := strings.ToLower(trimmedName)
+			if _, seen := seenNames[normalizedName]; seen {
+				validationErrors = append(validationErrors, ValidationError{
+					Code:    "emulation.target_profiles.name.duplicate",
+					Field:   nameField,
+					Message: fmt.Sprintf("target profile %q is duplicated", trimmedName),
+				})
+			} else {
+				seenNames[normalizedName] = struct{}{}
+			}
+		}
+
+		if targetProfile.TargetAddress == 0x00 || targetProfile.TargetAddress == 0xFF {
+			validationErrors = append(validationErrors, ValidationError{
+				Code:    "address.invalid_reserved",
+				Field:   fmt.Sprintf("emulation.target_profiles[%d].target_address", index),
+				Message: fmt.Sprintf("address 0x%02X is reserved", targetProfile.TargetAddress),
+			})
+		}
+
+		if _, seen := seenAddresses[targetProfile.TargetAddress]; seen {
+			if _, reported := overlapAddresses[targetProfile.TargetAddress]; reported {
+				continue
+			}
+
+			validationErrors = append(validationErrors, ValidationError{
+				Code:    "emulation.target_profiles.address.overlap",
+				Field:   "emulation.target_profiles",
+				Message: fmt.Sprintf("target address 0x%02X cannot be used by multiple target profiles", targetProfile.TargetAddress),
+			})
+			overlapAddresses[targetProfile.TargetAddress] = struct{}{}
+			continue
+		}
+
+		seenAddresses[targetProfile.TargetAddress] = struct{}{}
+	}
 
 	return validationErrors
 }

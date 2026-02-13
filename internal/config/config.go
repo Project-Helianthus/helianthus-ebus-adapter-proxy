@@ -59,6 +59,13 @@ type AddressGuardConfig struct {
 type EmulationConfig struct {
 	Enabled                bool
 	VirtualSourceAddresses []uint8
+	TargetProfiles         []EmulatedTargetProfileConfig
+}
+
+type EmulatedTargetProfileConfig struct {
+	Name          string
+	TargetAddress uint8
+	Enabled       bool
 }
 
 type SourceAddressPolicyConfig struct {

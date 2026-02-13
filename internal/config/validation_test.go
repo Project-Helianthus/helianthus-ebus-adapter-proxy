@@ -237,6 +237,60 @@ func TestValidateRejectsInvalidSourceAddressPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateAcceptsUniqueEmulationTargetProfiles(t *testing.T) {
+	configuration := validConfiguration()
+	configuration.Emulation.TargetProfiles = []EmulatedTargetProfileConfig{
+		{
+			Name:          "vr90",
+			TargetAddress: 0x15,
+			Enabled:       true,
+		},
+		{
+			Name:          "vr71",
+			TargetAddress: 0x31,
+			Enabled:       false,
+		},
+	}
+
+	err := Validate(configuration)
+	if err != nil {
+		t.Fatalf("expected no validation errors, got %v", err)
+	}
+}
+
+func TestValidateRejectsOverlappingEmulationTargetProfileAddresses(t *testing.T) {
+	configuration := validConfiguration()
+	configuration.Emulation.TargetProfiles = []EmulatedTargetProfileConfig{
+		{
+			Name:          "vr90-primary",
+			TargetAddress: 0x15,
+			Enabled:       true,
+		},
+		{
+			Name:          "vr90-shadow",
+			TargetAddress: 0x15,
+			Enabled:       false,
+		},
+	}
+
+	expectedErrors := ValidationErrors{
+		{
+			Code:    "emulation.target_profiles.address.overlap",
+			Field:   "emulation.target_profiles",
+			Message: "target address 0x15 cannot be used by multiple target profiles",
+		},
+	}
+
+	actualErrors, ok := Validate(configuration).(ValidationErrors)
+	if !ok {
+		t.Fatalf("expected ValidationErrors type")
+	}
+
+	if !reflect.DeepEqual(actualErrors, expectedErrors) {
+		t.Fatalf("unexpected validation errors:\nexpected: %#v\nactual: %#v", expectedErrors, actualErrors)
+	}
+}
+
 func validConfiguration() Config {
 	return Config{
 		Southbound: SouthboundConfig{
