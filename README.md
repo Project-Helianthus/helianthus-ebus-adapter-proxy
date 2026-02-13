@@ -11,13 +11,16 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
   - `internal/northbound/enh`: concurrent ENH listener sessions with metrics and lifecycle hooks.
   - `internal/northbound/ens`: concurrent ENS listener sessions with metrics and lifecycle hooks.
 - Domain contracts and proxy orchestration in `internal/domain/*` and `internal/proxy`.
+- Source-address policy and lease lifecycle components in `internal/sourcepolicy`.
 - CI workflow that runs tests, vet, and terminology checks.
 - Repository guardrail and architecture documents.
 
-## Runtime shape (M2)
+## Runtime shape (M3)
 
 - One southbound owner connection to the physical adapter (ENH or ENS).
 - Multiple concurrent northbound client sessions (ENH and ENS listeners).
+- `internal/sourcepolicy.Policy` applies deterministic source-address selection filters before lease assignment.
+- `internal/sourcepolicy.LeaseManager` enforces one active lease per owner and one owner per source address.
 - Listener sessions decode transport frames and pass them to proxy domain handling.
 - `internal/session.Manager` tracks session lifecycle, stable session identity, and bounded per-session queues.
 - `internal/scheduler/write.AdaptiveScheduler` selects the next writer from queue-pressure candidates and applies starvation protection.
@@ -31,6 +34,15 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Disconnect (`Unregister`) clears queued frames for that session and counts them as dropped.
 - `internal/session.Session.QueueMetrics` and `internal/session.Manager.Metrics()` expose deterministic counters:
   `RejectedInbound`, `RejectedOutbound`, `DroppedInbound`, `DroppedOutbound`.
+
+## Source-address policy and lease semantics (M3)
+
+- Candidate addresses are normalized (sorted, unique) and invalid reserved values (`0x00`, `0xFF`) are dropped.
+- Selection applies allow-list, block-list, in-use, and recent-activity filters in deterministic order.
+- Default reservation mode is `soft` with `0x31` soft-reserved; the policy avoids soft-reserved addresses when alternatives exist.
+- Soft-reserved candidates are still selectable when no alternatives remain, `ReservationMode` is `disabled`, or `AllowSoftReserved` is set.
+- Recent-activity guard blocks addresses observed within the configured activity window for new leases; at the exact window boundary the address becomes eligible again.
+- When every candidate is filtered only by recent activity, selection returns `ErrRecentlyActiveAddress`; otherwise exhaustion returns `ErrNoSourceAddressAvailable`.
 
 ## Terminology policy
 
