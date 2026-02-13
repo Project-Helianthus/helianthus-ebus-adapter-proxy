@@ -131,6 +131,13 @@ Expected result for each run:
 
 ```text
 PASS: gateway smoke profile <enh|ens> completed against 127.0.0.1:<port>
+PASS: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://127.0.0.1:<port>
+```
+
+Deterministic failure shape for gateway path readiness:
+
+```text
+FAIL: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://127.0.0.1:<port> (see <repo>/.verify/issue15/gateway-smoke-<profile>.log)
 ```
 
 HA add-on proxy marker checklist (ENH example):
@@ -151,6 +158,74 @@ Expected proxy marker checks in checklist output:
 ```text
 PASS CHECK_LOG_PROXY_PROFILE ...
 PASS CHECK_LOG_PROXY_ENDPOINT ...
+```
+
+## HA integration dual-topology smoke path (M4, issue #17)
+
+- Coordination target: `d3vi1/helianthus-ha-integration#58` / PR `#59`.
+- Cross-repo smoke runner:
+  - `scripts/run-ha-integration-dual-topology-smoke.sh`
+- The runner executes HA integration dual-topology smoke (`ebusd` endpoint + adapter-proxy endpoint) and checks deterministic marker `CHECK_DUAL_TOPOLOGY_PATH`.
+- Gateway readiness is reported with deterministic marker lines:
+  - `PASS: gateway readiness dual-topology path ...`
+  - `FAIL: gateway readiness dual-topology path ...`
+
+Cross-repo setup:
+
+```bash
+cd ../helianthus-ha-integration
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+cd ../helianthus-ebus-adapter-proxy
+```
+
+If PR `#59` is not merged yet, use the feature branch with `--allow-non-main`:
+
+```bash
+cd ../helianthus-ha-integration
+git fetch origin issue-58-ha-dual-topology-smoke
+git checkout issue-58-ha-dual-topology-smoke
+cd ../helianthus-ebus-adapter-proxy
+```
+
+ENH dual-topology smoke:
+
+```bash
+./scripts/run-ha-integration-dual-topology-smoke.sh \
+  --ha-repo ../helianthus-ha-integration \
+  --allow-non-main \
+  --proxy-profile enh \
+  --proxy-port 19001 \
+  --ebusd-host 127.0.0.1 \
+  --ebusd-port 8888
+```
+
+ENS dual-topology smoke:
+
+```bash
+./scripts/run-ha-integration-dual-topology-smoke.sh \
+  --ha-repo ../helianthus-ha-integration \
+  --allow-non-main \
+  --proxy-profile ens \
+  --proxy-port 19002 \
+  --ebusd-host 127.0.0.1 \
+  --ebusd-port 8888
+```
+
+Expected gateway-readiness markers:
+
+```text
+[PASS] CHECK_DUAL_TOPOLOGY_PATH :: mode=coexistence_ready ...
+PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh|ens>://127.0.0.1:<port>
+PASS: ha integration dual-topology smoke completed for proxy profile <enh|ens>
+```
+
+Deterministic gateway-readiness failure shape:
+
+```text
+[FAIL] CHECK_DUAL_TOPOLOGY_PATH :: ...
+FAIL: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh|ens>://127.0.0.1:<port> reason=...
 ```
 
 ## Terminology policy

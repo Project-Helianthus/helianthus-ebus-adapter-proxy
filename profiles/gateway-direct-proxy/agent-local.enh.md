@@ -2,6 +2,7 @@
 
 Use this template with `helianthus-ebusgateway` smoke (`EBUS_SMOKE=1`) when the gateway must connect directly to the adapter-proxy ENH endpoint.
 Keep source-address separation from `ebusd` by using a gateway-only source (example below uses `0xF0` while `ebusd` remains on `0x31`).
+For HA integration dual-topology validation, pair this gateway profile with `scripts/run-ha-integration-dual-topology-smoke.sh --proxy-profile enh`.
 
 ```yaml
 enh:
