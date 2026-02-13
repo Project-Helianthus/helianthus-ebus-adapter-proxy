@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - "issue-*"
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Terminology gate
+        run: ./scripts/terminology-gate.sh
