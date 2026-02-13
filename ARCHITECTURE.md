@@ -12,7 +12,7 @@
 - `internal/northbound/enh`: ENH northbound multi-session listener.
 - `internal/northbound/ens`: ENS northbound multi-session listener.
 - `internal/session`: session registry, lifecycle hooks, and bounded per-session queues.
-- `internal/scheduler/write`: adaptive write scheduler with starvation guard.
+- `internal/scheduler/write`: adaptive write scheduler with starvation guard and shared arbitration path for pass-through + emulated writes.
 - `internal/sourcepolicy`: source-address selection policy, recent-activity guard, and owner lease lifecycle.
 - `internal/domain/downstream`: downstream frame contracts and client interface.
 - `internal/domain/upstream`: upstream message contracts and client interface.
