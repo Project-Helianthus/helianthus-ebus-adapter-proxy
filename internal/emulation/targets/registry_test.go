@@ -159,6 +159,7 @@ func TestRegistryProfilesReturnsDeterministicOrder(t *testing.T) {
 
 func TestNewRegistryFromConfigBuildsProfileRegistry(t *testing.T) {
 	registry, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: true,
 		TargetProfiles: []config.EmulatedTargetProfileConfig{
 			{
 				Name:          "vr90",
@@ -184,5 +185,29 @@ func TestNewRegistryFromConfigBuildsProfileRegistry(t *testing.T) {
 	selection = registry.SelectRoute(0x31)
 	if selection.Mode != RouteModePassthrough {
 		t.Fatalf("expected passthrough route for configured but disabled profile, got %s", selection.Mode)
+	}
+}
+
+func TestNewRegistryFromConfigHonorsGlobalEmulationDisable(t *testing.T) {
+	registry, err := NewRegistryFromConfig(config.EmulationConfig{
+		Enabled: false,
+		TargetProfiles: []config.EmulatedTargetProfileConfig{
+			{
+				Name:          "vr90",
+				TargetAddress: 0x15,
+				Enabled:       true,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("expected profile registry initialization success, got %v", err)
+	}
+
+	selection := registry.SelectRoute(0x15)
+	if selection.Mode != RouteModePassthrough {
+		t.Fatalf(
+			"expected passthrough route when global emulation is disabled, got %s",
+			selection.Mode,
+		)
 	}
 }
