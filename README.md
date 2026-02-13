@@ -83,11 +83,18 @@ RESULT: FAIL (proxy responses diverge from direct endpoint)
 - Smoke profile templates for gateway live in:
   - `profiles/gateway-direct-proxy/agent-local.enh.md`
   - `profiles/gateway-direct-proxy/agent-local.ens.md`
+- HA add-on proxy topology profile references (aligned with `d3vi1/helianthus-ha-addon#30` / PR `#31`) live in:
+  - `../helianthus-ha-addon/README.md` (transition config includes `proxy_profile` and `proxy_endpoint`)
+  - `../helianthus-ha-addon/SMOKE_RUNBOOK.md` (proxy topology + deterministic smoke checklist)
 - Cross-repo smoke runner:
   - `scripts/run-gateway-direct-proxy-smoke.sh`
 - Dual-topology smoke notes:
   - Keep `ebusd` on its direct adapter path and validate gateway direct-to-proxy with two runs (`enh` then `ens`).
   - Keep source-address separation between topologies (`ebusd` on `0x31`, gateway smoke on dedicated addresses like `0xF0`/`0xF1`).
+  - HA add-on smoke checklist proxy markers must match:
+    - `Proxy profile: <disabled|enh|ens>`
+    - `Proxy endpoint: <profile>://<host>:<port>` when `proxy_profile` is `enh`/`ens`
+    - `Proxy endpoint: (none)` when `proxy_profile` is `disabled`
 
 Cross-repo verification steps against `helianthus-ebusgateway` `main`:
 
@@ -124,6 +131,26 @@ Expected result for each run:
 
 ```text
 PASS: gateway smoke profile <enh|ens> completed against 127.0.0.1:<port>
+```
+
+HA add-on proxy marker checklist (ENH example):
+
+```bash
+cd ../helianthus-ha-addon
+python3 scripts/smoke_addon_checklist.py \
+  --log-file /tmp/helianthus-addon.log \
+  --transport enh \
+  --network tcp \
+  --address 192.168.100.2:9999 \
+  --proxy-profile enh \
+  --proxy-endpoint 127.0.0.1:19001
+```
+
+Expected proxy marker checks in checklist output:
+
+```text
+PASS CHECK_LOG_PROXY_PROFILE ...
+PASS CHECK_LOG_PROXY_ENDPOINT ...
 ```
 
 ## Terminology policy
