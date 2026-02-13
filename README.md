@@ -14,19 +14,23 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - CI workflow that runs tests, vet, and terminology checks.
 - Repository guardrail and architecture documents.
 
-## Runtime shape (M1)
+## Runtime shape (M2)
 
 - One southbound owner connection to the physical adapter (ENH or ENS).
 - Multiple concurrent northbound client sessions (ENH and ENS listeners).
 - Listener sessions decode transport frames and pass them to proxy domain handling.
+- `internal/session.Manager` tracks session lifecycle, stable session identity, and bounded per-session queues.
+- `internal/scheduler/write.AdaptiveScheduler` selects the next writer from queue-pressure candidates and applies starvation protection.
 
 ## Queue backpressure semantics (M2)
 
 - Session queues are bounded via `internal/session.Options{InboundCapacity, OutboundCapacity}`.
 - `EnqueueInbound` and `EnqueueOutbound` reject when a queue is full and return typed `BackpressureError` values.
 - Rejections classify as `ErrInboundBackpressure` or `ErrOutboundBackpressure`, and still satisfy `errors.Is(err, ErrQueueFull)`.
+- Backpressure outcomes are stable for callers: `errors.Is(err, ErrInboundBackpressure|ErrOutboundBackpressure|ErrQueueFull)`.
 - Disconnect (`Unregister`) clears queued frames for that session and counts them as dropped.
-- `internal/session.Manager.Metrics()` and per-session snapshots expose deterministic `rejected_*` and `dropped_*` counters.
+- `internal/session.Session.QueueMetrics` and `internal/session.Manager.Metrics()` expose deterministic counters:
+  `RejectedInbound`, `RejectedOutbound`, `DroppedInbound`, `DroppedOutbound`.
 
 ## Terminology policy
 

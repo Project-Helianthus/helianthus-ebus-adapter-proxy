@@ -21,7 +21,9 @@
 - Transport codec tests must cover framing behavior, malformed input behavior, and recovery paths.
 - Transport driver tests must cover lifecycle behavior, timeout mapping, reconnect behavior, and error propagation.
 - Listener tests must cover concurrent sessions (2+ clients), lifecycle hooks/metrics, malformed-frame recovery, and timeout handling.
-- Session manager tests must cover bounded queue backpressure behavior, overflow error taxonomy, and rejected/dropped metric counters.
+- Session manager tests must cover bounded queue backpressure behavior, overflow error taxonomy (`ErrInboundBackpressure`, `ErrOutboundBackpressure`, `ErrQueueFull`), and deterministic rejected/dropped metric counters.
+- Scheduler tests must cover deterministic selection behavior, fairness under balanced load, and starvation-guard behavior under skewed sustained load.
+- Scheduler concurrency tests must remain race-safe and verify valid session selection under concurrent `Select` calls.
 - Prefer deterministic assertions (stable counters/order) over timing-sensitive assertions.
 
 ## Terminology
