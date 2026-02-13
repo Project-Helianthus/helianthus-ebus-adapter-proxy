@@ -161,34 +161,42 @@ func TestReadOnlyEndpointsRejectMutatingMethods(t *testing.T) {
 	})
 
 	paths := []string{"/health", "/sessions", "/scheduler", "/addresses"}
+	methods := []string{
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+	}
 
 	for _, path := range paths {
-		t.Run(path, func(t *testing.T) {
-			request := httptest.NewRequest(http.MethodPost, path, nil)
-			responseRecorder := httptest.NewRecorder()
+		for _, method := range methods {
+			t.Run(path+"_"+method, func(t *testing.T) {
+				request := httptest.NewRequest(method, path, nil)
+				responseRecorder := httptest.NewRecorder()
 
-			httpHandler.ServeHTTP(responseRecorder, request)
+				httpHandler.ServeHTTP(responseRecorder, request)
 
-			if responseRecorder.Code != http.StatusMethodNotAllowed {
-				t.Fatalf("expected status 405, got %d", responseRecorder.Code)
-			}
+				if responseRecorder.Code != http.StatusMethodNotAllowed {
+					t.Fatalf("expected status 405, got %d", responseRecorder.Code)
+				}
 
-			if allow := responseRecorder.Header().Get("Allow"); allow != http.MethodGet {
-				t.Fatalf("expected Allow header GET, got %q", allow)
-			}
+				if allow := responseRecorder.Header().Get("Allow"); allow != http.MethodGet {
+					t.Fatalf("expected Allow header GET, got %q", allow)
+				}
 
-			var response errorResponse
-			if err := json.Unmarshal(responseRecorder.Body.Bytes(), &response); err != nil {
-				t.Fatalf("failed to unmarshal error response: %v", err)
-			}
+				var response errorResponse
+				if err := json.Unmarshal(responseRecorder.Body.Bytes(), &response); err != nil {
+					t.Fatalf("failed to unmarshal error response: %v", err)
+				}
 
-			if response.Error != "method not allowed" {
-				t.Fatalf("expected method not allowed error, got %q", response.Error)
-			}
+				if response.Error != "method not allowed" {
+					t.Fatalf("expected method not allowed error, got %q", response.Error)
+				}
 
-			rootObject := decodeObject(t, responseRecorder.Body.Bytes())
-			assertObjectKeys(t, rootObject, []string{"error"})
-		})
+				rootObject := decodeObject(t, responseRecorder.Body.Bytes())
+				assertObjectKeys(t, rootObject, []string{"error"})
+			})
+		}
 	}
 }
 
