@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -302,4 +303,236 @@ func TestManagerBoundedQueuesAndReconnectReset(t *testing.T) {
 	if reconnectedSession.InboundDepth != 0 || reconnectedSession.OutboundDepth != 0 {
 		t.Fatalf("expected empty queues after reconnect, got inbound=%d outbound=%d", reconnectedSession.InboundDepth, reconnectedSession.OutboundDepth)
 	}
+}
+
+func TestManagerConcurrentOperationsAcrossSessions(t *testing.T) {
+	const (
+		sessionCount  = 6
+		queueCapacity = 3
+		rounds        = 8
+	)
+
+	manager := NewManager(
+		Options{
+			InboundCapacity:  queueCapacity,
+			OutboundCapacity: queueCapacity,
+		},
+		Hooks{},
+	)
+
+	identities := make([]Identity, sessionCount)
+	for index := 0; index < sessionCount; index++ {
+		identities[index] = Identity{
+			ClientID:   fmt.Sprintf("client-%d", index),
+			Protocol:   "enh",
+			RemoteAddr: fmt.Sprintf("127.0.0.1:%d", 40000+index),
+		}
+	}
+
+	registeredSessions := make([]Session, sessionCount)
+
+	startRegister := make(chan struct{})
+	var registerGroup sync.WaitGroup
+	registerErrors := make(chan error, sessionCount)
+
+	for index := 0; index < sessionCount; index++ {
+		registerGroup.Add(1)
+		go func(index int) {
+			defer registerGroup.Done()
+			<-startRegister
+
+			session, err := manager.Register(identities[index])
+			if err != nil {
+				registerErrors <- fmt.Errorf("register index %d failed: %w", index, err)
+				return
+			}
+
+			registeredSessions[index] = session
+		}(index)
+	}
+
+	close(startRegister)
+	registerGroup.Wait()
+	close(registerErrors)
+
+	for err := range registerErrors {
+		t.Fatalf("concurrent register error: %v", err)
+	}
+
+	seenIDs := make(map[uint64]struct{}, sessionCount)
+	for index := 0; index < sessionCount; index++ {
+		session := registeredSessions[index]
+		if session.ID == 0 {
+			t.Fatalf("expected non-zero session ID at index %d", index)
+		}
+
+		if _, duplicate := seenIDs[session.ID]; duplicate {
+			t.Fatalf("duplicate session ID detected: %d", session.ID)
+		}
+
+		seenIDs[session.ID] = struct{}{}
+	}
+
+	if len(manager.ActiveSessions()) != sessionCount {
+		t.Fatalf("expected %d active sessions after register, got %d", sessionCount, len(manager.ActiveSessions()))
+	}
+
+	startOps := make(chan struct{})
+	var opsGroup sync.WaitGroup
+	opsErrors := make(chan error, sessionCount)
+
+	for index := 0; index < sessionCount; index++ {
+		opsGroup.Add(1)
+		go func(index int) {
+			defer opsGroup.Done()
+			<-startOps
+
+			sessionID := registeredSessions[index].ID
+			identity := identities[index]
+
+			for round := 0; round < rounds; round++ {
+				inboundFrame := downstream.Frame{
+					Command: byte(0x10 + index),
+					Payload: []byte{byte(index), byte(round)},
+				}
+				outboundFrame := downstream.Frame{
+					Command: byte(0x20 + index),
+					Payload: []byte{byte(round), byte(index)},
+				}
+
+				if err := enqueueWithBoundedRecovery(
+					func() error {
+						return manager.EnqueueInbound(sessionID, inboundFrame)
+					},
+					func() (downstream.Frame, bool, error) {
+						return manager.DequeueInbound(sessionID)
+					},
+				); err != nil {
+					opsErrors <- fmt.Errorf("session %d inbound enqueue failed: %w", sessionID, err)
+					return
+				}
+
+				if err := enqueueWithBoundedRecovery(
+					func() error {
+						return manager.EnqueueOutbound(sessionID, outboundFrame)
+					},
+					func() (downstream.Frame, bool, error) {
+						return manager.DequeueOutbound(sessionID)
+					},
+				); err != nil {
+					opsErrors <- fmt.Errorf("session %d outbound enqueue failed: %w", sessionID, err)
+					return
+				}
+
+				if _, _, err := manager.DequeueInbound(sessionID); err != nil {
+					opsErrors <- fmt.Errorf("session %d inbound dequeue failed: %w", sessionID, err)
+					return
+				}
+
+				if _, _, err := manager.DequeueOutbound(sessionID); err != nil {
+					opsErrors <- fmt.Errorf("session %d outbound dequeue failed: %w", sessionID, err)
+					return
+				}
+
+				if round%2 == 1 {
+					if _, err := manager.Unregister(sessionID, nil); err != nil {
+						opsErrors <- fmt.Errorf("session %d unregister failed: %w", sessionID, err)
+						return
+					}
+
+					_, _, err := manager.DequeueInbound(sessionID)
+					if !errors.Is(err, ErrSessionNotConnected) {
+						opsErrors <- fmt.Errorf("session %d expected not connected error, got %v", sessionID, err)
+						return
+					}
+
+					reconnectedSession, err := manager.Reconnect(identity)
+					if err != nil {
+						opsErrors <- fmt.Errorf("session %d reconnect failed: %w", sessionID, err)
+						return
+					}
+
+					if reconnectedSession.ID != sessionID {
+						opsErrors <- fmt.Errorf("session %d reconnect returned different id %d", sessionID, reconnectedSession.ID)
+						return
+					}
+				}
+			}
+
+			finalSnapshot, err := manager.Snapshot(sessionID)
+			if err != nil {
+				opsErrors <- fmt.Errorf("session %d snapshot failed: %w", sessionID, err)
+				return
+			}
+
+			if !finalSnapshot.Connected {
+				opsErrors <- fmt.Errorf("session %d expected connected state", sessionID)
+				return
+			}
+
+			if finalSnapshot.InboundDepth > queueCapacity || finalSnapshot.OutboundDepth > queueCapacity {
+				opsErrors <- fmt.Errorf(
+					"session %d queue depth out of bounds: inbound=%d outbound=%d",
+					sessionID,
+					finalSnapshot.InboundDepth,
+					finalSnapshot.OutboundDepth,
+				)
+				return
+			}
+		}(index)
+	}
+
+	close(startOps)
+	opsGroup.Wait()
+	close(opsErrors)
+
+	for err := range opsErrors {
+		t.Fatalf("concurrent operation error: %v", err)
+	}
+
+	if len(manager.ActiveSessions()) != sessionCount {
+		t.Fatalf("expected %d active sessions after concurrent operations, got %d", sessionCount, len(manager.ActiveSessions()))
+	}
+
+	expectedReconnectCount := uint64(rounds / 2)
+	for index := 0; index < sessionCount; index++ {
+		sessionID := registeredSessions[index].ID
+		snapshot, err := manager.Snapshot(sessionID)
+		if err != nil {
+			t.Fatalf("expected snapshot for session %d, got %v", sessionID, err)
+		}
+
+		if snapshot.ReconnectCount != expectedReconnectCount {
+			t.Fatalf(
+				"expected reconnect count %d for session %d, got %d",
+				expectedReconnectCount,
+				sessionID,
+				snapshot.ReconnectCount,
+			)
+		}
+	}
+}
+
+func enqueueWithBoundedRecovery(
+	enqueue func() error,
+	dequeue func() (downstream.Frame, bool, error),
+) error {
+	err := enqueue()
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, ErrQueueFull) {
+		return err
+	}
+
+	_, ok, dequeueErr := dequeue()
+	if dequeueErr != nil {
+		return dequeueErr
+	}
+	if !ok {
+		return errors.New("expected queue item when recovering from full queue")
+	}
+
+	return enqueue()
 }
