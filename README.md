@@ -44,6 +44,39 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Recent-activity guard blocks addresses observed within the configured activity window for new leases; at the exact window boundary the address becomes eligible again.
 - When every candidate is filtered only by recent activity, selection returns `ErrRecentlyActiveAddress`; otherwise exhaustion returns `ErrNoSourceAddressAvailable`.
 
+## ebusd compatibility harness (M4)
+
+- Goal: prove config-only migration for ebusd clients by switching only `host:port` from direct adapter endpoint to proxy endpoint.
+- Scope: no ebusd code changes and no ebusd patch required.
+- Command set: representative ENH-style requests (`req_init`, `req_start`, `req_info`, `req_send`) executed unchanged across both endpoints.
+- Topology: deterministic local smoke path uses a mock adapter and local proxy endpoint, so CI does not need physical eBUS hardware.
+
+Run:
+
+```bash
+./scripts/run-ebusd-compat-harness.sh
+```
+
+Smoke output format:
+
+```text
+Issue #14 ebusd compatibility harness
+MODE: sim (local topology with mock adapter)
+MIGRATION: config-only endpoint switch (host/port)
+DIRECT_ENDPOINT=127.0.0.1:<port>
+PROXY_ENDPOINT=127.0.0.1:<port>
+PASS req_init request=0xC0 0x91 direct_response=0x80 0x91 proxy_response=0x80 0x91
+...
+RESULT: PASS (config-only migration verified; no ebusd patch required)
+```
+
+Failure shape:
+
+```text
+FAIL req_send request=... direct_response=... proxy_response=...
+RESULT: FAIL (proxy responses diverge from direct endpoint)
+```
+
 ## Terminology policy
 
 - Use `initiator` and `target` across code and docs.
