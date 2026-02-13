@@ -296,7 +296,9 @@ else
 	reason=""
 	if [[ -n "${dual_topology_fail_line}" ]]; then
 		reason="${dual_topology_fail_line#*:}"
-		reason="${reason#${fail_prefix}}"
+		if [[ "${reason}" == "${fail_prefix}"* ]]; then
+			reason="${reason:${#fail_prefix}}"
+		fi
 	fi
 	if [[ -z "${reason}" && "${ha_exit}" -ne 0 ]]; then
 		reason="ha smoke exited with status ${ha_exit}"
