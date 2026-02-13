@@ -77,6 +77,55 @@ FAIL req_send request=... direct_response=... proxy_response=...
 RESULT: FAIL (proxy responses diverge from direct endpoint)
 ```
 
+## Gateway direct proxy profile assets (M4, issue #15)
+
+- Dependency: `d3vi1/helianthus-ebusgateway#92` merged into `main` (endpoint-URI transport profile support for `enh://` and `ens://`).
+- Smoke profile templates for gateway live in:
+  - `profiles/gateway-direct-proxy/agent-local.enh.md`
+  - `profiles/gateway-direct-proxy/agent-local.ens.md`
+- Cross-repo smoke runner:
+  - `scripts/run-gateway-direct-proxy-smoke.sh`
+- Dual-topology smoke notes:
+  - Keep `ebusd` on its direct adapter path and validate gateway direct-to-proxy with two runs (`enh` then `ens`).
+  - Keep source-address separation between topologies (`ebusd` on `0x31`, gateway smoke on dedicated addresses like `0xF0`/`0xF1`).
+
+Cross-repo verification steps against `helianthus-ebusgateway` `main`:
+
+```bash
+cd ../helianthus-ebusgateway
+git checkout main
+git pull --ff-only origin main
+cd ../helianthus-ebus-adapter-proxy
+```
+
+ENH direct proxy smoke:
+
+```bash
+./scripts/run-gateway-direct-proxy-smoke.sh \
+  --gateway-repo ../helianthus-ebusgateway \
+  --profile enh \
+  --proxy-host 127.0.0.1 \
+  --proxy-port 19001 \
+  --source-address 0xF0
+```
+
+ENS direct proxy smoke:
+
+```bash
+./scripts/run-gateway-direct-proxy-smoke.sh \
+  --gateway-repo ../helianthus-ebusgateway \
+  --profile ens \
+  --proxy-host 127.0.0.1 \
+  --proxy-port 19002 \
+  --source-address 0xF1
+```
+
+Expected result for each run:
+
+```text
+PASS: gateway smoke profile <enh|ens> completed against 127.0.0.1:<port>
+```
+
 ## Terminology policy
 
 - Use `initiator` and `target` across code and docs.
