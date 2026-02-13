@@ -259,58 +259,79 @@ func (manager *Manager) ActiveSessions() []Session {
 }
 
 func (manager *Manager) EnqueueInbound(sessionID uint64, frame downstream.Frame) error {
-	state, err := manager.requireConnectedSession(sessionID)
-	if err != nil {
-		return err
-	}
-
-	return state.inboundQueue.enqueue(frame)
-}
-
-func (manager *Manager) EnqueueOutbound(sessionID uint64, frame downstream.Frame) error {
-	state, err := manager.requireConnectedSession(sessionID)
-	if err != nil {
-		return err
-	}
-
-	return state.outboundQueue.enqueue(frame)
-}
-
-func (manager *Manager) DequeueInbound(sessionID uint64) (downstream.Frame, bool, error) {
-	state, err := manager.requireConnectedSession(sessionID)
-	if err != nil {
-		return downstream.Frame{}, false, err
-	}
-
-	frame, ok := state.inboundQueue.dequeue()
-	return frame, ok, nil
-}
-
-func (manager *Manager) DequeueOutbound(sessionID uint64) (downstream.Frame, bool, error) {
-	state, err := manager.requireConnectedSession(sessionID)
-	if err != nil {
-		return downstream.Frame{}, false, err
-	}
-
-	frame, ok := state.outboundQueue.dequeue()
-	return frame, ok, nil
-}
-
-func (manager *Manager) requireConnectedSession(sessionID uint64) (*sessionState, error) {
 	manager.mutex.RLock()
 	state, found := manager.sessions[sessionID]
 	if !found {
 		manager.mutex.RUnlock()
-		return nil, ErrSessionNotFound
+		return ErrSessionNotFound
 	}
 
 	if !state.connected {
 		manager.mutex.RUnlock()
-		return nil, ErrSessionNotConnected
+		return ErrSessionNotConnected
 	}
+
+	err := state.inboundQueue.enqueue(frame)
 	manager.mutex.RUnlock()
 
-	return state, nil
+	return err
+}
+
+func (manager *Manager) EnqueueOutbound(sessionID uint64, frame downstream.Frame) error {
+	manager.mutex.RLock()
+	state, found := manager.sessions[sessionID]
+	if !found {
+		manager.mutex.RUnlock()
+		return ErrSessionNotFound
+	}
+
+	if !state.connected {
+		manager.mutex.RUnlock()
+		return ErrSessionNotConnected
+	}
+
+	err := state.outboundQueue.enqueue(frame)
+	manager.mutex.RUnlock()
+
+	return err
+}
+
+func (manager *Manager) DequeueInbound(sessionID uint64) (downstream.Frame, bool, error) {
+	manager.mutex.RLock()
+	state, found := manager.sessions[sessionID]
+	if !found {
+		manager.mutex.RUnlock()
+		return downstream.Frame{}, false, ErrSessionNotFound
+	}
+
+	if !state.connected {
+		manager.mutex.RUnlock()
+		return downstream.Frame{}, false, ErrSessionNotConnected
+	}
+
+	frame, ok := state.inboundQueue.dequeue()
+	manager.mutex.RUnlock()
+
+	return frame, ok, nil
+}
+
+func (manager *Manager) DequeueOutbound(sessionID uint64) (downstream.Frame, bool, error) {
+	manager.mutex.RLock()
+	state, found := manager.sessions[sessionID]
+	if !found {
+		manager.mutex.RUnlock()
+		return downstream.Frame{}, false, ErrSessionNotFound
+	}
+
+	if !state.connected {
+		manager.mutex.RUnlock()
+		return downstream.Frame{}, false, ErrSessionNotConnected
+	}
+
+	frame, ok := state.outboundQueue.dequeue()
+	manager.mutex.RUnlock()
+
+	return frame, ok, nil
 }
 
 func (state *sessionState) snapshot() Session {

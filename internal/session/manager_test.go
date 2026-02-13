@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
 )
@@ -302,6 +304,135 @@ func TestManagerBoundedQueuesAndReconnectReset(t *testing.T) {
 
 	if reconnectedSession.InboundDepth != 0 || reconnectedSession.OutboundDepth != 0 {
 		t.Fatalf("expected empty queues after reconnect, got inbound=%d outbound=%d", reconnectedSession.InboundDepth, reconnectedSession.OutboundDepth)
+	}
+}
+
+func TestManagerNoQueueOpsSucceedWhileDisconnectedUnderConcurrentChurn(t *testing.T) {
+	manager := NewManager(
+		Options{
+			InboundCapacity:  4,
+			OutboundCapacity: 4,
+		},
+		Hooks{},
+	)
+
+	identity := Identity{
+		ClientID:   "client-churn",
+		Protocol:   "ens",
+		RemoteAddr: "127.0.0.1:41001",
+	}
+
+	registeredSession, err := manager.Register(identity)
+	if err != nil {
+		t.Fatalf("expected register success, got %v", err)
+	}
+
+	var (
+		disconnectedFlag     int32
+		successWhileOffline  int32
+		notConnectedFailures int32
+	)
+
+	stopWorkers := make(chan struct{})
+	startWorkers := make(chan struct{})
+	var workersGroup sync.WaitGroup
+
+	const workerCount = 12
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		workersGroup.Add(1)
+		go func(workerIndex int) {
+			defer workersGroup.Done()
+			<-startWorkers
+
+			for {
+				select {
+				case <-stopWorkers:
+					return
+				default:
+				}
+
+				frame := downstream.Frame{
+					Command: byte(0x20 + workerIndex),
+					Payload: []byte{byte(workerIndex)},
+				}
+
+				err := manager.EnqueueInbound(registeredSession.ID, frame)
+				if err == nil {
+					if atomic.LoadInt32(&disconnectedFlag) == 1 {
+						atomic.AddInt32(&successWhileOffline, 1)
+					}
+
+					_, _, dequeueErr := manager.DequeueInbound(registeredSession.ID)
+					if dequeueErr == nil && atomic.LoadInt32(&disconnectedFlag) == 1 {
+						atomic.AddInt32(&successWhileOffline, 1)
+					}
+				} else if errors.Is(err, ErrSessionNotConnected) {
+					atomic.AddInt32(&notConnectedFailures, 1)
+				}
+
+				err = manager.EnqueueOutbound(registeredSession.ID, frame)
+				if err == nil {
+					if atomic.LoadInt32(&disconnectedFlag) == 1 {
+						atomic.AddInt32(&successWhileOffline, 1)
+					}
+
+					_, _, dequeueErr := manager.DequeueOutbound(registeredSession.ID)
+					if dequeueErr == nil && atomic.LoadInt32(&disconnectedFlag) == 1 {
+						atomic.AddInt32(&successWhileOffline, 1)
+					}
+				} else if errors.Is(err, ErrSessionNotConnected) {
+					atomic.AddInt32(&notConnectedFailures, 1)
+				}
+			}
+		}(workerIndex)
+	}
+
+	close(startWorkers)
+
+	const churnRounds = 40
+	for round := 0; round < churnRounds; round++ {
+		_, err := manager.Unregister(registeredSession.ID, nil)
+		if err != nil {
+			t.Fatalf("expected unregister success in round %d, got %v", round, err)
+		}
+
+		atomic.StoreInt32(&disconnectedFlag, 1)
+		time.Sleep(2 * time.Millisecond)
+		atomic.StoreInt32(&disconnectedFlag, 0)
+
+		reconnectedSession, err := manager.Reconnect(identity)
+		if err != nil {
+			t.Fatalf("expected reconnect success in round %d, got %v", round, err)
+		}
+
+		if reconnectedSession.ID != registeredSession.ID {
+			t.Fatalf(
+				"expected stable session ID %d during churn, got %d in round %d",
+				registeredSession.ID,
+				reconnectedSession.ID,
+				round,
+			)
+		}
+	}
+
+	close(stopWorkers)
+	workersGroup.Wait()
+
+	if atomic.LoadInt32(&successWhileOffline) != 0 {
+		t.Fatalf("expected no queue success while disconnected, got %d", atomic.LoadInt32(&successWhileOffline))
+	}
+
+	if atomic.LoadInt32(&notConnectedFailures) == 0 {
+		t.Fatalf("expected at least one not connected failure under churn")
+	}
+
+	finalSnapshot, err := manager.Snapshot(registeredSession.ID)
+	if err != nil {
+		t.Fatalf("expected final snapshot success, got %v", err)
+	}
+
+	if !finalSnapshot.Connected {
+		t.Fatalf("expected session connected after churn")
 	}
 }
 
