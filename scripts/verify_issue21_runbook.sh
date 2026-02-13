@@ -20,6 +20,7 @@ required_patterns=(
 	"PASS: gateway path readiness profile=<enh\\|ens> endpoint=<enh\\|ens>://127.0.0.1:<port>"
 	"\\[PASS\\] CHECK_DUAL_TOPOLOGY_PATH :: mode=coexistence_ready ..."
 	"PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh\\|ens>://127.0.0.1:<port>"
+	"PASS: ha integration dual-topology smoke completed for proxy profile <enh\\|ens>"
 )
 
 if command -v rg >/dev/null 2>&1; then
