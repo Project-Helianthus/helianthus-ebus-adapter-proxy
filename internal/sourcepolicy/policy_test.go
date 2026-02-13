@@ -3,6 +3,7 @@ package sourcepolicy
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestPolicySoftReserve31WhenEbusdOnlinePrefersAlternative(t *testing.T) {
@@ -116,6 +117,75 @@ func TestPolicyReturnsNoAddressAvailableWhenAllCandidatesFiltered(t *testing.T) 
 	)
 	if !errors.Is(err, ErrNoSourceAddressAvailable) {
 		t.Fatalf("expected no source address available error, got %v", err)
+	}
+}
+
+func TestPolicyRejectsRecentlyActiveAddressesForNewLeases(t *testing.T) {
+	baseTime := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	now := baseTime
+	activityWindow := mustNewActivityWindow(t, 5*time.Second, func() time.Time {
+		return now
+	})
+	activityWindow.ObserveAt(0x40, baseTime.Add(-2*time.Second))
+
+	policy := mustNewPolicy(t, Config{})
+	_, err := policy.SelectAddress(
+		[]uint8{0x40},
+		SelectOptions{
+			ActivityWindow: activityWindow,
+		},
+	)
+	if !errors.Is(err, ErrRecentlyActiveAddress) {
+		t.Fatalf("expected recently active address error, got %v", err)
+	}
+}
+
+func TestPolicySkipsRecentlyActiveAddressWhenAlternativeExists(t *testing.T) {
+	baseTime := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	now := baseTime
+	activityWindow := mustNewActivityWindow(t, 5*time.Second, func() time.Time {
+		return now
+	})
+	activityWindow.ObserveAt(0x40, baseTime.Add(-2*time.Second))
+
+	policy := mustNewPolicy(t, Config{})
+	selectedAddress, err := policy.SelectAddress(
+		[]uint8{0x40, 0x41},
+		SelectOptions{
+			ActivityWindow: activityWindow,
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected address selection success, got %v", err)
+	}
+
+	if selectedAddress != 0x41 {
+		t.Fatalf("expected selected address 0x41, got 0x%02X", selectedAddress)
+	}
+}
+
+func TestPolicyAllowsLeaseAtActivityWindowBoundary(t *testing.T) {
+	baseTime := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	now := baseTime
+	activityWindow := mustNewActivityWindow(t, 5*time.Second, func() time.Time {
+		return now
+	})
+	activityWindow.ObserveAt(0x40, baseTime)
+	now = baseTime.Add(5 * time.Second)
+
+	policy := mustNewPolicy(t, Config{})
+	selectedAddress, err := policy.SelectAddress(
+		[]uint8{0x40},
+		SelectOptions{
+			ActivityWindow: activityWindow,
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected address selection success at boundary, got %v", err)
+	}
+
+	if selectedAddress != 0x40 {
+		t.Fatalf("expected selected address 0x40, got 0x%02X", selectedAddress)
 	}
 }
 
