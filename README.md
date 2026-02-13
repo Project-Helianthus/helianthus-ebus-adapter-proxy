@@ -20,6 +20,14 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Multiple concurrent northbound client sessions (ENH and ENS listeners).
 - Listener sessions decode transport frames and pass them to proxy domain handling.
 
+## Queue backpressure semantics (M2)
+
+- Session queues are bounded via `internal/session.Options{InboundCapacity, OutboundCapacity}`.
+- `EnqueueInbound` and `EnqueueOutbound` reject when a queue is full and return typed `BackpressureError` values.
+- Rejections classify as `ErrInboundBackpressure` or `ErrOutboundBackpressure`, and still satisfy `errors.Is(err, ErrQueueFull)`.
+- Disconnect (`Unregister`) clears queued frames for that session and counts them as dropped.
+- `internal/session.Manager.Metrics()` and per-session snapshots expose deterministic `rejected_*` and `dropped_*` counters.
+
 ## Terminology policy
 
 - Use `initiator` and `target` across code and docs.
