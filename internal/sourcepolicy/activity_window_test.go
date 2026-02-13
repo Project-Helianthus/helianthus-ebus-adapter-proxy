@@ -54,6 +54,31 @@ func TestActivityWindowKeepsMostRecentObservationForAddress(t *testing.T) {
 	}
 }
 
+func TestActivityWindowIgnoresNonTrackableAddresses(t *testing.T) {
+	baseTime := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	now := baseTime
+	activityWindow := mustNewActivityWindow(t, 5*time.Second, func() time.Time {
+		return now
+	})
+
+	activityWindow.ObserveAt(0x00, baseTime)
+	activityWindow.ObserveAt(0xFF, baseTime)
+	activityWindow.ObserveAt(0x40, baseTime)
+
+	now = baseTime.Add(2 * time.Second)
+	if activityWindow.IsRecentlyActive(0x00) {
+		t.Fatalf("expected 0x00 to remain untracked")
+	}
+
+	if activityWindow.IsRecentlyActive(0xFF) {
+		t.Fatalf("expected 0xFF to remain untracked")
+	}
+
+	if !activityWindow.IsRecentlyActive(0x40) {
+		t.Fatalf("expected regular source address to remain tracked")
+	}
+}
+
 func mustNewActivityWindow(
 	t *testing.T,
 	window time.Duration,
