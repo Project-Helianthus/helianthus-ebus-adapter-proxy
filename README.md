@@ -14,6 +14,7 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Shared write arbitration path in `internal/scheduler/write` for deterministic ordering across pass-through and emulated writes.
 - Source-address policy and lease lifecycle components in `internal/sourcepolicy`.
 - Emulated target profile registry in `internal/emulation/targets` with a built-in VR90 profile (disabled by default), runtime enable/disable, and deterministic route selection.
+- Deployment and day-2 operations runbook in `OPERATIONS_RUNBOOK.md`.
 - CI workflow that runs tests, vet, and terminology checks.
 - Repository guardrail and architecture documents.
 
@@ -52,6 +53,11 @@ eBUS adapter proxy service with southbound transport drivers and northbound mult
 - Issue #15 (`scripts/run-gateway-direct-proxy-smoke.sh`): validates gateway `enh://`/`ens://` direct-proxy transport and emits `PASS|FAIL: gateway path readiness profile=...`.
 - Issue #16 (HA add-on linkage): aligns `proxy_profile` + `proxy_endpoint` semantics with `../helianthus-ha-addon/README.md` and `../helianthus-ha-addon/SMOKE_RUNBOOK.md`.
 - Issue #17 (`scripts/run-ha-integration-dual-topology-smoke.sh`): validates coexistence (`ebusd` + adapter-proxy) and requires `CHECK_DUAL_TOPOLOGY_PATH` readiness markers.
+
+## M6 deployment + operations runbook (#21)
+
+- Deployment topology, fail-closed behavior, recovery flow, and operator smoke procedures are documented in `OPERATIONS_RUNBOOK.md`.
+- Runbook verification helper: `./scripts/verify_issue21_runbook.sh`.
 
 ## ebusd compatibility harness (M4)
 

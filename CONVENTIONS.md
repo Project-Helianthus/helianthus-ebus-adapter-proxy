@@ -40,6 +40,14 @@
 - `scripts/run-ha-integration-dual-topology-smoke.sh` must leave `.verify/issue17/ha-dual-topology-<profile>.log`, parse `CHECK_DUAL_TOPOLOGY_PATH`, and emit deterministic wrapper markers `PASS|FAIL: gateway readiness dual-topology path ...`.
 - Dual-topology verification must require both marker layers: checklist marker (`[PASS] CHECK_DUAL_TOPOLOGY_PATH :: ...`) and overall marker (`OVERALL PASS`) from `../helianthus-ha-integration/scripts/run-ha-dual-topology-smoke.sh`.
 
+## M6 docs gate expectations
+
+- `OPERATIONS_RUNBOOK.md` must document:
+  - dual-active coexistence topology (`ebusd` direct path + Helianthus proxy path),
+  - fail-closed behavior with deterministic failure markers, and
+  - recovery steps plus operator smoke procedures with expected PASS markers.
+- `./scripts/verify_issue21_runbook.sh` should be used as a lightweight docs gate for required runbook sections/markers.
+
 ## Terminology
 
 - Preferred terms: `initiator`, `target`, `allow`, `block`.
