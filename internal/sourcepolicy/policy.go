@@ -17,6 +17,7 @@ const (
 var (
 	ErrNoSourceAddressAvailable = errors.New("no source address available")
 	ErrInvalidReservationMode   = errors.New("invalid source address reservation mode")
+	ErrRecentlyActiveAddress    = errors.New("source address recently active")
 )
 
 type Config struct {
@@ -29,6 +30,7 @@ type Config struct {
 type SelectOptions struct {
 	InUseAddresses    []uint8
 	AllowSoftReserved bool
+	ActivityWindow    *ActivityWindow
 }
 
 type Policy struct {
@@ -69,7 +71,7 @@ func NewPolicy(configuration Config) (*Policy, error) {
 
 // SelectAddress applies deterministic source address assignment:
 // 1) candidates are normalized (sorted, unique, invalid-reserved filtered),
-// 2) allow/deny and in-use filters are applied,
+// 2) allow/deny, in-use, and recent-activity filters are applied,
 // 3) in soft reservation mode, soft-reserved addresses are avoided unless there are no alternatives.
 func (policy *Policy) SelectAddress(
 	candidates []uint8,
@@ -78,6 +80,7 @@ func (policy *Policy) SelectAddress(
 	normalizedCandidates := uniqueSortedAddresses(candidates)
 	inUseAddressSet := buildAddressSet(options.InUseAddresses)
 	filteredCandidates := make([]uint8, 0, len(normalizedCandidates))
+	rejectedRecentlyActive := false
 
 	for _, candidate := range normalizedCandidates {
 		if len(policy.allowedSet) > 0 {
@@ -94,10 +97,19 @@ func (policy *Policy) SelectAddress(
 			continue
 		}
 
+		if options.ActivityWindow != nil && options.ActivityWindow.IsRecentlyActive(candidate) {
+			rejectedRecentlyActive = true
+			continue
+		}
+
 		filteredCandidates = append(filteredCandidates, candidate)
 	}
 
 	if len(filteredCandidates) == 0 {
+		if rejectedRecentlyActive {
+			return 0, ErrRecentlyActiveAddress
+		}
+
 		return 0, ErrNoSourceAddressAvailable
 	}
 
