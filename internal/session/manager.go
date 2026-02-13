@@ -14,6 +14,8 @@ var (
 	ErrSessionNotFound         = errors.New("session not found")
 	ErrSessionAlreadyConnected = errors.New("session already connected")
 	ErrSessionNotConnected     = errors.New("session not connected")
+	ErrInboundBackpressure     = errors.New("inbound queue backpressure")
+	ErrOutboundBackpressure    = errors.New("outbound queue backpressure")
 	ErrQueueFull               = errors.New("session queue is full")
 )
 
@@ -23,6 +25,13 @@ const (
 	EventTypeConnected    EventType = "connected"
 	EventTypeDisconnected EventType = "disconnected"
 	EventTypeReconnected  EventType = "reconnected"
+)
+
+type QueueDirection string
+
+const (
+	QueueDirectionInbound  QueueDirection = "inbound"
+	QueueDirectionOutbound QueueDirection = "outbound"
 )
 
 type Identity struct {
@@ -40,6 +49,43 @@ type Session struct {
 	ReconnectCount uint64
 	InboundDepth   int
 	OutboundDepth  int
+	QueueMetrics   QueueMetrics
+}
+
+type QueueMetrics struct {
+	RejectedInbound  uint64
+	RejectedOutbound uint64
+	DroppedInbound   uint64
+	DroppedOutbound  uint64
+}
+
+// BackpressureError reports enqueue rejection caused by bounded queue capacity.
+type BackpressureError struct {
+	SessionID uint64
+	Direction QueueDirection
+	Capacity  int
+}
+
+func (errorValue BackpressureError) Error() string {
+	return fmt.Sprintf(
+		"%s frame rejected due to queue backpressure (session=%d capacity=%d)",
+		errorValue.Direction,
+		errorValue.SessionID,
+		errorValue.Capacity,
+	)
+}
+
+func (errorValue BackpressureError) Is(target error) bool {
+	switch target {
+	case ErrQueueFull:
+		return true
+	case ErrInboundBackpressure:
+		return errorValue.Direction == QueueDirectionInbound
+	case ErrOutboundBackpressure:
+		return errorValue.Direction == QueueDirectionOutbound
+	default:
+		return false
+	}
 }
 
 type Event struct {
@@ -65,6 +111,7 @@ type Manager struct {
 	hooks        Hooks
 	identityToID map[string]uint64
 	sessions     map[uint64]*sessionState
+	queueMetrics QueueMetrics
 	nextID       uint64
 }
 
@@ -77,6 +124,7 @@ type sessionState struct {
 	reconnectCount uint64
 	inboundQueue   *frameQueue
 	outboundQueue  *frameQueue
+	queueMetrics   QueueMetrics
 }
 
 type frameQueue struct {
@@ -163,8 +211,12 @@ func (manager *Manager) Unregister(sessionID uint64, cause error) (Session, erro
 
 	state.connected = false
 	state.disconnectedAt = time.Now().UTC()
-	state.inboundQueue.clear()
-	state.outboundQueue.clear()
+	droppedInbound := state.inboundQueue.clear()
+	droppedOutbound := state.outboundQueue.clear()
+	state.queueMetrics.DroppedInbound += uint64(droppedInbound)
+	state.queueMetrics.DroppedOutbound += uint64(droppedOutbound)
+	manager.queueMetrics.DroppedInbound += uint64(droppedInbound)
+	manager.queueMetrics.DroppedOutbound += uint64(droppedOutbound)
 
 	event := Event{
 		Type:    EventTypeDisconnected,
@@ -258,40 +310,67 @@ func (manager *Manager) ActiveSessions() []Session {
 	return sessions
 }
 
-func (manager *Manager) EnqueueInbound(sessionID uint64, frame downstream.Frame) error {
+// Metrics returns deterministic aggregate queue backpressure counters.
+func (manager *Manager) Metrics() QueueMetrics {
 	manager.mutex.RLock()
+	metrics := manager.queueMetrics
+	manager.mutex.RUnlock()
+
+	return metrics
+}
+
+func (manager *Manager) EnqueueInbound(sessionID uint64, frame downstream.Frame) error {
+	manager.mutex.Lock()
 	state, found := manager.sessions[sessionID]
 	if !found {
-		manager.mutex.RUnlock()
+		manager.mutex.Unlock()
 		return ErrSessionNotFound
 	}
 
 	if !state.connected {
-		manager.mutex.RUnlock()
+		manager.mutex.Unlock()
 		return ErrSessionNotConnected
 	}
 
 	err := state.inboundQueue.enqueue(frame)
-	manager.mutex.RUnlock()
+	if errors.Is(err, ErrQueueFull) {
+		state.queueMetrics.RejectedInbound++
+		manager.queueMetrics.RejectedInbound++
+		err = BackpressureError{
+			SessionID: sessionID,
+			Direction: QueueDirectionInbound,
+			Capacity:  state.inboundQueue.capacity,
+		}
+	}
+	manager.mutex.Unlock()
 
 	return err
 }
 
 func (manager *Manager) EnqueueOutbound(sessionID uint64, frame downstream.Frame) error {
-	manager.mutex.RLock()
+	manager.mutex.Lock()
 	state, found := manager.sessions[sessionID]
 	if !found {
-		manager.mutex.RUnlock()
+		manager.mutex.Unlock()
 		return ErrSessionNotFound
 	}
 
 	if !state.connected {
-		manager.mutex.RUnlock()
+		manager.mutex.Unlock()
 		return ErrSessionNotConnected
 	}
 
 	err := state.outboundQueue.enqueue(frame)
-	manager.mutex.RUnlock()
+	if errors.Is(err, ErrQueueFull) {
+		state.queueMetrics.RejectedOutbound++
+		manager.queueMetrics.RejectedOutbound++
+		err = BackpressureError{
+			SessionID: sessionID,
+			Direction: QueueDirectionOutbound,
+			Capacity:  state.outboundQueue.capacity,
+		}
+	}
+	manager.mutex.Unlock()
 
 	return err
 }
@@ -344,6 +423,7 @@ func (state *sessionState) snapshot() Session {
 		ReconnectCount: state.reconnectCount,
 		InboundDepth:   state.inboundQueue.depth(),
 		OutboundDepth:  state.outboundQueue.depth(),
+		QueueMetrics:   state.queueMetrics,
 	}
 }
 
@@ -387,10 +467,13 @@ func (queue *frameQueue) depth() int {
 	return depth
 }
 
-func (queue *frameQueue) clear() {
+func (queue *frameQueue) clear() int {
 	queue.mutex.Lock()
+	dropped := len(queue.items)
 	queue.items = queue.items[:0]
 	queue.mutex.Unlock()
+
+	return dropped
 }
 
 func cloneFrame(frame downstream.Frame) downstream.Frame {

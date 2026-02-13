@@ -305,6 +305,136 @@ func TestManagerBoundedQueuesAndReconnectReset(t *testing.T) {
 	}
 }
 
+func TestManagerBackpressureErrorTaxonomyAndMetrics(t *testing.T) {
+	manager := NewManager(
+		Options{
+			InboundCapacity:  1,
+			OutboundCapacity: 1,
+		},
+		Hooks{},
+	)
+
+	identity := Identity{
+		ClientID:   "client-backpressure",
+		Protocol:   "ens",
+		RemoteAddr: "127.0.0.1:32001",
+	}
+
+	session, err := manager.Register(identity)
+	if err != nil {
+		t.Fatalf("expected register success, got %v", err)
+	}
+
+	if err := manager.EnqueueInbound(session.ID, downstream.Frame{Payload: []byte{0x01}}); err != nil {
+		t.Fatalf("expected enqueue inbound success, got %v", err)
+	}
+	if err := manager.EnqueueOutbound(session.ID, downstream.Frame{Payload: []byte{0x02}}); err != nil {
+		t.Fatalf("expected enqueue outbound success, got %v", err)
+	}
+
+	inboundErr := manager.EnqueueInbound(session.ID, downstream.Frame{Payload: []byte{0x03}})
+	if !errors.Is(inboundErr, ErrQueueFull) {
+		t.Fatalf("expected queue full error, got %v", inboundErr)
+	}
+	if !errors.Is(inboundErr, ErrInboundBackpressure) {
+		t.Fatalf("expected inbound backpressure error, got %v", inboundErr)
+	}
+	if errors.Is(inboundErr, ErrOutboundBackpressure) {
+		t.Fatalf("did not expect outbound backpressure classification for inbound enqueue")
+	}
+
+	var inboundBackpressureError BackpressureError
+	if !errors.As(inboundErr, &inboundBackpressureError) {
+		t.Fatalf("expected typed backpressure error, got %T", inboundErr)
+	}
+	if inboundBackpressureError.SessionID != session.ID {
+		t.Fatalf("expected inbound backpressure session %d, got %d", session.ID, inboundBackpressureError.SessionID)
+	}
+	if inboundBackpressureError.Direction != QueueDirectionInbound {
+		t.Fatalf("expected inbound direction, got %s", inboundBackpressureError.Direction)
+	}
+	if inboundBackpressureError.Capacity != 1 {
+		t.Fatalf("expected inbound backpressure capacity 1, got %d", inboundBackpressureError.Capacity)
+	}
+
+	outboundErr := manager.EnqueueOutbound(session.ID, downstream.Frame{Payload: []byte{0x04}})
+	if !errors.Is(outboundErr, ErrQueueFull) {
+		t.Fatalf("expected queue full error, got %v", outboundErr)
+	}
+	if !errors.Is(outboundErr, ErrOutboundBackpressure) {
+		t.Fatalf("expected outbound backpressure error, got %v", outboundErr)
+	}
+	if errors.Is(outboundErr, ErrInboundBackpressure) {
+		t.Fatalf("did not expect inbound backpressure classification for outbound enqueue")
+	}
+
+	var outboundBackpressureError BackpressureError
+	if !errors.As(outboundErr, &outboundBackpressureError) {
+		t.Fatalf("expected typed backpressure error, got %T", outboundErr)
+	}
+	if outboundBackpressureError.SessionID != session.ID {
+		t.Fatalf("expected outbound backpressure session %d, got %d", session.ID, outboundBackpressureError.SessionID)
+	}
+	if outboundBackpressureError.Direction != QueueDirectionOutbound {
+		t.Fatalf("expected outbound direction, got %s", outboundBackpressureError.Direction)
+	}
+	if outboundBackpressureError.Capacity != 1 {
+		t.Fatalf("expected outbound backpressure capacity 1, got %d", outboundBackpressureError.Capacity)
+	}
+
+	snapshotBeforeDisconnect, err := manager.Snapshot(session.ID)
+	if err != nil {
+		t.Fatalf("expected snapshot success, got %v", err)
+	}
+
+	expectedBeforeDisconnect := QueueMetrics{
+		RejectedInbound:  1,
+		RejectedOutbound: 1,
+	}
+	if !reflect.DeepEqual(snapshotBeforeDisconnect.QueueMetrics, expectedBeforeDisconnect) {
+		t.Fatalf(
+			"expected session queue metrics %#v before disconnect, got %#v",
+			expectedBeforeDisconnect,
+			snapshotBeforeDisconnect.QueueMetrics,
+		)
+	}
+
+	aggregateMetrics := manager.Metrics()
+	if !reflect.DeepEqual(aggregateMetrics, expectedBeforeDisconnect) {
+		t.Fatalf("expected aggregate metrics %#v before disconnect, got %#v", expectedBeforeDisconnect, aggregateMetrics)
+	}
+
+	disconnectedSession, err := manager.Unregister(session.ID, nil)
+	if err != nil {
+		t.Fatalf("expected unregister success, got %v", err)
+	}
+
+	expectedAfterDisconnect := QueueMetrics{
+		RejectedInbound:  1,
+		RejectedOutbound: 1,
+		DroppedInbound:   1,
+		DroppedOutbound:  1,
+	}
+
+	if !reflect.DeepEqual(disconnectedSession.QueueMetrics, expectedAfterDisconnect) {
+		t.Fatalf("expected disconnected queue metrics %#v, got %#v", expectedAfterDisconnect, disconnectedSession.QueueMetrics)
+	}
+
+	aggregateMetrics = manager.Metrics()
+	if !reflect.DeepEqual(aggregateMetrics, expectedAfterDisconnect) {
+		t.Fatalf("expected aggregate metrics %#v after disconnect, got %#v", expectedAfterDisconnect, aggregateMetrics)
+	}
+
+	reconnectedSession, err := manager.Reconnect(identity)
+	if err != nil {
+		t.Fatalf("expected reconnect success, got %v", err)
+	}
+
+	if !reflect.DeepEqual(reconnectedSession.QueueMetrics, expectedAfterDisconnect) {
+		t.Fatalf("expected reconnect to preserve queue metrics %#v, got %#v", expectedAfterDisconnect, reconnectedSession.QueueMetrics)
+	}
+}
+
 func TestManagerConcurrentQueueOpsRespectConnectedStateBarriers(t *testing.T) {
 	manager := NewManager(
 		Options{
