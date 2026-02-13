@@ -24,7 +24,12 @@
 - Session manager tests must cover bounded queue backpressure behavior, overflow error taxonomy (`ErrInboundBackpressure`, `ErrOutboundBackpressure`, `ErrQueueFull`), and deterministic rejected/dropped metric counters.
 - Scheduler tests must cover deterministic selection behavior, fairness under balanced load, and starvation-guard behavior under skewed sustained load.
 - Scheduler concurrency tests must remain race-safe and verify valid session selection under concurrent `Select` calls.
-- Prefer deterministic assertions (stable counters/order) over timing-sensitive assertions.
+- Source policy tests must cover deterministic allow/block/in-use filtering and soft-reserve behavior for `0x31` with and without `AllowSoftReserved`.
+- Activity-window tests must verify the exact timing boundary (`window` is exclusive), plus non-trackable address handling (`0x00`, `0xFF`).
+- Lease manager tests must cover `Acquire`/`Renew`/`Release`/`Expire` lifecycle behavior, including `ExpiresAt <= now` boundary behavior.
+- Lease conflict tests must assert stable conflict codes for address contention, duplicate owner acquire, missing owner lease, and expired owner lease.
+- Lease concurrency tests must cover simultaneous lease contention (single address and multi-address pools) and assert one active winner per address.
+- Prefer deterministic assertions (stable counters/order, injected clocks) over sleep-based timing assertions.
 
 ## Terminology
 
