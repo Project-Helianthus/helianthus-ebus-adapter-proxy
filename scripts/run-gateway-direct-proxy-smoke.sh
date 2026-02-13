@@ -200,6 +200,7 @@ fi
 mkdir -p "${LOG_DIR}"
 SMOKE_LOG="${LOG_DIR}/gateway-smoke-${PROFILE}.log"
 REPORT_JSON_OUTPUT="artifacts/smoke-report.${PROFILE}.json"
+PROXY_ENDPOINT_MARKER="${PROFILE}://${PROXY_HOST}:${PROXY_PORT}"
 
 AGENT_LOCAL_PATH="${GATEWAY_REPO}/AGENT-local.md"
 AGENT_LOCAL_BACKUP=""
@@ -257,7 +258,9 @@ printf 'Issue #15 gateway direct proxy smoke\n'
 printf 'Gateway repo: %s\n' "${GATEWAY_REPO}"
 printf 'Gateway branch: %s\n' "${gateway_branch}"
 printf 'Profile: %s\n' "${PROFILE}"
-printf 'Proxy endpoint: %s:%s\n' "${PROXY_HOST}" "${PROXY_PORT}"
+printf 'Proxy target: %s:%s\n' "${PROXY_HOST}" "${PROXY_PORT}"
+printf 'Proxy profile: %s\n' "${PROFILE}"
+printf 'Proxy endpoint: %s\n' "${PROXY_ENDPOINT_MARKER}"
 printf 'Gateway source address: %s\n' "${SOURCE_ADDRESS}"
 printf 'Dual topology separation: keep ebusd on %s, gateway on dedicated source address\n' "${DEFAULT_EBUSD_SOURCE_ADDRESS}"
 printf 'Smoke log: %s/%s\n' "${ROOT_DIR}" "${SMOKE_LOG}"
