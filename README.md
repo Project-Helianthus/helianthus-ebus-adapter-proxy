@@ -1,124 +1,68 @@
 # helianthus-ebus-adapter-proxy
 
-eBUS adapter proxy service with southbound transport drivers and northbound multi-session listeners.
+`helianthus-ebus-adapter-proxy` provides a shared proxy path between one southbound eBUS adapter connection and multiple northbound client sessions (ENH/ENS), including deterministic write arbitration for pass-through and emulated traffic.
 
-## What is included
+## Purpose and Scope
 
-- Southbound drivers:
-  - `internal/southbound/enh`: ENH dial/read/write lifecycle with reconnect hooks and timeout handling.
-  - `internal/southbound/ens`: ENS dial/read/write lifecycle with reconnect hooks and timeout handling.
-- Northbound listeners:
-  - `internal/northbound/enh`: concurrent ENH listener sessions with metrics and lifecycle hooks.
-  - `internal/northbound/ens`: concurrent ENS listener sessions with metrics and lifecycle hooks.
-- Domain contracts and proxy orchestration in `internal/domain/*` and `internal/proxy`.
-- Shared write arbitration path in `internal/scheduler/write` for deterministic ordering across pass-through and emulated writes.
-- Source-address policy and lease lifecycle components in `internal/sourcepolicy`.
-- Emulated target profile registry in `internal/emulation/targets` with a built-in VR90 profile (disabled by default), runtime enable/disable, and deterministic route selection.
-- Deployment and day-2 operations runbook in `OPERATIONS_RUNBOOK.md`.
-- CI workflow that runs tests, vet, and terminology checks.
-- Repository guardrail and architecture documents.
+### What belongs in this repository
 
-## Runtime shape (M3)
+- Southbound ENH/ENS adapter drivers (`internal/southbound/*`).
+- Northbound ENH/ENS multi-session listeners (`internal/northbound/*`).
+- Proxy orchestration and domain contracts (`internal/proxy`, `internal/domain/*`).
+- Shared write scheduler/arbitration (`internal/scheduler/write`).
+- Source-address policy and lease lifecycle (`internal/sourcepolicy`).
+- Emulation target registry/profile wiring (`internal/emulation/targets`).
+- Compatibility/smoke tooling and operations runbook (`scripts/*`, `OPERATIONS_RUNBOOK.md`).
 
-- One southbound owner connection to the physical adapter (ENH or ENS).
-- Multiple concurrent northbound client sessions (ENH and ENS listeners).
-- `internal/sourcepolicy.Policy` applies deterministic source-address selection filters before lease assignment.
-- `internal/sourcepolicy.LeaseManager` enforces one active lease per owner and one owner per source address.
-- Listener sessions decode transport frames and pass them to proxy domain handling.
-- `internal/session.Manager` tracks session lifecycle, stable session identity, and bounded per-session queues.
-- `internal/scheduler/write.AdaptiveScheduler` selects the next writer from queue-pressure candidates and applies starvation protection.
+### What does not belong in this repository
 
-## Queue backpressure semantics (M2)
+- Gateway API/runtime serving (belongs to `helianthus-ebusgateway`).
+- Home Assistant integration entity model (belongs to `helianthus-ha-integration`).
+- Home Assistant add-on packaging (belongs to `helianthus-ha-addon`).
 
-- Session queues are bounded via `internal/session.Options{InboundCapacity, OutboundCapacity}`.
-- `EnqueueInbound` and `EnqueueOutbound` reject when a queue is full and return typed `BackpressureError` values.
-- Rejections classify as `ErrInboundBackpressure` or `ErrOutboundBackpressure`, and still satisfy `errors.Is(err, ErrQueueFull)`.
-- Backpressure outcomes are stable for callers: `errors.Is(err, ErrInboundBackpressure|ErrOutboundBackpressure|ErrQueueFull)`.
-- Disconnect (`Unregister`) clears queued frames for that session and counts them as dropped.
-- `internal/session.Session.QueueMetrics` and `internal/session.Manager.Metrics()` expose deterministic counters:
-  `RejectedInbound`, `RejectedOutbound`, `DroppedInbound`, `DroppedOutbound`.
+## Status and Maturity
 
-## Source-address policy and lease semantics (M3)
+- Active proxy foundation with deterministic test coverage.
+- Includes issue-aligned smoke helpers for compatibility, gateway direct-proxy checks, and HA dual-topology checks.
+- Built-in VR90 emulation profile wiring is available and disabled by default.
 
-- Candidate addresses are normalized (sorted, unique) and invalid reserved values (`0x00`, `0xFF`) are dropped.
-- Selection applies allow-list, block-list, in-use, and recent-activity filters in deterministic order.
-- Default reservation mode is `soft` with `0x31` soft-reserved; the policy avoids soft-reserved addresses when alternatives exist.
-- Soft-reserved candidates are still selectable when no alternatives remain, `ReservationMode` is `disabled`, or `AllowSoftReserved` is set.
-- Recent-activity guard blocks addresses observed within the configured activity window for new leases; at the exact window boundary the address becomes eligible again.
-- When every candidate is filtered only by recent activity, selection returns `ErrRecentlyActiveAddress`; otherwise exhaustion returns `ErrNoSourceAddressAvailable`.
-
-## M4 integration path map (#14/#15/#16/#17)
-
-- Issue #14 (`scripts/run-ebusd-compat-harness.sh`): validates config-only ebusd migration and emits `RESULT: PASS|FAIL` in `.verify/issue14/ebusd-compat-harness.log`.
-- Issue #15 (`scripts/run-gateway-direct-proxy-smoke.sh`): validates gateway `enh://`/`ens://` direct-proxy transport and emits `PASS|FAIL: gateway path readiness profile=...`.
-- Issue #16 (HA add-on linkage): aligns `proxy_profile` + `proxy_endpoint` semantics with `../helianthus-ha-addon/README.md` and `../helianthus-ha-addon/SMOKE_RUNBOOK.md`.
-- Issue #17 (`scripts/run-ha-integration-dual-topology-smoke.sh`): validates coexistence (`ebusd` + adapter-proxy) and requires `CHECK_DUAL_TOPOLOGY_PATH` readiness markers.
-
-## M6 deployment + operations runbook (#21)
-
-- Deployment topology, fail-closed behavior, recovery flow, and operator smoke procedures are documented in `OPERATIONS_RUNBOOK.md`.
-- Runbook verification helper: `./scripts/verify_issue21_runbook.sh`.
-
-## ebusd compatibility harness (M4)
-
-- Goal: prove config-only migration for ebusd clients by switching only `host:port` from direct adapter endpoint to proxy endpoint.
-- Scope: no ebusd code changes and no ebusd patch required.
-- Command set: representative ENH-style requests (`req_init`, `req_start`, `req_info`, `req_send`) executed unchanged across both endpoints.
-- Topology: deterministic local smoke path uses a mock adapter and local proxy endpoint, so CI does not need physical eBUS hardware.
-
-Run:
-
-```bash
-./scripts/run-ebusd-compat-harness.sh
-```
-
-Smoke output format:
+## Helianthus Dependency Chain
 
 ```text
-Issue #14 ebusd compatibility harness
-MODE: sim (local topology with mock adapter)
-MIGRATION: config-only endpoint switch (host/port)
-DIRECT_ENDPOINT=127.0.0.1:<port>
-PROXY_ENDPOINT=127.0.0.1:<port>
-PASS req_init request=0xC0 0x91 direct_response=0x80 0x91 proxy_response=0x80 0x91
-...
-RESULT: PASS (config-only migration verified; no ebusd patch required)
+adapter endpoint/ebusd -> helianthus-ebus-adapter-proxy -> helianthus-ebusgateway -> helianthus-ha-integration/ha-addon
+        (io edge)                 (arbitration + proxy)         (api runtime)            (operator surfaces)
 ```
 
-Failure shape:
+## Quickstart (copy/paste)
 
-```text
-FAIL req_send request=... direct_response=... proxy_response=...
-RESULT: FAIL (proxy responses diverge from direct endpoint)
-```
-
-## Gateway direct proxy profile assets (M4, issue #15)
-
-- Dependency: `d3vi1/helianthus-ebusgateway#92` merged into `main` (endpoint-URI transport profile support for `enh://` and `ens://`).
-- Smoke profile templates for gateway live in:
-  - `profiles/gateway-direct-proxy/agent-local.enh.md`
-  - `profiles/gateway-direct-proxy/agent-local.ens.md`
-- HA add-on profile linkage details are tracked in issue #16 section below.
-- Cross-repo smoke runner:
-  - `scripts/run-gateway-direct-proxy-smoke.sh`
-- Dual-topology smoke notes:
-  - Keep `ebusd` on its direct adapter path and validate gateway direct-to-proxy with two runs (`enh` then `ens`).
-  - Keep source-address separation between topologies (`ebusd` on `0x31`, gateway smoke on dedicated addresses like `0xF0`/`0xF1`).
-  - HA add-on smoke checklist proxy markers must match:
-    - `Proxy profile: <disabled|enh|ens>`
-    - `Proxy endpoint: <profile>://<host>:<port>` when `proxy_profile` is `enh`/`ens`
-    - `Proxy endpoint: (none)` when `proxy_profile` is `disabled`
-
-Cross-repo verification steps against `helianthus-ebusgateway` `main`:
+### 1) Clone and baseline validation
 
 ```bash
-cd ../helianthus-ebusgateway
-git checkout main
-git pull --ff-only origin main
-cd ../helianthus-ebus-adapter-proxy
+git clone https://github.com/d3vi1/helianthus-ebus-adapter-proxy.git
+cd helianthus-ebus-adapter-proxy
+GOWORK=off go test ./...
+GOWORK=off go vet ./...
+./scripts/terminology-gate.sh
+./scripts/verify_issue21_runbook.sh
 ```
 
-ENH direct proxy smoke:
+### 2) Local compatibility harness (simulated, no external hardware)
+
+```bash
+go run ./cmd/ebusd-compat-harness --timeout 10s
+```
+
+Or via wrapper:
+
+```bash
+./scripts/run-ebusd-compat-harness.sh --timeout 10s --log-dir .verify/issue14
+```
+
+## Local Smoke-Test Configuration Examples
+
+### A) Gateway direct-proxy smoke profile (issue #15)
+
+Use when `../helianthus-ebusgateway` is available and pointed at this proxy:
 
 ```bash
 ./scripts/run-gateway-direct-proxy-smoke.sh \
@@ -129,153 +73,55 @@ ENH direct proxy smoke:
   --source-address 0xF0
 ```
 
-ENS direct proxy smoke:
+### B) HA integration dual-topology smoke profile (issue #17)
 
-```bash
-./scripts/run-gateway-direct-proxy-smoke.sh \
-  --gateway-repo ../helianthus-ebusgateway \
-  --profile ens \
-  --proxy-host 127.0.0.1 \
-  --proxy-port 19002 \
-  --source-address 0xF1
-```
-
-Expected result for each run:
-
-```text
-PASS: gateway smoke profile <enh|ens> completed against 127.0.0.1:<port>
-PASS: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://127.0.0.1:<port>
-```
-
-Deterministic failure shape for gateway path readiness:
-
-```text
-FAIL: gateway path readiness profile=<enh|ens> endpoint=<enh|ens>://127.0.0.1:<port> (see <repo>/.verify/issue15/gateway-smoke-<profile>.log)
-```
-
-## HA add-on proxy profile linkage (M4, issue #16)
-
-- Coordination target: `d3vi1/helianthus-ha-addon#30` / PR `#31`.
-- Cross-repo profile configuration and smoke runbook live in:
-  - `../helianthus-ha-addon/README.md`
-  - `../helianthus-ha-addon/SMOKE_RUNBOOK.md`
-- Deterministic checklist markers must include:
-  - `[PASS] CHECK_LOG_PROXY_PROFILE :: ...`
-  - `[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...`
-
-Cross-repo setup:
-
-```bash
-cd ../helianthus-ha-addon
-git checkout main
-git pull --ff-only origin main
-cd ../helianthus-ebus-adapter-proxy
-```
-
-HA add-on proxy marker checklist (ENH example):
-
-```bash
-cd ../helianthus-ha-addon
-python3 scripts/smoke_addon_checklist.py \
-  --log-file /tmp/helianthus-addon.log \
-  --transport enh \
-  --network tcp \
-  --address 192.168.100.2:9999 \
-  --proxy-profile enh \
-  --proxy-endpoint 127.0.0.1:19001
-```
-
-Expected proxy marker checks in checklist output:
-
-```text
-[PASS] CHECK_LOG_PROXY_PROFILE :: ...
-[PASS] CHECK_LOG_PROXY_ENDPOINT :: ...
-```
-
-## HA integration dual-topology smoke path (M4, issue #17)
-
-- Coordination target: `d3vi1/helianthus-ha-integration#58` / PR `#59`.
-- Cross-repo smoke runner:
-  - `scripts/run-ha-integration-dual-topology-smoke.sh`
-- The runner executes HA integration dual-topology smoke (`ebusd` endpoint + adapter-proxy endpoint) and checks deterministic marker `CHECK_DUAL_TOPOLOGY_PATH`.
-- Gateway readiness is reported with deterministic marker lines:
-  - `PASS: gateway readiness dual-topology path ...`
-  - `FAIL: gateway readiness dual-topology path ...`
-
-Cross-repo setup:
-
-```bash
-cd ../helianthus-ha-integration
-git fetch origin
-git checkout main
-git pull --ff-only origin main
-cd ../helianthus-ebus-adapter-proxy
-```
-
-If PR `#59` is not merged yet, use the feature branch with `--allow-non-main`:
-
-```bash
-cd ../helianthus-ha-integration
-git fetch origin issue-58-ha-dual-topology-smoke
-git checkout issue-58-ha-dual-topology-smoke
-cd ../helianthus-ebus-adapter-proxy
-```
-
-ENH dual-topology smoke:
+Use when `../helianthus-ha-integration` is available for coexistence checks:
 
 ```bash
 ./scripts/run-ha-integration-dual-topology-smoke.sh \
   --ha-repo ../helianthus-ha-integration \
-  --allow-non-main \
   --proxy-profile enh \
   --proxy-port 19001 \
   --ebusd-host 127.0.0.1 \
   --ebusd-port 8888
 ```
 
-ENS dual-topology smoke:
+### C) Profile templates for generated gateway `AGENT-local.md`
 
-```bash
-./scripts/run-ha-integration-dual-topology-smoke.sh \
-  --ha-repo ../helianthus-ha-integration \
-  --allow-non-main \
-  --proxy-profile ens \
-  --proxy-port 19002 \
-  --ebusd-host 127.0.0.1 \
-  --ebusd-port 8888
-```
+- `profiles/gateway-direct-proxy/agent-local.enh.md`
+- `profiles/gateway-direct-proxy/agent-local.ens.md`
 
-Expected gateway-readiness markers:
+## Validation Commands
 
-```text
-[PASS] CHECK_DUAL_TOPOLOGY_PATH :: mode=coexistence_ready ...
-PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh|ens>://127.0.0.1:<port>
-PASS: ha integration dual-topology smoke completed for proxy profile <enh|ens>
-```
+| Area | Command |
+|---|---|
+| format (repo expectation) | `find . -name '*.go' -type f -print0 \| xargs -0 gofmt -w` |
+| tests | `GOWORK=off go test ./...` |
+| vet | `GOWORK=off go vet ./...` |
+| terminology gate | `./scripts/terminology-gate.sh` |
+| operations runbook gate | `./scripts/verify_issue21_runbook.sh` |
+| compatibility harness | `go run ./cmd/ebusd-compat-harness --timeout 10s` |
+| gateway smoke CLI help | `./scripts/run-gateway-direct-proxy-smoke.sh --help` |
+| HA dual-topology smoke CLI help | `./scripts/run-ha-integration-dual-topology-smoke.sh --help` |
 
-Deterministic gateway-readiness failure shape:
+## Link Map
 
-```text
-[FAIL] CHECK_DUAL_TOPOLOGY_PATH :: ...
-FAIL: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh|ens>://127.0.0.1:<port> reason=...
-```
+### Local repository docs
 
-## Terminology policy
+- Architecture: `ARCHITECTURE.md`
+- Conventions: `CONVENTIONS.md`
+- Operations runbook: `OPERATIONS_RUNBOOK.md`
+- Agent instructions: `AGENTS.md`
 
-- Use `initiator` and `target` across code and docs.
-- If integration with an external protocol/source requires legacy wording, keep it scoped to that source and add a short clarification in the same context.
-- Keep repository terminology gate-compliant (`./scripts/terminology-gate.sh`).
+### Related repos/docs
 
-## Quick start
+- Gateway runtime: https://github.com/d3vi1/helianthus-ebusgateway
+- HA integration: https://github.com/d3vi1/helianthus-ha-integration
+- HA add-on: https://github.com/d3vi1/helianthus-ha-addon
+- eBUS docs hub: https://github.com/d3vi1/helianthus-docs-ebus
 
-```bash
-GOWORK=off go test ./...
-GOWORK=off go vet ./...
-./scripts/terminology-gate.sh
-```
+### Issue workflow conventions
 
-## Repository documents
-
-- `AGENTS.md`
-- `ARCHITECTURE.md`
-- `CONVENTIONS.md`
+- Keep one issue-focused branch per change (example: `issue-51-readme-refresh`).
+- Keep PR scope aligned to issue acceptance criteria.
+- Include closing keyword in PR body (example: `Fixes #51`).
