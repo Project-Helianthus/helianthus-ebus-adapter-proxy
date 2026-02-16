@@ -22,6 +22,7 @@ func main() {
 	dialTimeout := flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 200*time.Millisecond, "read timeout applied to upstream and downstream sockets")
 	writeTimeout := flag.Duration("write-timeout", 2*time.Second, "write timeout applied to upstream and downstream sockets")
+	debug := flag.Bool("debug", false, "enable debug logging (no client addresses)")
 	flag.Parse()
 
 	normalizedListen, err := normalizeListenAddr(*listenAddr)
@@ -47,6 +48,7 @@ func main() {
 		DialTimeout:  *dialTimeout,
 		ReadTimeout:  *readTimeout,
 		WriteTimeout: *writeTimeout,
+		Debug:        *debug,
 	})
 
 	if err := server.Serve(ctx); err != nil {

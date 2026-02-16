@@ -8,4 +8,5 @@ type Config struct {
 	DialTimeout  time.Duration
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
+	Debug        bool
 }
