@@ -40,6 +40,12 @@ func dialUpstream(
 		return nil, err
 	}
 
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
 	return &upstreamClient{
 		conn:         conn,
 		readTimeout:  readTimeout,
