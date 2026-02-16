@@ -29,4 +29,4 @@ jobs:
         run: ./scripts/terminology-gate.sh
 
       - name: Runbook docs gate
-        run: ./scripts/verify_issue21_runbook.sh
+        run: ./scripts/runbook-gate.sh

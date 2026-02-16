@@ -71,7 +71,7 @@ func (client *upstreamClient) WriteFrame(frame downstream.Frame) error {
 		return io.EOF
 	}
 
-	payload, err := client.encoder.Encode(frame)
+	payload, err := encodeUpstreamFrame(client.encoder, frame)
 	if err != nil {
 		return err
 	}

@@ -45,4 +45,5 @@ for pattern in "${required_patterns[@]}"; do
 	fi
 done
 
-echo "PASS: issue #21 runbook markers verified"
+echo "PASS: operations runbook markers verified"
+
