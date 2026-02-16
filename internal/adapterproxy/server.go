@@ -421,6 +421,9 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			if server.deliverPendingStart(frame) {
 				continue
 			}
+			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResFailed {
+				server.deliverUpstreamFailed(frame)
+			}
 		default:
 		}
 	}
@@ -560,6 +563,21 @@ func (server *Server) deliverUpstreamError(frame downstream.Frame) {
 
 	if owner != 0 {
 		server.reply(owner, frame)
+		server.releaseBusIfOwner(owner)
+		return
+	}
+
+	server.broadcast(frame)
+}
+
+func (server *Server) deliverUpstreamFailed(frame downstream.Frame) {
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+
+	if owner != 0 {
+		server.reply(owner, frame)
+		server.releaseBusIfOwner(owner)
 		return
 	}
 
