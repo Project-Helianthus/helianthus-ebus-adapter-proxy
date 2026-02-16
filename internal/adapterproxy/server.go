@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
@@ -24,6 +26,11 @@ type Server struct {
 	listener net.Listener
 	upstream *upstreamClient
 
+	upstreamFeatures atomic.Uint32
+
+	backpressureDrops  atomic.Uint64
+	backpressureCloses atomic.Uint64
+
 	mutex    sync.Mutex
 	sessions map[uint64]*session
 	nextID   uint64
@@ -33,6 +40,9 @@ type Server struct {
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
+
+	pendingInfoMu sync.Mutex
+	pendingInfo   *pendingInfo
 
 	leasesMu     sync.Mutex
 	leaseManager *sourcepolicy.LeaseManager
@@ -44,6 +54,11 @@ type Server struct {
 type pendingStart struct {
 	sessionID uint64
 	respCh    chan downstream.Frame
+}
+
+type pendingInfo struct {
+	sessionID uint64
+	remaining int
 }
 
 func NewServer(cfg Config) *Server {
@@ -80,7 +95,9 @@ func (server *Server) Serve(ctx context.Context) error {
 		return fmt.Errorf("dial upstream: %w", err)
 	}
 	server.upstream = upstream
-	if err := server.upstream.SendInit(0x00); err != nil {
+	// Request additional infos up-front so downstream clients can query INFO without
+	// being sensitive to proxy initialization ordering.
+	if err := server.upstream.SendInit(0x01); err != nil {
 		// Best-effort: some adapters respond with RESETTED, others start streaming immediately.
 	}
 
@@ -155,6 +172,12 @@ func (server *Server) unregisterSession(sessionID uint64) {
 		server.pendingStart = nil
 	}
 	server.pendingStartMu.Unlock()
+
+	server.pendingInfoMu.Lock()
+	if server.pendingInfo != nil && server.pendingInfo.sessionID == sessionID {
+		server.pendingInfo = nil
+	}
+	server.pendingInfoMu.Unlock()
 }
 
 func (server *Server) closeSessions() {
@@ -180,18 +203,15 @@ func (server *Server) handleFrame(ctx context.Context, sessionID uint64, frame d
 
 	switch command {
 	case southboundenh.ENHReqInit:
+		initFeatures := server.initResponseFeatures(data)
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResResetted),
-			Payload: []byte{data},
+			Payload: []byte{initFeatures},
 		})
 	case southboundenh.ENHReqInfo:
-		// Respond with a zero-length info payload.
-		server.reply(sessionID, downstream.Frame{
-			Command: byte(southboundenh.ENHResInfo),
-			Payload: []byte{0x00},
-		})
+		server.handleInfo(sessionID, data)
 	case southboundenh.ENHReqStart:
-		go server.handleStart(ctx, sessionID, data)
+		server.handleStart(ctx, sessionID, data)
 	case southboundenh.ENHReqSend:
 		server.handleSend(sessionID, data)
 	default:
@@ -202,7 +222,22 @@ func (server *Server) handleFrame(ctx context.Context, sessionID uint64, frame d
 	}
 }
 
+func (server *Server) initResponseFeatures(requested byte) byte {
+	upstream := byte(server.upstreamFeatures.Load())
+	if upstream != 0 {
+		return upstream
+	}
+	return requested
+}
+
 func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiator byte) {
+	server.mutex.Lock()
+	sess := server.sessions[sessionID]
+	server.mutex.Unlock()
+	if sess == nil {
+		return
+	}
+
 	if !server.acquireLease(sessionID, initiator) {
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
@@ -211,10 +246,27 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 
+	waitStart := time.Now()
 	select {
 	case <-server.busToken:
 	case <-ctx.Done():
 		return
+	case <-sess.done:
+		return
+	}
+
+	if server.cfg.Debug {
+		log.Printf("session=%d start_wait=%s", sessionID, time.Since(waitStart))
+	}
+
+	select {
+	case <-ctx.Done():
+		server.releaseBusToken()
+		return
+	case <-sess.done:
+		server.releaseBusToken()
+		return
+	default:
 	}
 
 	respCh := make(chan downstream.Frame, 1)
@@ -265,6 +317,35 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
 		server.releaseBusToken()
+		return
+	}
+}
+
+func (server *Server) handleInfo(sessionID uint64, infoID byte) {
+	server.mutex.Lock()
+	sess := server.sessions[sessionID]
+	server.mutex.Unlock()
+	if sess == nil {
+		return
+	}
+
+	server.pendingInfoMu.Lock()
+	server.pendingInfo = &pendingInfo{
+		sessionID: sessionID,
+		remaining: -1,
+	}
+	server.pendingInfoMu.Unlock()
+
+	infoFrame := downstream.Frame{
+		Command: byte(southboundenh.ENHReqInfo),
+		Payload: []byte{infoID},
+	}
+	if err := server.upstream.WriteFrame(infoFrame); err != nil {
+		server.clearPendingInfo(sessionID)
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
 		return
 	}
 }
@@ -323,9 +404,20 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 
 		switch southboundenh.ENHCommand(frame.Command) {
 		case southboundenh.ENHResReceived, southboundenh.ENHResResetted:
+			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResResetted && len(frame.Payload) == 1 {
+				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
+			}
 			server.broadcast(frame)
-		case southboundenh.ENHResStarted, southboundenh.ENHResFailed,
-			southboundenh.ENHResErrorEBUS, southboundenh.ENHResErrorHost:
+		case southboundenh.ENHResInfo:
+			if server.deliverPendingInfo(frame) {
+				continue
+			}
+		case southboundenh.ENHResErrorEBUS, southboundenh.ENHResErrorHost:
+			if server.deliverPendingStart(frame) {
+				continue
+			}
+			server.deliverUpstreamError(frame)
+		case southboundenh.ENHResStarted, southboundenh.ENHResFailed:
 			if server.deliverPendingStart(frame) {
 				continue
 			}
@@ -350,12 +442,63 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	return true
 }
 
+func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
+	server.pendingInfoMu.Lock()
+	pending := server.pendingInfo
+	server.pendingInfoMu.Unlock()
+	if pending == nil {
+		return false
+	}
+
+	server.mutex.Lock()
+	sess := server.sessions[pending.sessionID]
+	server.mutex.Unlock()
+	if sess == nil {
+		server.clearPendingInfo(pending.sessionID)
+		return false
+	}
+
+	server.reply(pending.sessionID, frame)
+
+	server.pendingInfoMu.Lock()
+	defer server.pendingInfoMu.Unlock()
+	if server.pendingInfo == nil || server.pendingInfo.sessionID != pending.sessionID {
+		return true
+	}
+
+	if len(frame.Payload) != 1 {
+		return true
+	}
+
+	if server.pendingInfo.remaining < 0 {
+		server.pendingInfo.remaining = int(frame.Payload[0])
+		if server.pendingInfo.remaining <= 0 {
+			server.pendingInfo = nil
+		}
+		return true
+	}
+
+	server.pendingInfo.remaining--
+	if server.pendingInfo.remaining <= 0 {
+		server.pendingInfo = nil
+	}
+	return true
+}
+
 func (server *Server) clearPendingStart(sessionID uint64) {
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
 		server.pendingStart = nil
 	}
 	server.pendingStartMu.Unlock()
+}
+
+func (server *Server) clearPendingInfo(sessionID uint64) {
+	server.pendingInfoMu.Lock()
+	if server.pendingInfo != nil && server.pendingInfo.sessionID == sessionID {
+		server.pendingInfo = nil
+	}
+	server.pendingInfoMu.Unlock()
 }
 
 func (server *Server) broadcast(frame downstream.Frame) {
@@ -367,7 +510,7 @@ func (server *Server) broadcast(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	for _, sess := range sessions {
-		sess.enqueue(frame)
+		server.enqueueOrClose(sess, frame, "broadcast")
 	}
 }
 
@@ -379,7 +522,48 @@ func (server *Server) reply(sessionID uint64, frame downstream.Frame) {
 		return
 	}
 
-	sess.enqueue(frame)
+	server.enqueueOrClose(sess, frame, "reply")
+}
+
+func (server *Server) enqueueOrClose(sess *session, frame downstream.Frame, reason string) {
+	select {
+	case <-sess.done:
+		return
+	default:
+	}
+
+	if sess.enqueue(frame) {
+		return
+	}
+
+	dropped := server.backpressureDrops.Add(1)
+	closed := server.backpressureCloses.Add(1)
+	if server.cfg.Debug {
+		log.Printf(
+			"session=%d outbound_backpressure reason=%s dropped=%d closed=%d queue_len=%d queue_cap=%d",
+			sess.id,
+			reason,
+			dropped,
+			closed,
+			len(sess.sendCh),
+			cap(sess.sendCh),
+		)
+	}
+
+	_ = sess.Close()
+}
+
+func (server *Server) deliverUpstreamError(frame downstream.Frame) {
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+
+	if owner != 0 {
+		server.reply(owner, frame)
+		return
+	}
+
+	server.broadcast(frame)
 }
 
 func (server *Server) releaseBusIfOwner(sessionID uint64) {
