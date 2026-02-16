@@ -294,8 +294,6 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	select {
 	case response := <-respCh:
 		server.clearPendingStart(sessionID)
-		server.reply(sessionID, response)
-
 		switch southboundenh.ENHCommand(response.Command) {
 		case southboundenh.ENHResStarted:
 			server.mutex.Lock()
@@ -375,10 +373,6 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		server.releaseBusIfOwner(sessionID)
 		return
 	}
-
-	if data == 0xAA {
-		server.releaseBusIfOwner(sessionID)
-	}
 }
 
 func (server *Server) runUpstreamReader(ctx context.Context) {
@@ -436,6 +430,11 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	if pending == nil {
 		return false
 	}
+
+	// Preserve upstream ordering: enqueue the response immediately on the owning
+	// session (mirrors the single-connection behavior of a real adapter). The
+	// waiting START handler only uses respCh to update internal ownership state.
+	server.reply(pending.sessionID, frame)
 
 	select {
 	case pending.respCh <- cloneFrame(frame):
