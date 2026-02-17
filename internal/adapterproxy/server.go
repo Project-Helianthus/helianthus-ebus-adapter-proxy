@@ -239,6 +239,10 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 
+	if server.cfg.Debug {
+		log.Printf("session=%d start initiator=0x%02X", sessionID, initiator)
+	}
+
 	if !server.acquireLease(sessionID, initiator) {
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
@@ -326,6 +330,14 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	select {
 	case response := <-respCh:
 		server.clearPendingStart(sessionID)
+		if server.cfg.Debug {
+			log.Printf(
+				"session=%d start_resp cmd=0x%02X data=0x%02X",
+				sessionID,
+				response.Command,
+				response.Payload[0],
+			)
+		}
 		switch southboundenh.ENHCommand(response.Command) {
 		case southboundenh.ENHResStarted:
 			server.mutex.Lock()
@@ -485,6 +497,15 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	server.pendingStartMu.Unlock()
 	if pending == nil {
 		return false
+	}
+
+	if server.cfg.Debug {
+		log.Printf(
+			"session=%d upstream_start_result cmd=0x%02X data=0x%02X",
+			pending.sessionID,
+			frame.Command,
+			frame.Payload[0],
+		)
 	}
 
 	// Preserve upstream ordering: enqueue the response immediately on the owning
