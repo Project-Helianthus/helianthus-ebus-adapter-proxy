@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultLeaseDuration = 30 * time.Minute
+	ebusSyn              = byte(0xAA)
 )
 
 type Server struct {
@@ -246,25 +247,54 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 
-	waitStart := time.Now()
-	select {
-	case <-server.busToken:
-	case <-ctx.Done():
-		return
-	case <-sess.done:
+	if initiator == ebusSyn {
+		server.handleStartCancel(sessionID)
+		// Forward best-effort cancellation upstream. The enhanced protocol does not
+		// mandate a response for START+SYN, so we must not block waiting for one.
+		_ = server.upstream.WriteFrame(downstream.Frame{
+			Command: byte(southboundenh.ENHReqStart),
+			Payload: []byte{initiator},
+		})
 		return
 	}
 
-	if server.cfg.Debug {
-		log.Printf("session=%d start_wait=%s", sessionID, time.Since(waitStart))
+	ownedBySession := func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return server.busOwner == sessionID
+	}()
+
+	if !ownedBySession {
+		waitStart := time.Now()
+		select {
+		case <-server.busToken:
+		case <-ctx.Done():
+			return
+		case <-sess.done:
+			return
+		}
+
+		if server.cfg.Debug {
+			log.Printf("session=%d start_wait=%s", sessionID, time.Since(waitStart))
+		}
+	} else if server.cfg.Debug {
+		log.Printf("session=%d start_reuse_owner=true", sessionID)
 	}
+
+	// If we acquired the bus token above, it is now held until SYN (end-of-message)
+	// or an error/disconnect. If we are reusing an existing ownership, do not touch
+	// the token here.
 
 	select {
 	case <-ctx.Done():
-		server.releaseBusToken()
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
 		return
 	case <-sess.done:
-		server.releaseBusToken()
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
 		return
 	default:
 	}
@@ -283,7 +313,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 	if err := server.upstream.WriteFrame(startFrame); err != nil {
 		server.clearPendingStart(sessionID)
-		server.releaseBusToken()
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
@@ -301,12 +333,16 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 			server.mutex.Unlock()
 			return
 		default:
-			server.releaseBusToken()
+			if !ownedBySession {
+				server.releaseBusToken()
+			}
 			return
 		}
 	case <-time.After(5 * time.Second):
 		server.clearPendingStart(sessionID)
-		server.releaseBusToken()
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
@@ -314,9 +350,22 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
-		server.releaseBusToken()
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
 		return
 	}
+}
+
+func (server *Server) handleStartCancel(sessionID uint64) {
+	server.pendingStartMu.Lock()
+	pending := server.pendingStart
+	if pending != nil && pending.sessionID == sessionID {
+		server.pendingStart = nil
+	}
+	server.pendingStartMu.Unlock()
+
+	server.releaseBusIfOwner(sessionID)
 }
 
 func (server *Server) handleInfo(sessionID uint64, infoID byte) {
@@ -372,6 +421,13 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		})
 		server.releaseBusIfOwner(sessionID)
 		return
+	}
+
+	// In direct-mode usage, hosts terminate a telegram with SYN (0xAA).
+	// Release our multiplexed bus lock at that boundary so other sessions can
+	// arbitrate, matching the single-host behavior of a real adapter.
+	if data == ebusSyn {
+		server.releaseBusIfOwner(sessionID)
 	}
 }
 
