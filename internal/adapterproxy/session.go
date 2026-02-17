@@ -1,6 +1,7 @@
 package adapterproxy
 
 import (
+	"bufio"
 	"io"
 	"net"
 	"sync"
@@ -15,6 +16,7 @@ type session struct {
 	remoteAddr string
 
 	conn         net.Conn
+	reader       *bufio.Reader
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 
@@ -43,6 +45,7 @@ func newSession(
 		id:           id,
 		remoteAddr:   conn.RemoteAddr().String(),
 		conn:         conn,
+		reader:       bufio.NewReaderSize(conn, 4096),
 		readTimeout:  readTimeout,
 		writeTimeout: writeTimeout,
 		sendCh:       make(chan downstream.Frame, defaultSessionSendBuffer),
@@ -103,7 +106,7 @@ func (s *session) runReader(onFrame func(downstream.Frame), onError func(error))
 		}
 
 		_ = setReadDeadline(s.conn, s.readTimeout)
-		frame, err := s.parser.Parse(s.conn)
+		frame, err := s.parser.Parse(s.reader)
 		if err != nil {
 			if isTimeoutError(err) {
 				continue
