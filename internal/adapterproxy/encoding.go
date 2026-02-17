@@ -30,9 +30,5 @@ func encodeUpstreamFrame(encoder southboundenh.ENHEncoder, frame downstream.Fram
 		)
 	}
 
-	if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHReqSend && frame.Payload[0] < 0x80 {
-		return []byte{frame.Payload[0]}, nil
-	}
-
 	return encoder.Encode(frame)
 }
