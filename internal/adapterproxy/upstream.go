@@ -1,6 +1,7 @@
 package adapterproxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 type upstreamClient struct {
 	conn         net.Conn
+	reader       *bufio.Reader
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 
@@ -48,6 +50,7 @@ func dialUpstream(
 
 	return &upstreamClient{
 		conn:         conn,
+		reader:       bufio.NewReaderSize(conn, 4096),
 		readTimeout:  readTimeout,
 		writeTimeout: writeTimeout,
 	}, nil
@@ -69,7 +72,7 @@ func (client *upstreamClient) ReadFrame() (downstream.Frame, error) {
 		return downstream.Frame{}, err
 	}
 
-	return client.parser.Parse(client.conn)
+	return client.parser.Parse(client.reader)
 }
 
 func (client *upstreamClient) WriteFrame(frame downstream.Frame) error {

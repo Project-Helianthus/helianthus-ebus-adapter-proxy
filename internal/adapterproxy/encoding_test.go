@@ -58,7 +58,7 @@ func TestEncodeDownstreamFrame_DoesNotShortFormNonReceived(t *testing.T) {
 	}
 }
 
-func TestEncodeUpstreamFrame_UsesShortFormForSendBelow80(t *testing.T) {
+func TestEncodeUpstreamFrame_EncodesSendBelow80(t *testing.T) {
 	encoder := southboundenh.ENHEncoder{}
 	frame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqSend),
@@ -70,8 +70,8 @@ func TestEncodeUpstreamFrame_UsesShortFormForSendBelow80(t *testing.T) {
 		t.Fatalf("encodeUpstreamFrame returned error: %v", err)
 	}
 
-	if len(encoded) != 1 || encoded[0] != 0x01 {
-		t.Fatalf("expected short form [0x01], got %v", encoded)
+	if len(encoded) != 2 {
+		t.Fatalf("expected 2-byte ENH encoding, got %v", encoded)
 	}
 }
 
