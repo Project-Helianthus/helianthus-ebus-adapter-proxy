@@ -38,6 +38,7 @@ type Server struct {
 
 	busToken chan struct{}
 	busOwner uint64
+	busDirty bool
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -342,6 +343,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		case southboundenh.ENHResStarted:
 			server.mutex.Lock()
 			server.busOwner = sessionID
+			server.busDirty = false
 			server.mutex.Unlock()
 			return
 		default:
@@ -422,6 +424,10 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		return
 	}
 
+	server.mutex.Lock()
+	server.busDirty = true
+	server.mutex.Unlock()
+
 	sendFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqSend),
 		Payload: []byte{data},
@@ -468,6 +474,9 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		case southboundenh.ENHResReceived, southboundenh.ENHResResetted:
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResResetted && len(frame.Payload) == 1 {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
+			}
+			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 && frame.Payload[0] == ebusSyn {
+				server.releaseBusIfIdleSyn()
 			}
 			server.broadcast(frame)
 		case southboundenh.ENHResInfo:
@@ -667,9 +676,27 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 		return
 	}
 	server.busOwner = 0
+	server.busDirty = false
 	server.mutex.Unlock()
 
 	server.releaseBusToken()
+}
+
+func (server *Server) releaseBusIfIdleSyn() {
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	server.mutex.Unlock()
+
+	if owner == 0 || !dirty {
+		return
+	}
+
+	if server.cfg.Debug {
+		log.Printf("session=%d release_reason=idle_syn", owner)
+	}
+
+	server.releaseBusIfOwner(owner)
 }
 
 func (server *Server) releaseBusToken() {
