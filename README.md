@@ -40,10 +40,7 @@ adapter endpoint/ebusd -> helianthus-ebus-adapter-proxy -> helianthus-ebusgatewa
 ```bash
 git clone https://github.com/d3vi1/helianthus-ebus-adapter-proxy.git
 cd helianthus-ebus-adapter-proxy
-GOWORK=off go test ./...
-GOWORK=off go vet ./...
-./scripts/terminology-gate.sh
-./scripts/verify_issue21_runbook.sh
+./scripts/ci_local.sh
 ```
 
 ### 2) Local compatibility harness (simulated, no external hardware)
