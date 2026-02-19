@@ -520,6 +520,11 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 					server.markSessionCollision(sessionID, 0x00)
 				}
 			}
+			if southboundenh.ENHCommand(response.Command) == southboundenh.ENHResFailed ||
+				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorEBUS ||
+				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorHost {
+				server.releaseBusIfOwner(sessionID)
+			}
 			if !ownedBySession {
 				server.releaseBusToken()
 			}
@@ -527,6 +532,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 	case <-time.After(5 * time.Second):
 		server.clearPendingStart(sessionID)
+		server.releaseBusIfOwner(sessionID)
 		if !ownedBySession {
 			server.releaseBusToken()
 		}
@@ -537,6 +543,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
+		server.releaseBusIfOwner(sessionID)
 		if !ownedBySession {
 			server.releaseBusToken()
 		}
@@ -1278,10 +1285,9 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 func (server *Server) releaseBusIfIdleSyn() {
 	server.mutex.Lock()
 	owner := server.busOwner
-	dirty := server.busDirty
 	server.mutex.Unlock()
 
-	if owner == 0 || !dirty {
+	if owner == 0 {
 		return
 	}
 
