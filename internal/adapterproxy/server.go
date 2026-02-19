@@ -281,7 +281,13 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		log.Printf("session=%d start initiator=0x%02X", sessionID, initiator)
 	}
 
-	if !server.acquireLease(sessionID, initiator) {
+	if err := server.acquireLease(sessionID, initiator); err != nil {
+		log.Printf(
+			"session=%d lease_rejected initiator=0x%02X reason=%v",
+			sessionID,
+			initiator,
+			err,
+		)
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
@@ -978,16 +984,23 @@ func (server *Server) releaseBusToken() {
 	}
 }
 
-func (server *Server) acquireLease(sessionID uint64, initiator byte) bool {
+func (server *Server) acquireLease(sessionID uint64, initiator byte) error {
 	if server.leaseManager == nil {
-		return true
+		return nil
 	}
 
 	server.leasesMu.Lock()
 	defer server.leasesMu.Unlock()
 
 	if existing, ok := server.leasedBySess[sessionID]; ok {
-		return existing.Address == initiator
+		if existing.Address == initiator {
+			return nil
+		}
+		return fmt.Errorf(
+			"session already leased initiator 0x%02X (requested 0x%02X)",
+			existing.Address,
+			initiator,
+		)
 	}
 
 	lease, err := server.leaseManager.Acquire(
@@ -998,11 +1011,11 @@ func (server *Server) acquireLease(sessionID uint64, initiator byte) bool {
 		},
 	)
 	if err != nil {
-		return false
+		return err
 	}
 
 	server.leasedBySess[sessionID] = lease
-	return true
+	return nil
 }
 
 func (server *Server) releaseLease(sessionID uint64) {

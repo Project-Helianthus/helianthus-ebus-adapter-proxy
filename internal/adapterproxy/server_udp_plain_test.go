@@ -1,10 +1,12 @@
 package adapterproxy
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/sourcepolicy"
 	southboundenh "github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/southbound/enh"
 )
 
@@ -93,5 +95,24 @@ func TestDeliverPendingStartFromArbByteFailed(t *testing.T) {
 		}
 	default:
 		t.Fatalf("no pending response delivered")
+	}
+}
+
+func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	if err := server.acquireLease(1, 0x31); err != nil {
+		t.Fatalf("acquireLease(session=1) error = %v", err)
+	}
+
+	err := server.acquireLease(2, 0x31)
+	if err == nil {
+		t.Fatalf("acquireLease(session=2) error = nil; want conflict")
+	}
+
+	var conflict sourcepolicy.LeaseConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("acquireLease(session=2) error = %v; want LeaseConflictError", err)
 	}
 }
