@@ -98,6 +98,42 @@ func TestDeliverPendingStartFromArbByteFailed(t *testing.T) {
 	}
 }
 
+func TestDeliverPendingStart_UDPPlainDoesNotReplyImmediatelyOnFailed(t *testing.T) {
+	t.Parallel()
+
+	respCh := make(chan downstream.Frame, 1)
+	sessionState := &session{id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})}
+	server := &Server{
+		sessions: map[uint64]*session{1: sessionState},
+		pendingStart: &pendingStart{
+			sessionID: 1,
+			respCh:    respCh,
+			mode:      pendingStartModeUDPPlain,
+			initiator: 0x31,
+		},
+	}
+
+	delivered := server.deliverPendingStart(downstream.Frame{
+		Command: byte(southboundenh.ENHResFailed),
+		Payload: []byte{0x33},
+	})
+	if !delivered {
+		t.Fatalf("deliverPendingStart returned false; want true")
+	}
+
+	select {
+	case <-respCh:
+	default:
+		t.Fatalf("pending response channel did not receive frame")
+	}
+
+	select {
+	case frame := <-sessionState.sendCh:
+		t.Fatalf("unexpected immediate downstream reply: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
+	default:
+	}
+}
+
 func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {
 	t.Parallel()
 

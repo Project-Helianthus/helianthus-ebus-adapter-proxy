@@ -564,9 +564,17 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 				server.busOwner = sessionID
 				server.busDirty = false
 				server.mutex.Unlock()
+				server.reply(sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResStarted),
+					Payload: []byte{initiator},
+				})
 				return
 			case southboundenh.ENHResFailed:
 				if attempt+1 >= udpPlainMaxAttempts {
+					server.reply(sessionID, downstream.Frame{
+						Command: byte(southboundenh.ENHResFailed),
+						Payload: append([]byte(nil), response.Payload...),
+					})
 					return
 				}
 				if server.cfg.Debug && len(response.Payload) == 1 {
@@ -863,15 +871,19 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		)
 	}
 
-	// Preserve upstream ordering: enqueue the response immediately on the owning
-	// session (mirrors the single-connection behavior of a real adapter). The
-	// waiting START handler only uses respCh to update internal ownership state.
-	server.reply(pending.sessionID, frame)
-
 	select {
 	case pending.respCh <- cloneFrame(frame):
 	default:
 	}
+
+	if pending.mode == pendingStartModeUDPPlain {
+		return true
+	}
+
+	// Preserve upstream ordering for ENH upstream mode: enqueue the response
+	// immediately on the owning session. The waiting START handler still uses
+	// respCh for internal ownership state updates.
+	server.reply(pending.sessionID, frame)
 
 	return true
 }
