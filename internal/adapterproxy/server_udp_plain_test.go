@@ -138,11 +138,11 @@ func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {
 	t.Parallel()
 
 	server := NewServer(Config{})
-	if err := server.acquireLease(1, 0x31); err != nil {
+	if _, err := server.acquireLease(1, 0x31); err != nil {
 		t.Fatalf("acquireLease(session=1) error = %v", err)
 	}
 
-	err := server.acquireLease(2, 0x31)
+	_, err := server.acquireLease(2, 0x31)
 	if err == nil {
 		t.Fatalf("acquireLease(session=2) error = nil; want conflict")
 	}
@@ -150,5 +150,77 @@ func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {
 	var conflict sourcepolicy.LeaseConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("acquireLease(session=2) error = %v; want LeaseConflictError", err)
+	}
+}
+
+func TestUDPPlainRetryBackoffWithJitter(t *testing.T) {
+	t.Parallel()
+
+	base := udpPlainRetryBackoff(2)
+	if got := udpPlainRetryBackoffWithJitter(2, 0, func() float64 { return 0.5 }); got != base {
+		t.Fatalf("jitter disabled backoff = %s; want %s", got, base)
+	}
+
+	low := udpPlainRetryBackoffWithJitter(2, 0.2, func() float64 { return 0.0 })
+	high := udpPlainRetryBackoffWithJitter(2, 0.2, func() float64 { return 1.0 })
+	if low >= base {
+		t.Fatalf("low jitter backoff = %s; want < %s", low, base)
+	}
+	if high <= base {
+		t.Fatalf("high jitter backoff = %s; want > %s", high, base)
+	}
+	if high > udpPlainBackoffMax {
+		t.Fatalf("high jitter backoff = %s; want <= %s", high, udpPlainBackoffMax)
+	}
+}
+
+func TestSelectAutoInitiatorSkipsObservedAndLeased(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{AutoJoinActivityWindow: time.Minute})
+	now := time.Now().UTC()
+
+	server.observedMu.Lock()
+	server.observedInitiatorAt[0xFF] = now
+	server.observedMu.Unlock()
+
+	server.leasesMu.Lock()
+	server.leasedBySess[1] = sourcepolicy.Lease{OwnerID: "session/1", Address: 0xF7}
+	server.leasesMu.Unlock()
+
+	selected, err := server.selectAutoInitiator()
+	if err != nil {
+		t.Fatalf("selectAutoInitiator error = %v", err)
+	}
+	if selected != 0xF3 {
+		t.Fatalf("selectAutoInitiator = 0x%02X; want 0xF3", selected)
+	}
+}
+
+func TestHandleSendReturnsArbitrationFailedWhenCollisionActive(t *testing.T) {
+	t.Parallel()
+
+	sessionState := &session{
+		id:     1,
+		sendCh: make(chan downstream.Frame, 1),
+		done:   make(chan struct{}),
+	}
+	server := &Server{
+		sessions:           map[uint64]*session{1: sessionState},
+		collisionBySession: map[uint64]byte{1: 0x33},
+	}
+
+	server.handleSend(1, 0xB5)
+
+	select {
+	case frame := <-sessionState.sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResFailed {
+			t.Fatalf("command = 0x%02X; want ENHResFailed", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x33 {
+			t.Fatalf("payload = %x; want [33]", frame.Payload)
+		}
+	default:
+		t.Fatalf("expected arbitration failed reply")
 	}
 }

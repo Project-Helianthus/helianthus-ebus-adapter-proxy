@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"strings"
@@ -27,6 +28,8 @@ const (
 	udpPlainMaxAttempts   = 4
 	udpPlainBackoffBase   = 25 * time.Millisecond
 	udpPlainBackoffMax    = 400 * time.Millisecond
+	defaultRetryJitter    = 0.2
+	defaultAutoJoinWarmup = 5 * time.Second
 	udpNorthboundQueueCap = 1024
 )
 
@@ -53,9 +56,18 @@ type Server struct {
 	backpressureDrops  atomic.Uint64
 	backpressureCloses atomic.Uint64
 
+	randomFloat64 func() float64
+
 	mutex    sync.Mutex
 	sessions map[uint64]*session
 	nextID   uint64
+
+	autoJoinInitiator byte
+	startOfTelegram   bool
+
+	observedMu          sync.Mutex
+	observedInitiatorAt map[byte]time.Time
+	collisionBySession  map[uint64]byte
 
 	busToken chan struct{}
 	busOwner uint64
@@ -94,15 +106,43 @@ const (
 	pendingStartModeUDPPlain
 )
 
+var preferredInitiatorAddresses = []byte{
+	0xFF, 0xF7, 0xF3, 0xF1, 0xF0,
+	0x7F, 0x77, 0x73, 0x71, 0x70,
+	0x3F, 0x37, 0x33, 0x31, 0x30,
+	0x1F, 0x17, 0x13, 0x11, 0x10,
+	0x0F, 0x07, 0x03, 0x01, 0x00,
+}
+
 func NewServer(cfg Config) *Server {
+	if cfg.AutoJoinWarmup <= 0 {
+		cfg.AutoJoinWarmup = defaultAutoJoinWarmup
+	}
+	if cfg.AutoJoinActivityWindow <= 0 {
+		cfg.AutoJoinActivityWindow = cfg.AutoJoinWarmup
+	}
+	if cfg.UDPPlainRetryJitter < 0 {
+		cfg.UDPPlainRetryJitter = 0
+	}
+	if cfg.UDPPlainRetryJitter > 1 {
+		cfg.UDPPlainRetryJitter = 1
+	}
+	if cfg.UDPPlainRetryJitter == 0 {
+		cfg.UDPPlainRetryJitter = defaultRetryJitter
+	}
+
 	server := &Server{
-		cfg:          cfg,
-		sessions:     make(map[uint64]*session),
-		busToken:     make(chan struct{}, 1),
-		leasedBySess: make(map[uint64]sourcepolicy.Lease),
-		synCh:        make(chan struct{}, 1),
-		udpClients:   make(map[string]*net.UDPAddr),
-		udpQueue:     make(chan udpDatagram, udpNorthboundQueueCap),
+		cfg:                 cfg,
+		sessions:            make(map[uint64]*session),
+		busToken:            make(chan struct{}, 1),
+		leasedBySess:        make(map[uint64]sourcepolicy.Lease),
+		synCh:               make(chan struct{}, 1),
+		udpClients:          make(map[string]*net.UDPAddr),
+		udpQueue:            make(chan udpDatagram, udpNorthboundQueueCap),
+		randomFloat64:       rand.Float64,
+		startOfTelegram:     true,
+		observedInitiatorAt: make(map[byte]time.Time),
+		collisionBySession:  make(map[uint64]byte),
 	}
 	server.busToken <- struct{}{}
 
@@ -178,6 +218,27 @@ func (server *Server) Serve(ctx context.Context) error {
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
+	if server.cfg.AutoJoinWarmup > 0 {
+		if server.cfg.Debug {
+			log.Printf("auto_join_warmup=%s", server.cfg.AutoJoinWarmup)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(server.cfg.AutoJoinWarmup):
+		}
+		if selected, err := server.selectAutoInitiator(); err == nil {
+			server.mutex.Lock()
+			server.autoJoinInitiator = selected
+			server.mutex.Unlock()
+			if server.cfg.Debug {
+				log.Printf("auto_join_selected initiator=0x%02X", selected)
+			}
+		} else if server.cfg.Debug {
+			log.Printf("auto_join_select_error=%v", err)
+		}
+	}
+
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -239,6 +300,7 @@ func (server *Server) unregisterSession(sessionID uint64) {
 
 	server.releaseBusIfOwner(sessionID)
 	server.releaseLease(sessionID)
+	server.clearSessionCollision(sessionID)
 
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
@@ -315,7 +377,23 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		log.Printf("session=%d start initiator=0x%02X", sessionID, initiator)
 	}
 
-	if err := server.acquireLease(sessionID, initiator); err != nil {
+	if initiator == 0x00 {
+		selected, err := server.selectAutoInitiator()
+		if err != nil {
+			server.reply(sessionID, downstream.Frame{
+				Command: byte(southboundenh.ENHResErrorHost),
+				Payload: []byte{0x00},
+			})
+			return
+		}
+		initiator = selected
+		if server.cfg.Debug {
+			log.Printf("session=%d auto_join_initiator=0x%02X", sessionID, initiator)
+		}
+	}
+
+	selectedInitiator, err := server.acquireLease(sessionID, initiator)
+	if err != nil {
 		log.Printf(
 			"session=%d lease_rejected initiator=0x%02X reason=%v",
 			sessionID,
@@ -328,6 +406,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		})
 		return
 	}
+	initiator = selectedInitiator
 
 	if initiator == ebusSyn {
 		server.handleStartCancel(sessionID)
@@ -431,8 +510,16 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 			server.busOwner = sessionID
 			server.busDirty = false
 			server.mutex.Unlock()
+			server.clearSessionCollision(sessionID)
 			return
 		default:
+			if southboundenh.ENHCommand(response.Command) == southboundenh.ENHResFailed {
+				if len(response.Payload) == 1 {
+					server.markSessionCollision(sessionID, response.Payload[0])
+				} else {
+					server.markSessionCollision(sessionID, 0x00)
+				}
+			}
 			if !ownedBySession {
 				server.releaseBusToken()
 			}
@@ -483,6 +570,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	}()
 
 	if ownedBySession {
+		server.clearSessionCollision(sessionID)
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResStarted),
 			Payload: []byte{initiator},
@@ -564,6 +652,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 				server.busOwner = sessionID
 				server.busDirty = false
 				server.mutex.Unlock()
+				server.clearSessionCollision(sessionID)
 				server.reply(sessionID, downstream.Frame{
 					Command: byte(southboundenh.ENHResStarted),
 					Payload: []byte{initiator},
@@ -571,6 +660,11 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 				return
 			case southboundenh.ENHResFailed:
 				if attempt+1 >= udpPlainMaxAttempts {
+					if len(response.Payload) == 1 {
+						server.markSessionCollision(sessionID, response.Payload[0])
+					} else {
+						server.markSessionCollision(sessionID, 0x00)
+					}
 					server.reply(sessionID, downstream.Frame{
 						Command: byte(southboundenh.ENHResFailed),
 						Payload: append([]byte(nil), response.Payload...),
@@ -585,7 +679,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 						response.Payload[0],
 					)
 				}
-				backoff := udpPlainRetryBackoff(attempt)
+				backoff := udpPlainRetryBackoffWithJitter(attempt, server.cfg.UDPPlainRetryJitter, server.randomFloat64)
 				select {
 				case <-time.After(backoff):
 				case <-ctx.Done():
@@ -649,6 +743,13 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	server.mutex.Unlock()
 
 	if owner != sessionID {
+		if winner, ok := server.takeSessionCollision(sessionID); ok {
+			server.reply(sessionID, downstream.Frame{
+				Command: byte(southboundenh.ENHResFailed),
+				Payload: []byte{winner},
+			})
+			return
+		}
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
@@ -812,6 +913,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
 				server.logWireRX(frame.Payload[0])
 				server.broadcastUDPPlainByte(frame.Payload[0])
+				server.noteObservedInitiatorByte(frame.Payload[0])
 				if frame.Payload[0] == ebusSyn {
 					select {
 					case server.synCh <- struct{}{}:
@@ -913,6 +1015,34 @@ func udpPlainRetryBackoff(attempt int) time.Duration {
 		return udpPlainBackoffMax
 	}
 	return delay
+}
+
+func udpPlainRetryBackoffWithJitter(
+	attempt int,
+	jitterFactor float64,
+	randomFloat64 func() float64,
+) time.Duration {
+	backoff := udpPlainRetryBackoff(attempt)
+	if jitterFactor <= 0 {
+		return backoff
+	}
+	if jitterFactor > 1 {
+		jitterFactor = 1
+	}
+	if randomFloat64 == nil {
+		randomFloat64 = rand.Float64
+	}
+
+	// Uniform jitter in [-jitterFactor, +jitterFactor].
+	jitter := (randomFloat64()*2 - 1) * jitterFactor
+	jittered := time.Duration(float64(backoff) * (1 + jitter))
+	if jittered <= 0 {
+		jittered = time.Millisecond
+	}
+	if jittered > udpPlainBackoffMax {
+		return udpPlainBackoffMax
+	}
+	return jittered
 }
 
 func (server *Server) logWireRX(value byte) {
@@ -1105,6 +1235,11 @@ func (server *Server) deliverUpstreamError(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	if owner != 0 {
+		winner := byte(0x00)
+		if len(frame.Payload) == 1 {
+			winner = frame.Payload[0]
+		}
+		server.markSessionCollision(owner, winner)
 		server.reply(owner, frame)
 		server.releaseBusIfOwner(owner)
 		return
@@ -1164,9 +1299,9 @@ func (server *Server) releaseBusToken() {
 	}
 }
 
-func (server *Server) acquireLease(sessionID uint64, initiator byte) error {
+func (server *Server) acquireLease(sessionID uint64, initiator byte) (byte, error) {
 	if server.leaseManager == nil {
-		return nil
+		return initiator, nil
 	}
 
 	server.leasesMu.Lock()
@@ -1174,9 +1309,9 @@ func (server *Server) acquireLease(sessionID uint64, initiator byte) error {
 
 	if existing, ok := server.leasedBySess[sessionID]; ok {
 		if existing.Address == initiator {
-			return nil
+			return existing.Address, nil
 		}
-		return fmt.Errorf(
+		return 0, fmt.Errorf(
 			"session already leased initiator 0x%02X (requested 0x%02X)",
 			existing.Address,
 			initiator,
@@ -1191,11 +1326,11 @@ func (server *Server) acquireLease(sessionID uint64, initiator byte) error {
 		},
 	)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	server.leasedBySess[sessionID] = lease
-	return nil
+	return lease.Address, nil
 }
 
 func (server *Server) releaseLease(sessionID uint64) {
@@ -1212,6 +1347,120 @@ func (server *Server) releaseLease(sessionID uint64) {
 
 	if ok {
 		_, _ = server.leaseManager.Release(lease.OwnerID)
+	}
+}
+
+func (server *Server) noteObservedInitiatorByte(byteValue byte) {
+	server.observedMu.Lock()
+	defer server.observedMu.Unlock()
+
+	if byteValue == ebusSyn {
+		server.startOfTelegram = true
+		return
+	}
+	if !server.startOfTelegram {
+		return
+	}
+	server.startOfTelegram = false
+	if !isInitiatorAddress(byteValue) {
+		return
+	}
+
+	now := time.Now().UTC()
+	server.observedInitiatorAt[byteValue] = now
+	server.pruneObservedInitiatorsLocked(now.Add(-server.cfg.AutoJoinActivityWindow))
+}
+
+func (server *Server) pruneObservedInitiatorsLocked(cutoff time.Time) {
+	for address, seenAt := range server.observedInitiatorAt {
+		if !seenAt.After(cutoff) {
+			delete(server.observedInitiatorAt, address)
+		}
+	}
+}
+
+func (server *Server) selectAutoInitiator() (byte, error) {
+	now := time.Now().UTC()
+	observedSet := make(map[byte]struct{})
+
+	server.observedMu.Lock()
+	server.pruneObservedInitiatorsLocked(now.Add(-server.cfg.AutoJoinActivityWindow))
+	for address := range server.observedInitiatorAt {
+		observedSet[address] = struct{}{}
+	}
+	server.observedMu.Unlock()
+
+	leasedSet := make(map[byte]struct{})
+	server.leasesMu.Lock()
+	for _, lease := range server.leasedBySess {
+		leasedSet[lease.Address] = struct{}{}
+	}
+	server.leasesMu.Unlock()
+
+	server.mutex.Lock()
+	previous := server.autoJoinInitiator
+	server.mutex.Unlock()
+	if previous != 0 {
+		if _, observed := observedSet[previous]; !observed {
+			if _, leased := leasedSet[previous]; !leased {
+				return previous, nil
+			}
+		}
+	}
+
+	for _, candidate := range preferredInitiatorAddresses {
+		if _, observed := observedSet[candidate]; observed {
+			continue
+		}
+		if _, leased := leasedSet[candidate]; leased {
+			continue
+		}
+		return candidate, nil
+	}
+	return 0, fmt.Errorf("no initiator address available for auto join")
+}
+
+func (server *Server) markSessionCollision(sessionID uint64, winner byte) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	server.collisionBySession[sessionID] = winner
+}
+
+func (server *Server) clearSessionCollision(sessionID uint64) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	delete(server.collisionBySession, sessionID)
+}
+
+func (server *Server) takeSessionCollision(sessionID uint64) (byte, bool) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	winner, ok := server.collisionBySession[sessionID]
+	if !ok {
+		return 0, false
+	}
+	delete(server.collisionBySession, sessionID)
+	return winner, true
+}
+
+func isInitiatorAddress(address byte) bool {
+	return initiatorPart(address&0x0F) > 0 && initiatorPart((address&0xF0)>>4) > 0
+}
+
+func initiatorPart(bits byte) byte {
+	switch bits {
+	case 0x0:
+		return 1
+	case 0x1:
+		return 2
+	case 0x3:
+		return 3
+	case 0x7:
+		return 4
+	case 0xF:
+		return 5
+	default:
+		return 0
 	}
 }
 

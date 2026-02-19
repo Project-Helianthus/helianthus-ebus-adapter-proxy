@@ -23,6 +23,9 @@ func main() {
 	dialTimeout := flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 200*time.Millisecond, "read timeout applied to upstream and downstream sockets")
 	writeTimeout := flag.Duration("write-timeout", 2*time.Second, "write timeout applied to upstream and downstream sockets")
+	autoJoinWarmup := flag.Duration("auto-join-warmup", 5*time.Second, "passive warmup duration before selecting auto initiator")
+	autoJoinActivityWindow := flag.Duration("auto-join-activity-window", 5*time.Second, "activity freshness window for auto initiator selection")
+	udpRetryJitter := flag.Float64("udp-retry-jitter", 0.2, "jitter factor [0..1] for udp-plain arbitration retry backoff")
 	wireLogPath := flag.String("wire-log", "", "optional file path to write timestamped upstream tx/rx bytes (no addresses)")
 	debug := flag.Bool("debug", false, "enable debug logging (no client addresses)")
 	flag.Parse()
@@ -49,15 +52,18 @@ func main() {
 	log.Printf("Upstream: (configured)")
 
 	server := adapterproxy.NewServer(adapterproxy.Config{
-		ListenAddr:         normalizedListen,
-		UDPPlainListenAddr: normalizedUDPPlainListen,
-		UpstreamTransport:  upstreamTransport,
-		UpstreamAddr:       normalizedUpstream,
-		DialTimeout:        *dialTimeout,
-		ReadTimeout:        *readTimeout,
-		WriteTimeout:       *writeTimeout,
-		WireLogPath:        strings.TrimSpace(*wireLogPath),
-		Debug:              *debug,
+		ListenAddr:             normalizedListen,
+		UDPPlainListenAddr:     normalizedUDPPlainListen,
+		UpstreamTransport:      upstreamTransport,
+		UpstreamAddr:           normalizedUpstream,
+		DialTimeout:            *dialTimeout,
+		ReadTimeout:            *readTimeout,
+		WriteTimeout:           *writeTimeout,
+		AutoJoinWarmup:         *autoJoinWarmup,
+		AutoJoinActivityWindow: *autoJoinActivityWindow,
+		UDPPlainRetryJitter:    *udpRetryJitter,
+		WireLogPath:            strings.TrimSpace(*wireLogPath),
+		Debug:                  *debug,
 	})
 
 	if err := server.Serve(ctx); err != nil {
