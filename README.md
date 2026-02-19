@@ -63,6 +63,15 @@ go run ./cmd/helianthus-ebus-adapter-proxy \
   --upstream enh://203.0.113.10:9999
 ```
 
+Enable a northbound raw UDP endpoint for plain-byte clients:
+
+```bash
+go run ./cmd/helianthus-ebus-adapter-proxy \
+  --listen 0.0.0.0:19001 \
+  --listen-udp-plain 0.0.0.0:19002 \
+  --upstream enh://203.0.113.10:9999
+```
+
 For raw UDP adapters (no ENH framing), use:
 
 ```bash

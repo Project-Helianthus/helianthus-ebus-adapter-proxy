@@ -76,3 +76,39 @@ func TestNormalizeUpstreamEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeOptionalListenAddr(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: ""},
+		{name: "valid", input: "127.0.0.1:19011", want: "127.0.0.1:19011"},
+		{name: "invalid", input: "127.0.0.1", wantErr: true},
+	}
+
+	for _, testCase := range tests {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := normalizeOptionalListenAddr(testCase.input)
+			if testCase.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeOptionalListenAddr(%q) error=nil; want non-nil", testCase.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeOptionalListenAddr(%q) error=%v", testCase.input, err)
+			}
+			if got != testCase.want {
+				t.Fatalf("normalizeOptionalListenAddr(%q) = %q; want %q", testCase.input, got, testCase.want)
+			}
+		})
+	}
+}

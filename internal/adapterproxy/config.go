@@ -10,12 +10,13 @@ const (
 )
 
 type Config struct {
-	ListenAddr        string
-	UpstreamTransport UpstreamTransport
-	UpstreamAddr      string
-	DialTimeout       time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	WireLogPath       string
-	Debug             bool
+	ListenAddr         string
+	UDPPlainListenAddr string
+	UpstreamTransport  UpstreamTransport
+	UpstreamAddr       string
+	DialTimeout        time.Duration
+	ReadTimeout        time.Duration
+	WriteTimeout       time.Duration
+	WireLogPath        string
+	Debug              bool
 }

@@ -18,6 +18,7 @@ import (
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:19001", "listen address for downstream ebusd-compatible enhanced protocol clients")
+	listenUDPPlainAddr := flag.String("listen-udp-plain", "", "optional udp listen address for northbound raw-byte clients")
 	upstream := flag.String("upstream", "", "upstream adapter endpoint (e.g. enh://host:port, ens://host:port, or udp-plain://host:port)")
 	dialTimeout := flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 200*time.Millisecond, "read timeout applied to upstream and downstream sockets")
@@ -29,6 +30,10 @@ func main() {
 	normalizedListen, err := normalizeListenAddr(*listenAddr)
 	if err != nil {
 		log.Fatalf("invalid -listen: %v", err)
+	}
+	normalizedUDPPlainListen, err := normalizeOptionalListenAddr(*listenUDPPlainAddr)
+	if err != nil {
+		log.Fatalf("invalid -listen-udp-plain: %v", err)
 	}
 
 	upstreamTransport, normalizedUpstream, err := normalizeUpstreamEndpoint(*upstream)
@@ -44,14 +49,15 @@ func main() {
 	log.Printf("Upstream: (configured)")
 
 	server := adapterproxy.NewServer(adapterproxy.Config{
-		ListenAddr:        normalizedListen,
-		UpstreamTransport: upstreamTransport,
-		UpstreamAddr:      normalizedUpstream,
-		DialTimeout:       *dialTimeout,
-		ReadTimeout:       *readTimeout,
-		WriteTimeout:      *writeTimeout,
-		WireLogPath:       strings.TrimSpace(*wireLogPath),
-		Debug:             *debug,
+		ListenAddr:         normalizedListen,
+		UDPPlainListenAddr: normalizedUDPPlainListen,
+		UpstreamTransport:  upstreamTransport,
+		UpstreamAddr:       normalizedUpstream,
+		DialTimeout:        *dialTimeout,
+		ReadTimeout:        *readTimeout,
+		WriteTimeout:       *writeTimeout,
+		WireLogPath:        strings.TrimSpace(*wireLogPath),
+		Debug:              *debug,
 	})
 
 	if err := server.Serve(ctx); err != nil {
@@ -63,6 +69,18 @@ func normalizeListenAddr(raw string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", fmt.Errorf("listen address is required")
+	}
+	_, _, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return "", err
+	}
+	return trimmed, nil
+}
+
+func normalizeOptionalListenAddr(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
 	}
 	_, _, err := net.SplitHostPort(trimmed)
 	if err != nil {

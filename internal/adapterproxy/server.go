@@ -20,14 +20,19 @@ import (
 )
 
 const (
-	defaultLeaseDuration = 30 * time.Minute
-	ebusSyn              = byte(0xAA)
-	udpPlainSynWait      = 5 * time.Second
-	udpPlainStartWait    = 5 * time.Second
-	udpPlainMaxAttempts  = 4
-	udpPlainBackoffBase  = 25 * time.Millisecond
-	udpPlainBackoffMax   = 400 * time.Millisecond
+	defaultLeaseDuration  = 30 * time.Minute
+	ebusSyn               = byte(0xAA)
+	udpPlainSynWait       = 5 * time.Second
+	udpPlainStartWait     = 5 * time.Second
+	udpPlainMaxAttempts   = 4
+	udpPlainBackoffBase   = 25 * time.Millisecond
+	udpPlainBackoffMax    = 400 * time.Millisecond
+	udpNorthboundQueueCap = 1024
 )
+
+type udpDatagram struct {
+	payload []byte
+}
 
 type Server struct {
 	cfg Config
@@ -37,6 +42,11 @@ type Server struct {
 
 	wireLog *wireLogger
 	synCh   chan struct{}
+
+	udpListener  *net.UDPConn
+	udpClientsMu sync.RWMutex
+	udpClients   map[string]*net.UDPAddr
+	udpQueue     chan udpDatagram
 
 	upstreamFeatures atomic.Uint32
 
@@ -91,6 +101,8 @@ func NewServer(cfg Config) *Server {
 		busToken:     make(chan struct{}, 1),
 		leasedBySess: make(map[uint64]sourcepolicy.Lease),
 		synCh:        make(chan struct{}, 1),
+		udpClients:   make(map[string]*net.UDPAddr),
+		udpQueue:     make(chan udpDatagram, udpNorthboundQueueCap),
 	}
 	server.busToken <- struct{}{}
 
@@ -144,6 +156,25 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 	server.listener = listener
 
+	if strings.TrimSpace(server.cfg.UDPPlainListenAddr) != "" {
+		udpAddress, err := net.ResolveUDPAddr("udp", server.cfg.UDPPlainListenAddr)
+		if err != nil {
+			_ = listener.Close()
+			_ = upstream.Close()
+			return fmt.Errorf("resolve udp listen %q: %w", server.cfg.UDPPlainListenAddr, err)
+		}
+		udpListener, err := net.ListenUDP("udp", udpAddress)
+		if err != nil {
+			_ = listener.Close()
+			_ = upstream.Close()
+			return fmt.Errorf("listen udp %q: %w", server.cfg.UDPPlainListenAddr, err)
+		}
+		server.udpListener = udpListener
+		server.waitGroup.Add(2)
+		go server.runUDPPlainReader(ctx)
+		go server.runUDPPlainWriter(ctx)
+	}
+
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
@@ -178,6 +209,9 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 
 	_ = listener.Close()
+	if server.udpListener != nil {
+		_ = server.udpListener.Close()
+	}
 	server.closeSessions()
 	server.waitGroup.Wait()
 	_ = upstream.Close()
@@ -640,6 +674,107 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	}
 }
 
+func (server *Server) runUDPPlainReader(ctx context.Context) {
+	defer server.waitGroup.Done()
+
+	if server.udpListener == nil {
+		return
+	}
+
+	buffer := make([]byte, udpPlainReadBufferSize)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := setReadDeadline(server.udpListener, server.cfg.ReadTimeout); err != nil {
+			continue
+		}
+
+		n, remoteAddr, err := server.udpListener.ReadFromUDP(buffer)
+		if err != nil {
+			if isTimeoutError(err) {
+				continue
+			}
+			if errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		if n == 0 || remoteAddr == nil {
+			continue
+		}
+
+		server.registerUDPPlainClient(remoteAddr)
+		payload := append([]byte(nil), buffer[:n]...)
+
+		select {
+		case server.udpQueue <- udpDatagram{payload: payload}:
+		default:
+			if server.cfg.Debug {
+				log.Printf("udp_plain_queue_full dropped_datagram_len=%d", len(payload))
+			}
+		}
+	}
+}
+
+func (server *Server) runUDPPlainWriter(ctx context.Context) {
+	defer server.waitGroup.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case datagram := <-server.udpQueue:
+			if len(datagram.payload) == 0 {
+				continue
+			}
+			if err := server.forwardUDPPlainDatagram(ctx, datagram.payload); err != nil {
+				if server.cfg.Debug {
+					log.Printf("udp_plain_forward_failed len=%d err=%v", len(datagram.payload), err)
+				}
+			}
+		}
+	}
+}
+
+func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byte) error {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	select {
+	case <-server.busToken:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer server.releaseBusToken()
+
+	for _, symbol := range payload {
+		server.logWireTX(symbol)
+		if err := server.upstream.WriteFrame(downstream.Frame{
+			Command: byte(southboundenh.ENHReqSend),
+			Payload: []byte{symbol},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
+	if remoteAddr == nil {
+		return
+	}
+	clientAddress := remoteAddr.String()
+
+	server.udpClientsMu.Lock()
+	server.udpClients[clientAddress] = remoteAddr
+	server.udpClientsMu.Unlock()
+}
+
 func (server *Server) runUpstreamReader(ctx context.Context) {
 	defer server.waitGroup.Done()
 
@@ -668,6 +803,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
 				server.logWireRX(frame.Payload[0])
+				server.broadcastUDPPlainByte(frame.Payload[0])
 				if frame.Payload[0] == ebusSyn {
 					select {
 					case server.synCh <- struct{}{}:
@@ -878,6 +1014,38 @@ func (server *Server) broadcast(frame downstream.Frame) {
 	for _, sess := range sessions {
 		server.enqueueOrClose(sess, frame, "broadcast")
 	}
+}
+
+func (server *Server) broadcastUDPPlainByte(value byte) {
+	if server.udpListener == nil {
+		return
+	}
+
+	server.udpClientsMu.RLock()
+	clients := make([]*net.UDPAddr, 0, len(server.udpClients))
+	for _, clientAddress := range server.udpClients {
+		clients = append(clients, clientAddress)
+	}
+	server.udpClientsMu.RUnlock()
+
+	for _, clientAddress := range clients {
+		if clientAddress == nil {
+			continue
+		}
+		_, err := server.udpListener.WriteToUDP([]byte{value}, clientAddress)
+		if err != nil {
+			server.removeUDPPlainClient(clientAddress.String())
+		}
+	}
+}
+
+func (server *Server) removeUDPPlainClient(clientAddress string) {
+	if strings.TrimSpace(clientAddress) == "" {
+		return
+	}
+	server.udpClientsMu.Lock()
+	delete(server.udpClients, clientAddress)
+	server.udpClientsMu.Unlock()
 }
 
 func (server *Server) reply(sessionID uint64, frame downstream.Frame) {
