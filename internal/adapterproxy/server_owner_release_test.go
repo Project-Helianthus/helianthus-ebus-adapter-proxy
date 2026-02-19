@@ -134,6 +134,56 @@ func TestHandleStartReleasesOwnerOnTerminalUpstreamError(t *testing.T) {
 	}
 }
 
+func TestDeliverPendingStartENHStartedMismatchBecomesFailed(t *testing.T) {
+	t.Parallel()
+
+	respCh := make(chan downstream.Frame, 1)
+	server := &Server{
+		cfg: Config{UpstreamTransport: UpstreamENH},
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+		},
+		pendingStart: &pendingStart{
+			sessionID: 1,
+			respCh:    respCh,
+			mode:      pendingStartModeENH,
+			initiator: 0xF0,
+		},
+	}
+
+	handled := server.deliverPendingStart(downstream.Frame{
+		Command: byte(southboundenh.ENHResStarted),
+		Payload: []byte{0x31},
+	})
+	if !handled {
+		t.Fatal("deliverPendingStart = false; want true")
+	}
+
+	select {
+	case frame := <-respCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResFailed {
+			t.Fatalf("respCh command = 0x%02X; want ENHResFailed", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("respCh payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pending start response not delivered")
+	}
+
+	select {
+	case frame := <-server.sessions[1].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResFailed {
+			t.Fatalf("session command = 0x%02X; want ENHResFailed", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("session payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("session response not delivered")
+	}
+}
+
 func waitUntil(timeout time.Duration, condition func() bool) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

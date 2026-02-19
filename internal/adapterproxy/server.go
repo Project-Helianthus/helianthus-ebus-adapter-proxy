@@ -971,17 +971,29 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		return false
 	}
 
+	frameData := byte(0x00)
+	if len(frame.Payload) > 0 {
+		frameData = frame.Payload[0]
+	}
 	if server.cfg.Debug {
 		log.Printf(
 			"session=%d upstream_start_result cmd=0x%02X data=0x%02X",
 			pending.sessionID,
 			frame.Command,
-			frame.Payload[0],
+			frameData,
 		)
 	}
 
+	forwarded := cloneFrame(frame)
+	if pending.mode == pendingStartModeENH &&
+		southboundenh.ENHCommand(forwarded.Command) == southboundenh.ENHResStarted &&
+		frameData != pending.initiator {
+		forwarded.Command = byte(southboundenh.ENHResFailed)
+		forwarded.Payload = []byte{frameData}
+	}
+
 	select {
-	case pending.respCh <- cloneFrame(frame):
+	case pending.respCh <- cloneFrame(forwarded):
 	default:
 	}
 
@@ -992,7 +1004,7 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	// Preserve upstream ordering for ENH upstream mode: enqueue the response
 	// immediately on the owning session. The waiting START handler still uses
 	// respCh for internal ownership state updates.
-	server.reply(pending.sessionID, frame)
+	server.reply(pending.sessionID, forwarded)
 
 	return true
 }
