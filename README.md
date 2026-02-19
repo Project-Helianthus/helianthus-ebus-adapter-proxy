@@ -55,6 +55,25 @@ Or via wrapper:
 ./scripts/run-ebusd-compat-harness.sh --timeout 10s --log-dir .verify/issue14
 ```
 
+### 3) Run proxy against adapter endpoint
+
+```bash
+go run ./cmd/helianthus-ebus-adapter-proxy \
+  --listen 0.0.0.0:19001 \
+  --upstream enh://203.0.113.10:9999
+```
+
+For raw UDP adapters (no ENH framing), use:
+
+```bash
+go run ./cmd/helianthus-ebus-adapter-proxy \
+  --listen 0.0.0.0:19001 \
+  --upstream udp-plain://203.0.113.10:9999 \
+  --wire-log /tmp/helianthus-ebus-wire.log
+```
+
+`--wire-log` stores timestamped TX/RX bytes only (no client addresses/credentials).
+
 ## Local Smoke-Test Configuration Examples
 
 ### A) Gateway direct-proxy smoke profile (issue #15)
