@@ -377,6 +377,19 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		log.Printf("session=%d start initiator=0x%02X", sessionID, initiator)
 	}
 
+	if initiator == ebusSyn {
+		server.handleStartCancel(sessionID)
+		if server.cfg.UpstreamTransport != UpstreamUDPPlain {
+			// Forward best-effort cancellation upstream. The enhanced protocol does not
+			// mandate a response for START+SYN, so we must not block waiting for one.
+			_ = server.upstream.WriteFrame(downstream.Frame{
+				Command: byte(southboundenh.ENHReqStart),
+				Payload: []byte{initiator},
+			})
+		}
+		return
+	}
+
 	if initiator == 0x00 {
 		selected, err := server.selectAutoInitiator()
 		if err != nil {
@@ -407,19 +420,6 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 	initiator = selectedInitiator
-
-	if initiator == ebusSyn {
-		server.handleStartCancel(sessionID)
-		if server.cfg.UpstreamTransport != UpstreamUDPPlain {
-			// Forward best-effort cancellation upstream. The enhanced protocol does not
-			// mandate a response for START+SYN, so we must not block waiting for one.
-			_ = server.upstream.WriteFrame(downstream.Frame{
-				Command: byte(southboundenh.ENHReqStart),
-				Payload: []byte{initiator},
-			})
-		}
-		return
-	}
 
 	if server.cfg.UpstreamTransport == UpstreamUDPPlain {
 		server.handleStartUDPPlain(ctx, sessionID, initiator)
