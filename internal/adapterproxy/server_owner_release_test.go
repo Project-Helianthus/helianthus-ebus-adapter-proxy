@@ -42,6 +42,39 @@ func TestReleaseBusIfIdleSynReleasesCleanOwner(t *testing.T) {
 	}
 }
 
+func TestReleaseBusIfIdleSynKeepsDirtyOwner(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.busOwner = 7
+	server.busDirty = true
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	server.releaseBusIfIdleSyn()
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	server.mutex.Unlock()
+	if owner != 7 {
+		t.Fatalf("busOwner = %d; want 7", owner)
+	}
+	if !dirty {
+		t.Fatalf("busDirty = false; want true")
+	}
+
+	select {
+	case <-server.busToken:
+		t.Fatalf("bus token released; expected owner to keep it while dirty")
+	default:
+	}
+}
+
 func TestHandleStartReleasesOwnerOnTerminalUpstreamError(t *testing.T) {
 	t.Parallel()
 

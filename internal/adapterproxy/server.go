@@ -1297,9 +1297,10 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 func (server *Server) releaseBusIfIdleSyn() {
 	server.mutex.Lock()
 	owner := server.busOwner
+	dirty := server.busDirty
 	server.mutex.Unlock()
 
-	if owner == 0 {
+	if owner == 0 || dirty {
 		return
 	}
 
