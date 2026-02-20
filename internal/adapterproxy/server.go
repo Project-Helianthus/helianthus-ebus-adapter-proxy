@@ -930,6 +930,9 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
+				if server.cfg.Debug {
+					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
+				}
 				server.logWireRX(frame.Payload[0])
 				server.broadcastUDPPlainByte(frame.Payload[0])
 				server.noteObservedInitiatorByte(frame.Payload[0])
