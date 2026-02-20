@@ -42,7 +42,7 @@ func TestReleaseBusIfIdleSynReleasesCleanOwner(t *testing.T) {
 	}
 }
 
-func TestReleaseBusIfIdleSynKeepsDirtyOwner(t *testing.T) {
+func TestReleaseBusIfIdleSynMarksBoundaryBeforeRelease(t *testing.T) {
 	t.Parallel()
 
 	server := NewServer(Config{})
@@ -64,14 +64,55 @@ func TestReleaseBusIfIdleSynKeepsDirtyOwner(t *testing.T) {
 	if owner != 7 {
 		t.Fatalf("busOwner = %d; want 7", owner)
 	}
-	if !dirty {
-		t.Fatalf("busDirty = false; want true")
+	if dirty {
+		t.Fatalf("busDirty = true; want false after first SYN boundary")
 	}
 
 	select {
 	case <-server.busToken:
 		t.Fatalf("bus token released; expected owner to keep it while dirty")
 	default:
+	}
+
+	server.releaseBusIfIdleSyn()
+
+	server.mutex.Lock()
+	owner = server.busOwner
+	dirty = server.busDirty
+	server.mutex.Unlock()
+	if owner != 0 {
+		t.Fatalf("busOwner = %d; want 0 after idle SYN", owner)
+	}
+	if dirty {
+		t.Fatalf("busDirty = true; want false after release")
+	}
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected released bus token after idle SYN")
+	}
+}
+
+func TestNoteBusWireSymbolMarksDirtyForOwnedTraffic(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.busOwner = 3
+	server.busDirty = false
+
+	server.noteBusWireSymbol(0x15)
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	server.mutex.Unlock()
+
+	if owner != 3 {
+		t.Fatalf("busOwner = %d; want 3", owner)
+	}
+	if !dirty {
+		t.Fatalf("busDirty = false; want true")
 	}
 }
 

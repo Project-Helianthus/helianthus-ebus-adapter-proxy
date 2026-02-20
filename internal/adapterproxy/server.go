@@ -782,12 +782,6 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		return
 	}
 
-	// In direct-mode usage, hosts terminate a telegram with SYN (0xAA).
-	// Release our multiplexed bus lock at that boundary so other sessions can
-	// arbitrate, matching the single-host behavior of a real adapter.
-	if data == ebusSyn {
-		server.releaseBusIfOwner(sessionID)
-	}
 }
 
 func (server *Server) runUDPPlainReader(ctx context.Context) {
@@ -921,12 +915,12 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				server.logWireRX(frame.Payload[0])
 				server.broadcastUDPPlainByte(frame.Payload[0])
 				server.noteObservedInitiatorByte(frame.Payload[0])
+				server.noteBusWireSymbol(frame.Payload[0])
 				if frame.Payload[0] == ebusSyn {
 					select {
 					case server.synCh <- struct{}{}:
 					default:
 					}
-					server.releaseBusIfIdleSyn()
 				}
 
 				if server.isStartPending() {
@@ -1298,17 +1292,37 @@ func (server *Server) releaseBusIfIdleSyn() {
 	server.mutex.Lock()
 	owner := server.busOwner
 	dirty := server.busDirty
-	server.mutex.Unlock()
-
-	if owner == 0 || dirty {
+	if owner == 0 {
+		server.mutex.Unlock()
 		return
 	}
+	if dirty {
+		// First SYN after activity marks a telegram boundary. Keep ownership
+		// until a subsequent idle SYN is observed.
+		server.busDirty = false
+		server.mutex.Unlock()
+		return
+	}
+	server.mutex.Unlock()
 
 	if server.cfg.Debug {
 		log.Printf("session=%d release_reason=idle_syn", owner)
 	}
 
 	server.releaseBusIfOwner(owner)
+}
+
+func (server *Server) noteBusWireSymbol(symbol byte) {
+	if symbol == ebusSyn {
+		server.releaseBusIfIdleSyn()
+		return
+	}
+
+	server.mutex.Lock()
+	if server.busOwner != 0 {
+		server.busDirty = true
+	}
+	server.mutex.Unlock()
 }
 
 func (server *Server) releaseBusToken() {
