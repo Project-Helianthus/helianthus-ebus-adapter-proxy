@@ -23,7 +23,7 @@ import (
 const (
 	defaultLeaseDuration  = 30 * time.Minute
 	ebusSyn               = byte(0xAA)
-	busIdleReleaseGrace   = 25 * time.Millisecond
+	busIdleReleaseGrace   = 400 * time.Millisecond
 	udpPlainSynWait       = 5 * time.Second
 	udpPlainStartWait     = 5 * time.Second
 	udpPlainMaxAttempts   = 4
@@ -794,6 +794,7 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 
 	server.mutex.Lock()
 	server.busDirty = true
+	server.busOwned = time.Now().UTC()
 	server.mutex.Unlock()
 
 	sendFrame := downstream.Frame{

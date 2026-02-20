@@ -150,6 +150,41 @@ func TestNoteBusWireSymbolMarksDirtyForOwnedTraffic(t *testing.T) {
 	}
 }
 
+func TestHandleSendRefreshesBusOwnershipTimestamp(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := NewServer(Config{})
+	server.upstream = upstream
+	server.sessions = map[uint64]*session{
+		3: {id: 3, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+	}
+	server.busOwner = 3
+	server.busDirty = false
+	server.busOwned = time.Time{}
+
+	server.handleSend(3, 0x15)
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	ownedAt := server.busOwned
+	server.mutex.Unlock()
+
+	if owner != 3 {
+		t.Fatalf("busOwner = %d; want 3", owner)
+	}
+	if !dirty {
+		t.Fatalf("busDirty = false; want true")
+	}
+	if ownedAt.IsZero() {
+		t.Fatalf("busOwned is zero; want refreshed timestamp")
+	}
+	if elapsed := time.Since(ownedAt); elapsed > 2*time.Second {
+		t.Fatalf("busOwned too old: elapsed=%s", elapsed)
+	}
+}
+
 func TestHandleStartReleasesOwnerOnTerminalUpstreamError(t *testing.T) {
 	t.Parallel()
 
