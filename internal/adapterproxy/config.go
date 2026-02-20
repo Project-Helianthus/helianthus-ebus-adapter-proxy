@@ -6,6 +6,7 @@ type UpstreamTransport string
 
 const (
 	UpstreamENH      UpstreamTransport = "enh"
+	UpstreamENS      UpstreamTransport = "ens"
 	UpstreamUDPPlain UpstreamTransport = "udp-plain"
 )
 

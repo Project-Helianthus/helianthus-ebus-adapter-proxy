@@ -47,7 +47,7 @@ func dialUpstream(
 	switch transport {
 	case UpstreamUDPPlain:
 		return dialUpstreamUDPPlain(ctx, address, timeout, readTimeout, writeTimeout)
-	case UpstreamENH, "":
+	case UpstreamENH, UpstreamENS, "":
 		return dialUpstreamENH(ctx, address, timeout, readTimeout, writeTimeout)
 	default:
 		return nil, fmt.Errorf("unsupported upstream transport %q", transport)

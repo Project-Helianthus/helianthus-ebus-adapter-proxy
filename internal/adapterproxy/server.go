@@ -924,14 +924,14 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				}
 
 				if server.isStartPending() {
-					if server.cfg.UpstreamTransport == UpstreamUDPPlain && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
+					if server.shouldUseWireArbitrationResult() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
 						continue
 					}
 					// Match ebusd-style behavior: while START is pending, ignore received bus bytes.
 					continue
 				}
 
-				if server.cfg.UpstreamTransport == UpstreamUDPPlain && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
+				if server.shouldUseWireArbitrationResult() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
 					continue
 				}
 			}
@@ -1009,6 +1009,10 @@ func (server *Server) isStartPending() bool {
 	return server.pendingStart != nil
 }
 
+func (server *Server) shouldUseWireArbitrationResult() bool {
+	return server.cfg.UpstreamTransport == UpstreamUDPPlain || server.cfg.UpstreamTransport == UpstreamENS
+}
+
 func (server *Server) clearSynSignal() {
 	for {
 		select {
@@ -1079,7 +1083,12 @@ func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
 
 	server.pendingStartMu.Lock()
 	pending := server.pendingStart
-	if pending == nil || pending.mode != pendingStartModeUDPPlain || pending.delivered {
+	allowFromWire := false
+	if pending != nil {
+		allowFromWire = pending.mode == pendingStartModeUDPPlain ||
+			(pending.mode == pendingStartModeENH && server.cfg.UpstreamTransport == UpstreamENS)
+	}
+	if pending == nil || !allowFromWire || pending.delivered {
 		server.pendingStartMu.Unlock()
 		return false
 	}

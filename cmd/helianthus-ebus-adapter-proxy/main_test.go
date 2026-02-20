@@ -23,9 +23,9 @@ func TestNormalizeUpstreamEndpoint(t *testing.T) {
 			wantAddress:   "127.0.0.1:9999",
 		},
 		{
-			name:          "ens scheme maps to enh",
+			name:          "ens scheme",
 			input:         "ens://127.0.0.1:9999",
-			wantTransport: adapterproxy.UpstreamENH,
+			wantTransport: adapterproxy.UpstreamENS,
 			wantAddress:   "127.0.0.1:9999",
 		},
 		{

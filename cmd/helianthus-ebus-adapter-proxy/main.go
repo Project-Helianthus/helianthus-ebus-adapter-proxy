@@ -111,8 +111,10 @@ func normalizeUpstreamEndpoint(raw string) (adapterproxy.UpstreamTransport, stri
 		}
 		scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
 		switch scheme {
-		case "enh", "ens", "tcp":
+		case "enh", "tcp":
 			return adapterproxy.UpstreamENH, parsed.Host, nil
+		case "ens":
+			return adapterproxy.UpstreamENS, parsed.Host, nil
 		case "udp-plain":
 			return adapterproxy.UpstreamUDPPlain, parsed.Host, nil
 		default:
