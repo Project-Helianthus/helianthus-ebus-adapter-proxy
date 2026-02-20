@@ -23,6 +23,7 @@ import (
 const (
 	defaultLeaseDuration  = 30 * time.Minute
 	ebusSyn               = byte(0xAA)
+	busIdleReleaseGrace   = 25 * time.Millisecond
 	udpPlainSynWait       = 5 * time.Second
 	udpPlainStartWait     = 5 * time.Second
 	udpPlainMaxAttempts   = 4
@@ -72,6 +73,7 @@ type Server struct {
 	busToken chan struct{}
 	busOwner uint64
 	busDirty bool
+	busOwned time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -445,8 +447,16 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		if server.cfg.Debug {
 			log.Printf("session=%d start_wait=%s", sessionID, time.Since(waitStart))
 		}
-	} else if server.cfg.Debug {
-		log.Printf("session=%d start_reuse_owner=true", sessionID)
+	} else {
+		server.mutex.Lock()
+		if server.busOwner == sessionID {
+			server.busDirty = true
+			server.busOwned = time.Now().UTC()
+		}
+		server.mutex.Unlock()
+		if server.cfg.Debug {
+			log.Printf("session=%d start_reuse_owner=true", sessionID)
+		}
 	}
 
 	// If we acquired the bus token above, it is now held until SYN (end-of-message)
@@ -508,7 +518,8 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		case southboundenh.ENHResStarted:
 			server.mutex.Lock()
 			server.busOwner = sessionID
-			server.busDirty = false
+			server.busDirty = true
+			server.busOwned = time.Now().UTC()
 			server.mutex.Unlock()
 			server.clearSessionCollision(sessionID)
 			return
@@ -657,7 +668,8 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			case southboundenh.ENHResStarted:
 				server.mutex.Lock()
 				server.busOwner = sessionID
-				server.busDirty = false
+				server.busDirty = true
+				server.busOwned = time.Now().UTC()
 				server.mutex.Unlock()
 				server.clearSessionCollision(sessionID)
 				server.reply(sessionID, downstream.Frame{
@@ -1296,6 +1308,7 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	}
 	server.busOwner = 0
 	server.busDirty = false
+	server.busOwned = time.Time{}
 	server.mutex.Unlock()
 
 	server.releaseBusToken()
@@ -1305,7 +1318,12 @@ func (server *Server) releaseBusIfIdleSyn() {
 	server.mutex.Lock()
 	owner := server.busOwner
 	dirty := server.busDirty
+	ownedAt := server.busOwned
 	if owner == 0 {
+		server.mutex.Unlock()
+		return
+	}
+	if !ownedAt.IsZero() && time.Since(ownedAt) < busIdleReleaseGrace {
 		server.mutex.Unlock()
 		return
 	}
