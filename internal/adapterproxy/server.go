@@ -762,6 +762,9 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	server.mutex.Unlock()
 
 	if owner != sessionID {
+		if server.cfg.Debug {
+			log.Printf("session=%d send_rejected owner=%d symbol=0x%02X", sessionID, owner, data)
+		}
 		if winner, ok := server.takeSessionCollision(sessionID); ok {
 			server.reply(sessionID, downstream.Frame{
 				Command: byte(southboundenh.ENHResFailed),
@@ -783,6 +786,9 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	sendFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqSend),
 		Payload: []byte{data},
+	}
+	if server.cfg.Debug {
+		log.Printf("session=%d send symbol=0x%02X", sessionID, data)
 	}
 	server.logWireTX(data)
 	if err := server.upstream.WriteFrame(sendFrame); err != nil {
