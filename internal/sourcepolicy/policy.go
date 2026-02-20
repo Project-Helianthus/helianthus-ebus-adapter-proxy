@@ -137,7 +137,9 @@ func uniqueSortedAddresses(addresses []uint8) []uint8 {
 	uniqueAddresses := make([]uint8, 0, len(addressSet))
 
 	for address := range addressSet {
-		if address == 0x00 || address == 0xFF {
+		// 0x00 is reserved as "auto initiator selection" in ENH START handling,
+		// so it must not be handed out as a concrete leased source address.
+		if address == 0x00 {
 			continue
 		}
 

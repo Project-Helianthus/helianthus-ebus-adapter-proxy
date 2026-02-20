@@ -24,6 +24,22 @@ func TestPolicySoftReserve31WhenEbusdOnlinePrefersAlternative(t *testing.T) {
 	}
 }
 
+func TestPolicyAllowsAddressFF(t *testing.T) {
+	policy := mustNewPolicy(t, Config{})
+
+	selectedAddress, err := policy.SelectAddress(
+		[]uint8{0xFF},
+		SelectOptions{},
+	)
+	if err != nil {
+		t.Fatalf("expected address selection success, got %v", err)
+	}
+
+	if selectedAddress != 0xFF {
+		t.Fatalf("expected selected address 0xFF, got 0x%02X", selectedAddress)
+	}
+}
+
 func TestPolicySoftReserve31WhenEbusdOfflineUses31OnlyWithoutAlternatives(t *testing.T) {
 	policy := mustNewPolicy(t, Config{})
 
