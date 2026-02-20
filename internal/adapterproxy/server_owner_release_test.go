@@ -256,6 +256,10 @@ func TestDeliverPendingStartENHStartedMismatchBecomesFailed(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("session response not delivered")
 	}
+
+	if server.isStartPending() {
+		t.Fatal("pending start remains set after delivery; want cleared")
+	}
 }
 
 func waitUntil(timeout time.Duration, condition func() bool) bool {

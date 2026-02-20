@@ -188,6 +188,10 @@ func TestDeliverPendingStart_UDPPlainDoesNotReplyImmediatelyOnFailed(t *testing.
 		t.Fatalf("unexpected immediate downstream reply: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
 	default:
 	}
+
+	if server.isStartPending() {
+		t.Fatalf("pending start remains set after delivery; want cleared")
+	}
 }
 
 func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {

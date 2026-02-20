@@ -960,10 +960,14 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	server.pendingStartMu.Lock()
 	pending := server.pendingStart
-	server.pendingStartMu.Unlock()
 	if pending == nil {
+		server.pendingStartMu.Unlock()
 		return false
 	}
+	// Clear pending immediately once a START result frame is consumed so that
+	// subsequent wire bytes are not dropped by the "start pending" fast-path.
+	server.pendingStart = nil
+	server.pendingStartMu.Unlock()
 
 	frameData := byte(0x00)
 	if len(frame.Payload) > 0 {
