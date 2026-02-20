@@ -1048,7 +1048,7 @@ func (server *Server) isStartPending() bool {
 }
 
 func (server *Server) shouldUseWireArbitrationResult() bool {
-	return server.cfg.UpstreamTransport == UpstreamUDPPlain || server.cfg.UpstreamTransport == UpstreamENS
+	return server.cfg.UpstreamTransport == UpstreamUDPPlain
 }
 
 func (server *Server) clearSynSignal() {
@@ -1123,8 +1123,7 @@ func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
 	pending := server.pendingStart
 	allowFromWire := false
 	if pending != nil {
-		allowFromWire = pending.mode == pendingStartModeUDPPlain ||
-			(pending.mode == pendingStartModeENH && server.cfg.UpstreamTransport == UpstreamENS)
+		allowFromWire = pending.mode == pendingStartModeUDPPlain
 	}
 	if pending == nil || !allowFromWire || pending.delivered {
 		server.pendingStartMu.Unlock()

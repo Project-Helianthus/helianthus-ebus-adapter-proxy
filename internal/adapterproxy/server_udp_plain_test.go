@@ -99,7 +99,7 @@ func TestDeliverPendingStartFromArbByteFailed(t *testing.T) {
 	}
 }
 
-func TestDeliverPendingStartFromArbByteENSStarted(t *testing.T) {
+func TestDeliverPendingStartFromArbByteENSFallbackDisabled(t *testing.T) {
 	t.Parallel()
 
 	respCh := make(chan downstream.Frame, 1)
@@ -113,20 +113,14 @@ func TestDeliverPendingStartFromArbByteENSStarted(t *testing.T) {
 		},
 	}
 
-	if !server.deliverPendingStartFromArbByte(0x31) {
-		t.Fatalf("deliverPendingStartFromArbByte returned false; want true")
+	if server.deliverPendingStartFromArbByte(0x31) {
+		t.Fatalf("deliverPendingStartFromArbByte returned true; want false")
 	}
 
 	select {
 	case frame := <-respCh:
-		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
-			t.Fatalf("command = 0x%02X; want ENHResStarted", frame.Command)
-		}
-		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
-			t.Fatalf("payload = %x; want [31]", frame.Payload)
-		}
+		t.Fatalf("unexpected pending response delivered: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
 	default:
-		t.Fatalf("no pending response delivered")
 	}
 }
 
