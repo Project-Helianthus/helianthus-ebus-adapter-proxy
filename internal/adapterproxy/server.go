@@ -25,6 +25,7 @@ const (
 	ebusSyn               = byte(0xAA)
 	busIdleReleaseGrace   = 400 * time.Millisecond
 	udpPlainSynWait       = 5 * time.Second
+	udpPlainBootstrapWait = 250 * time.Millisecond
 	udpPlainStartWait     = 5 * time.Second
 	udpPlainMaxAttempts   = 4
 	udpPlainBackoffBase   = 25 * time.Millisecond
@@ -53,6 +54,7 @@ type Server struct {
 	udpQueue     chan udpDatagram
 
 	upstreamFeatures atomic.Uint32
+	lastWireRXAtNano atomic.Int64
 
 	backpressureDrops  atomic.Uint64
 	backpressureCloses atomic.Uint64
@@ -633,22 +635,12 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	for attempt := 0; attempt < udpPlainMaxAttempts; attempt++ {
 		server.clearSynSignal()
 
-		synWait := time.Now()
-		select {
-		case <-server.synCh:
-		case <-time.After(udpPlainSynWait):
-			server.reply(sessionID, downstream.Frame{
-				Command: byte(southboundenh.ENHResErrorHost),
-				Payload: []byte{0x00},
-			})
-			return
-		case <-ctx.Done():
-			return
-		case <-sess.done:
+		waitedForSyn, ok := server.waitForUDPPlainIdleSyn(ctx, sess, sessionID, attempt+1)
+		if !ok {
 			return
 		}
-		if server.cfg.Debug {
-			log.Printf("session=%d attempt=%d syn_wait=%s", sessionID, attempt+1, time.Since(synWait))
+		if server.cfg.Debug && waitedForSyn {
+			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
 		}
 
 		respCh := make(chan downstream.Frame, 1)
@@ -944,6 +936,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
+				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
 				if server.cfg.Debug {
 					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
 				}
@@ -982,6 +975,62 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		default:
 		}
 	}
+}
+
+func (server *Server) waitForUDPPlainIdleSyn(
+	ctx context.Context,
+	sess *session,
+	sessionID uint64,
+	attempt int,
+) (bool, bool) {
+	waitTimeout := udpPlainSynWait
+	bootstrapMode := !server.hasRecentWireRX(udpPlainSynWait)
+	if bootstrapMode {
+		waitTimeout = udpPlainBootstrapWait
+	}
+
+	synWait := time.Now()
+	select {
+	case <-server.synCh:
+		if server.cfg.Debug {
+			log.Printf("session=%d attempt=%d syn_wait=%s", sessionID, attempt, time.Since(synWait))
+		}
+		return true, true
+	case <-time.After(waitTimeout):
+		if bootstrapMode {
+			if server.cfg.Debug {
+				log.Printf(
+					"session=%d attempt=%d syn_wait_bootstrap_timeout=%s proceeding_without_syn=true",
+					sessionID,
+					attempt,
+					waitTimeout,
+				)
+			}
+			return false, true
+		}
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+		return true, false
+	case <-ctx.Done():
+		return false, false
+	case <-sess.done:
+		return false, false
+	}
+}
+
+func (server *Server) hasRecentWireRX(window time.Duration) bool {
+	if window <= 0 {
+		return false
+	}
+
+	lastSeen := server.lastWireRXAtNano.Load()
+	if lastSeen <= 0 {
+		return false
+	}
+
+	return time.Since(time.Unix(0, lastSeen)) <= window
 }
 
 func (server *Server) deliverPendingStart(frame downstream.Frame) bool {

@@ -312,3 +312,45 @@ func TestHandleSendReturnsArbitrationFailedWhenCollisionActive(t *testing.T) {
 		t.Fatalf("expected arbitration failed reply")
 	}
 }
+
+func TestHandleStartUDPPlainBootstrapsWithoutObservedSyn(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{
+		UpstreamTransport:      UpstreamUDPPlain,
+		AutoJoinActivityWindow: time.Minute,
+	})
+	server.upstream = newFakeUpstream()
+
+	sessionState := &session{
+		id:     1,
+		sendCh: make(chan downstream.Frame, 2),
+		done:   make(chan struct{}),
+	}
+	server.sessions = map[uint64]*session{1: sessionState}
+
+	go func() {
+		deadline := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if server.isStartPending() {
+				_ = server.deliverPendingStartFromArbByte(0x31)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	server.handleStartUDPPlain(context.Background(), 1, 0x31)
+
+	select {
+	case frame := <-sessionState.sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
+			t.Fatalf("command = 0x%02X; want ENHResStarted", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected start response for udp bootstrap flow")
+	}
+}
