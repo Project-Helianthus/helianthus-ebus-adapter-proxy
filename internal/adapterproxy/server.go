@@ -958,15 +958,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 					}
 				}
 
-				if server.isStartPending() {
-					if server.shouldUseWireArbitrationResult() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
-						continue
-					}
-					// Match ebusd-style behavior: while START is pending, ignore received bus bytes.
-					continue
-				}
-
-				if server.shouldUseWireArbitrationResult() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
+				if server.shouldUseWireArbitrationResult() && server.isStartPending() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
 					continue
 				}
 			}

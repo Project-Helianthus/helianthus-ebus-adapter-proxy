@@ -142,3 +142,52 @@ func TestRunUpstreamReaderSuppressesReceivedWhileStartPending(t *testing.T) {
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+func TestRunUpstreamReaderBroadcastsReceivedWhileStartPendingENH(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	respCh := make(chan downstream.Frame, 1)
+	server := &Server{
+		cfg:      Config{UpstreamTransport: UpstreamENH},
+		upstream: upstream,
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+			2: {id: 2, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		},
+		pendingStart: &pendingStart{
+			sessionID: 1,
+			respCh:    respCh,
+			mode:      pendingStartModeENH,
+			initiator: 0x31,
+		},
+		synCh: make(chan struct{}, 1),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x42},
+	}
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResReceived {
+			t.Fatalf("command = 0x%02X; want ENHResReceived", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x42 {
+			t.Fatalf("payload = %x; want [42]", frame.Payload)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("expected broadcast while ENH start pending")
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
