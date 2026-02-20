@@ -1,6 +1,7 @@
 package adapterproxy
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -210,6 +211,39 @@ func TestAcquireLeaseRejectsDuplicateInitiatorAcrossSessions(t *testing.T) {
 	var conflict sourcepolicy.LeaseConflictError
 	if !errors.As(err, &conflict) {
 		t.Fatalf("acquireLease(session=2) error = %v; want LeaseConflictError", err)
+	}
+}
+
+func TestHandleStartReturnsFailedWhenLeaseAddressInUse(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+	}
+	server.upstream = newFakeUpstream()
+
+	if _, err := server.acquireLease(1, 0x31); err != nil {
+		t.Fatalf("acquireLease(session=1) error = %v", err)
+	}
+
+	server.handleStart(context.Background(), 2, 0x31)
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResFailed {
+			t.Fatalf("command = 0x%02X; want ENHResFailed", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatalf("no response frame delivered for lease collision")
+	}
+
+	if winner, ok := server.takeSessionCollision(2); !ok || winner != 0x31 {
+		t.Fatalf("collision marker = (ok=%v winner=0x%02X); want (true, 0x31)", ok, winner)
 	}
 }
 

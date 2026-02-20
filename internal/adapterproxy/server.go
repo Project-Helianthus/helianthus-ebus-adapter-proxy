@@ -415,6 +415,19 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 			initiator,
 			err,
 		)
+		var conflict sourcepolicy.LeaseConflictError
+		if errors.As(err, &conflict) && conflict.Code == sourcepolicy.LeaseConflictCodeAddressInUse {
+			winner := conflict.Address
+			if winner == 0x00 {
+				winner = initiator
+			}
+			server.markSessionCollision(sessionID, winner)
+			server.reply(sessionID, downstream.Frame{
+				Command: byte(southboundenh.ENHResFailed),
+				Payload: []byte{winner},
+			})
+			return
+		}
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
