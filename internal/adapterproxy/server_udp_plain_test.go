@@ -355,6 +355,45 @@ func TestHandleStartUDPPlainBootstrapsWithoutObservedSyn(t *testing.T) {
 	}
 }
 
+func TestHandleStartUDPPlainTimeoutFallsBackToStarted(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{
+		UpstreamTransport:      UpstreamUDPPlain,
+		AutoJoinActivityWindow: time.Minute,
+		UDPPlainStartWait:      20 * time.Millisecond,
+	})
+	server.upstream = newFakeUpstream()
+
+	sessionState := &session{
+		id:     1,
+		sendCh: make(chan downstream.Frame, 2),
+		done:   make(chan struct{}),
+	}
+	server.sessions = map[uint64]*session{1: sessionState}
+
+	server.handleStartUDPPlain(context.Background(), 1, 0x31)
+
+	select {
+	case frame := <-sessionState.sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
+			t.Fatalf("command = 0x%02X; want ENHResStarted", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected start response for timeout fallback flow")
+	}
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 1 {
+		t.Fatalf("busOwner = %d; want 1", owner)
+	}
+}
+
 func TestHandleStartAutoJoinReusesExistingLease(t *testing.T) {
 	t.Parallel()
 

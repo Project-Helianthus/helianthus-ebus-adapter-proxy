@@ -12,16 +12,18 @@ const (
 )
 
 type Config struct {
-	ListenAddr             string
-	UDPPlainListenAddr     string
-	UpstreamTransport      UpstreamTransport
-	UpstreamAddr           string
-	DialTimeout            time.Duration
-	ReadTimeout            time.Duration
-	WriteTimeout           time.Duration
-	AutoJoinWarmup         time.Duration
-	AutoJoinActivityWindow time.Duration
-	UDPPlainRetryJitter    float64
-	WireLogPath            string
-	Debug                  bool
+	ListenAddr                   string
+	UDPPlainListenAddr           string
+	UpstreamTransport            UpstreamTransport
+	UpstreamAddr                 string
+	DialTimeout                  time.Duration
+	ReadTimeout                  time.Duration
+	WriteTimeout                 time.Duration
+	AutoJoinWarmup               time.Duration
+	AutoJoinActivityWindow       time.Duration
+	UDPPlainRetryJitter          float64
+	UDPPlainStartWait            time.Duration
+	DisableUDPPlainStartFallback bool
+	WireLogPath                  string
+	Debug                        bool
 }

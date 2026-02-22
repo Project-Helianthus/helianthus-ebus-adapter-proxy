@@ -83,6 +83,8 @@ unexpected = []
 xfailed = 0
 xpassed = 0
 passed = 0
+blocked = 0
+blocked_invalid = []
 for case in cases:
     value = normalized_outcome(case)
     case_id = case.get("case_id", "?")
@@ -92,15 +94,26 @@ for case in cases:
         xfailed += 1
     elif value == "xpass":
         xpassed += 1
+    elif value == "blocked-infra":
+        reason = str(case.get("infra_reason", "")).strip()
+        if reason != "adapter_no_signal":
+            blocked_invalid.append((case_id, reason))
+            continue
+        blocked += 1
     else:
         unexpected.append(case_id)
+
+if blocked_invalid:
+    preview = ",".join(f"{case_id}:{reason or 'missing'}" for case_id, reason in blocked_invalid[:10])
+    print(f"transport gate: matrix has blocked-infra with unsupported reason ({len(blocked_invalid)}). sample={preview}")
+    raise SystemExit(1)
 
 if unexpected:
     preview = ",".join(unexpected[:10])
     print(f"transport gate: matrix has unexpected failures/planned ({len(unexpected)}). sample={preview}")
     raise SystemExit(1)
 
-msg = f"transport gate: PASS (pass={passed}, xfail={xfailed}, xpass={xpassed}, total={len(cases)})."
+msg = f"transport gate: PASS (pass={passed}, xfail={xfailed}, xpass={xpassed}, blocked={blocked}, total={len(cases)})."
 if xpassed:
     msg += " review expected-failure list (xpass present)."
 print(msg)

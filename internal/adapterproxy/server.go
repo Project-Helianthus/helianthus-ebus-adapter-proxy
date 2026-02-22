@@ -21,19 +21,19 @@ import (
 )
 
 const (
-	defaultLeaseDuration  = 30 * time.Minute
-	ebusSyn               = byte(0xAA)
-	udpBridgeOwnerID      = ^uint64(0)
-	busIdleReleaseGrace   = 400 * time.Millisecond
-	udpPlainSynWait       = 5 * time.Second
-	udpPlainBootstrapWait = 250 * time.Millisecond
-	udpPlainStartWait     = 5 * time.Second
-	udpPlainMaxAttempts   = 4
-	udpPlainBackoffBase   = 25 * time.Millisecond
-	udpPlainBackoffMax    = 400 * time.Millisecond
-	defaultRetryJitter    = 0.2
-	defaultAutoJoinWarmup = 5 * time.Second
-	udpNorthboundQueueCap = 1024
+	defaultLeaseDuration     = 30 * time.Minute
+	ebusSyn                  = byte(0xAA)
+	udpBridgeOwnerID         = ^uint64(0)
+	busIdleReleaseGrace      = 400 * time.Millisecond
+	udpPlainSynWait          = 5 * time.Second
+	udpPlainBootstrapWait    = 250 * time.Millisecond
+	udpPlainStartWaitDefault = 5 * time.Second
+	udpPlainMaxAttempts      = 4
+	udpPlainBackoffBase      = 25 * time.Millisecond
+	udpPlainBackoffMax       = 400 * time.Millisecond
+	defaultRetryJitter       = 0.2
+	defaultAutoJoinWarmup    = 5 * time.Second
+	udpNorthboundQueueCap    = 1024
 )
 
 type udpDatagram struct {
@@ -134,6 +134,9 @@ func NewServer(cfg Config) *Server {
 	}
 	if cfg.UDPPlainRetryJitter == 0 {
 		cfg.UDPPlainRetryJitter = defaultRetryJitter
+	}
+	if cfg.UDPPlainStartWait <= 0 {
+		cfg.UDPPlainStartWait = udpPlainStartWaitDefault
 	}
 
 	server := &Server{
@@ -743,12 +746,28 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			default:
 				return
 			}
-		case <-time.After(udpPlainStartWait):
+		case <-time.After(server.cfg.UDPPlainStartWait):
 			server.clearPendingStart(sessionID)
-			server.releaseLease(sessionID)
+			if server.cfg.DisableUDPPlainStartFallback {
+				server.releaseLease(sessionID)
+				server.reply(sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				})
+				return
+			}
+			if server.cfg.Debug {
+				log.Printf("session=%d start_timeout_fallback=true", sessionID)
+			}
+			server.mutex.Lock()
+			server.busOwner = sessionID
+			server.busDirty = true
+			server.busOwned = time.Now().UTC()
+			server.mutex.Unlock()
+			server.clearSessionCollision(sessionID)
 			server.reply(sessionID, downstream.Frame{
-				Command: byte(southboundenh.ENHResErrorHost),
-				Payload: []byte{0x00},
+				Command: byte(southboundenh.ENHResStarted),
+				Payload: []byte{initiator},
 			})
 			return
 		case <-ctx.Done():
@@ -874,6 +893,14 @@ func (server *Server) runUDPPlainReader(ctx context.Context) {
 
 		server.registerUDPPlainClient(remoteAddr)
 		payload := append([]byte(nil), buffer[:n]...)
+		if server.cfg.Debug {
+			log.Printf(
+				"udp_plain_rx client=%s len=%d first=0x%02X",
+				remoteAddr.String(),
+				len(payload),
+				payload[0],
+			)
+		}
 
 		select {
 		case server.udpQueue <- udpDatagram{payload: payload}:
@@ -908,6 +935,14 @@ func (server *Server) runUDPPlainWriter(ctx context.Context) {
 func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byte) error {
 	if len(payload) == 0 {
 		return nil
+	}
+	if server.cfg.Debug {
+		log.Printf(
+			"udp_plain_forward begin len=%d first=0x%02X wire_plain_upstream=%t",
+			len(payload),
+			payload[0],
+			server.isWirePlainUpstream(),
+		)
 	}
 
 	select {
@@ -952,6 +987,9 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 			}
 			return err
 		}
+	}
+	if server.cfg.Debug {
+		log.Printf("udp_plain_forward done len=%d", len(payload))
 	}
 	return nil
 }
@@ -1005,8 +1043,14 @@ func (server *Server) startUDPPlainBridge(initiator byte) error {
 		default:
 			return fmt.Errorf("upstream start unexpected response 0x%02X", response.Command)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(server.cfg.UDPPlainStartWait):
 		server.clearPendingStart(0)
+		if !server.cfg.DisableUDPPlainStartFallback {
+			if server.cfg.Debug {
+				log.Printf("udp_plain_bridge_start_timeout_fallback=true initiator=0x%02X", initiator)
+			}
+			return nil
+		}
 		return fmt.Errorf("upstream start timeout")
 	}
 }

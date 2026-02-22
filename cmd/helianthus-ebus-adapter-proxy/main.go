@@ -26,6 +26,8 @@ func main() {
 	autoJoinWarmup := flag.Duration("auto-join-warmup", 5*time.Second, "passive warmup duration before selecting auto initiator")
 	autoJoinActivityWindow := flag.Duration("auto-join-activity-window", 5*time.Second, "activity freshness window for auto initiator selection")
 	udpRetryJitter := flag.Float64("udp-retry-jitter", 0.2, "jitter factor [0..1] for udp-plain arbitration retry backoff")
+	udpStartWait := flag.Duration("udp-plain-start-wait", 5*time.Second, "maximum wait for udp-plain START arbitration before timeout/fallback")
+	udpDisableStartFallback := flag.Bool("udp-plain-disable-start-fallback", false, "disable udp-plain START timeout fallback to STARTED")
 	wireLogPath := flag.String("wire-log", "", "optional file path to write timestamped upstream tx/rx bytes (no addresses)")
 	debug := flag.Bool("debug", false, "enable debug logging (no client addresses)")
 	flag.Parse()
@@ -52,18 +54,20 @@ func main() {
 	log.Printf("Upstream: (configured)")
 
 	server := adapterproxy.NewServer(adapterproxy.Config{
-		ListenAddr:             normalizedListen,
-		UDPPlainListenAddr:     normalizedUDPPlainListen,
-		UpstreamTransport:      upstreamTransport,
-		UpstreamAddr:           normalizedUpstream,
-		DialTimeout:            *dialTimeout,
-		ReadTimeout:            *readTimeout,
-		WriteTimeout:           *writeTimeout,
-		AutoJoinWarmup:         *autoJoinWarmup,
-		AutoJoinActivityWindow: *autoJoinActivityWindow,
-		UDPPlainRetryJitter:    *udpRetryJitter,
-		WireLogPath:            strings.TrimSpace(*wireLogPath),
-		Debug:                  *debug,
+		ListenAddr:                   normalizedListen,
+		UDPPlainListenAddr:           normalizedUDPPlainListen,
+		UpstreamTransport:            upstreamTransport,
+		UpstreamAddr:                 normalizedUpstream,
+		DialTimeout:                  *dialTimeout,
+		ReadTimeout:                  *readTimeout,
+		WriteTimeout:                 *writeTimeout,
+		AutoJoinWarmup:               *autoJoinWarmup,
+		AutoJoinActivityWindow:       *autoJoinActivityWindow,
+		UDPPlainRetryJitter:          *udpRetryJitter,
+		UDPPlainStartWait:            *udpStartWait,
+		DisableUDPPlainStartFallback: *udpDisableStartFallback,
+		WireLogPath:                  strings.TrimSpace(*wireLogPath),
+		Debug:                        *debug,
 	})
 
 	if err := server.Serve(ctx); err != nil {

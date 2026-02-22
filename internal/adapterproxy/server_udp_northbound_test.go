@@ -212,6 +212,37 @@ func TestForwardUDPPlainDatagramBridgesStartForENHUpstream(t *testing.T) {
 	server.waitGroup.Wait()
 }
 
+func TestForwardUDPPlainDatagramBridgeStartTimeoutFallback(t *testing.T) {
+	t.Parallel()
+
+	upstream := &recordingUpstream{}
+	server := &Server{
+		cfg: Config{
+			UpstreamTransport: UpstreamENH,
+			UDPPlainStartWait: 20 * time.Millisecond,
+		},
+		upstream: upstream,
+		busToken: make(chan struct{}, 1),
+		synCh:    make(chan struct{}, 1),
+	}
+	server.busToken <- struct{}{}
+
+	if err := server.forwardUDPPlainDatagram(context.Background(), []byte{0x31, 0x15, 0x07, 0x04, 0x00}); err != nil {
+		t.Fatalf("forwardUDPPlainDatagram error = %v", err)
+	}
+
+	got := upstream.snapshot()
+	want := []byte{0x15, 0x07, 0x04, 0x00}
+	if len(got) != len(want) {
+		t.Fatalf("written len = %d; want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("written[%d] = 0x%02X; want 0x%02X", index, got[index], want[index])
+		}
+	}
+}
+
 func TestBroadcastUDPPlainByteWritesToRegisteredClient(t *testing.T) {
 	t.Parallel()
 
