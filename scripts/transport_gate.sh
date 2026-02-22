@@ -13,7 +13,13 @@ if ! git rev-parse --verify "${base_ref}" >/dev/null 2>&1; then
   exit 0
 fi
 
-changed_files="$(git diff --name-only "${base_ref}...HEAD")"
+changed_files="$(
+  {
+    git diff --name-only "${base_ref}...HEAD"
+    git diff --name-only
+    git diff --name-only --cached
+  } | awk 'NF { print }' | sort -u
+)"
 if [[ -z "${changed_files}" ]]; then
   echo "transport gate: no changes against ${base_ref}."
   exit 0

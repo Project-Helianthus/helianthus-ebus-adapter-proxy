@@ -960,7 +960,7 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 
 	if !server.isWirePlainUpstream() {
 		initiator := payload[0]
-		if err := server.startUDPPlainBridge(initiator); err != nil {
+		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
 		server.mutex.Lock()
@@ -1005,8 +1005,12 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 	server.udpClientsMu.Unlock()
 }
 
-func (server *Server) startUDPPlainBridge(initiator byte) error {
+func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) error {
 	respCh := make(chan downstream.Frame, 1)
+	startMode := pendingStartModeENH
+	if server.isWirePlainUpstream() {
+		startMode = pendingStartModeUDPPlain
+	}
 
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil {
@@ -1016,7 +1020,7 @@ func (server *Server) startUDPPlainBridge(initiator byte) error {
 	server.pendingStart = &pendingStart{
 		sessionID: 0,
 		respCh:    respCh,
-		mode:      pendingStartModeUDPPlain,
+		mode:      startMode,
 		initiator: initiator,
 	}
 	server.pendingStartMu.Unlock()
@@ -1043,6 +1047,9 @@ func (server *Server) startUDPPlainBridge(initiator byte) error {
 		default:
 			return fmt.Errorf("upstream start unexpected response 0x%02X", response.Command)
 		}
+	case <-ctx.Done():
+		server.clearPendingStart(0)
+		return ctx.Err()
 	case <-time.After(server.cfg.UDPPlainStartWait):
 		server.clearPendingStart(0)
 		if !server.cfg.DisableUDPPlainStartFallback {
