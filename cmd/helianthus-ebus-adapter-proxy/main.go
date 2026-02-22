@@ -19,7 +19,7 @@ import (
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:19001", "listen address for downstream ebusd-compatible enhanced protocol clients")
 	listenUDPPlainAddr := flag.String("listen-udp-plain", "", "optional udp listen address for northbound raw-byte clients")
-	upstream := flag.String("upstream", "", "upstream adapter endpoint (e.g. enh://host:port, ens://host:port, or udp-plain://host:port)")
+	upstream := flag.String("upstream", "", "upstream adapter endpoint (e.g. enh://host:port, ens://host:port, udp-plain://host:port, or tcp-plain://host:port)")
 	dialTimeout := flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 200*time.Millisecond, "read timeout applied to upstream and downstream sockets")
 	writeTimeout := flag.Duration("write-timeout", 2*time.Second, "write timeout applied to upstream and downstream sockets")
@@ -117,6 +117,8 @@ func normalizeUpstreamEndpoint(raw string) (adapterproxy.UpstreamTransport, stri
 			return adapterproxy.UpstreamENS, parsed.Host, nil
 		case "udp-plain":
 			return adapterproxy.UpstreamUDPPlain, parsed.Host, nil
+		case "tcp-plain":
+			return adapterproxy.UpstreamTCPPlain, parsed.Host, nil
 		default:
 			return "", "", fmt.Errorf("upstream endpoint unsupported scheme %q", scheme)
 		}

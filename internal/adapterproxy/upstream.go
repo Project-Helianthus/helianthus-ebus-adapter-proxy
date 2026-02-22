@@ -47,6 +47,8 @@ func dialUpstream(
 	switch transport {
 	case UpstreamUDPPlain:
 		return dialUpstreamUDPPlain(ctx, address, timeout, readTimeout, writeTimeout)
+	case UpstreamTCPPlain:
+		return dialUpstreamTCPPlain(ctx, address, timeout, readTimeout, writeTimeout)
 	case UpstreamENH, UpstreamENS, "":
 		return dialUpstreamENH(ctx, address, timeout, readTimeout, writeTimeout)
 	default:
@@ -242,6 +244,98 @@ func (client *udpPlainUpstreamClient) WriteFrame(frame downstream.Frame) error {
 }
 
 func (client *udpPlainUpstreamClient) SendInit(features byte) error {
+	return nil
+}
+
+type tcpPlainUpstreamClient struct {
+	conn         net.Conn
+	reader       *bufio.Reader
+	readTimeout  time.Duration
+	writeTimeout time.Duration
+
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+}
+
+func dialUpstreamTCPPlain(
+	ctx context.Context,
+	address string,
+	timeout time.Duration,
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) (*tcpPlainUpstreamClient, error) {
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+	return &tcpPlainUpstreamClient{
+		conn:         conn,
+		reader:       bufio.NewReaderSize(conn, 4096),
+		readTimeout:  readTimeout,
+		writeTimeout: writeTimeout,
+	}, nil
+}
+
+func (client *tcpPlainUpstreamClient) Close() error {
+	if client == nil || client.conn == nil {
+		return nil
+	}
+	return client.conn.Close()
+}
+
+func (client *tcpPlainUpstreamClient) ReadFrame() (downstream.Frame, error) {
+	if client == nil || client.conn == nil {
+		return downstream.Frame{}, io.EOF
+	}
+	client.readMu.Lock()
+	defer client.readMu.Unlock()
+
+	if err := setReadDeadline(client.conn, client.readTimeout); err != nil {
+		return downstream.Frame{}, err
+	}
+	value, err := client.reader.ReadByte()
+	if err != nil {
+		return downstream.Frame{}, err
+	}
+	return downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{value},
+	}, nil
+}
+
+func (client *tcpPlainUpstreamClient) WriteFrame(frame downstream.Frame) error {
+	if client == nil || client.conn == nil {
+		return io.EOF
+	}
+	if len(frame.Payload) != 1 {
+		return fmt.Errorf("tcp-plain upstream requires exactly one byte payload, got %d", len(frame.Payload))
+	}
+	command := southboundenh.ENHCommand(frame.Command)
+	switch command {
+	case southboundenh.ENHReqSend:
+	case southboundenh.ENHReqInit:
+		return nil
+	default:
+		return fmt.Errorf("tcp-plain upstream does not support command 0x%02X", frame.Command)
+	}
+
+	client.writeMu.Lock()
+	defer client.writeMu.Unlock()
+
+	if err := setWriteDeadline(client.conn, client.writeTimeout); err != nil {
+		return err
+	}
+	_, err := client.conn.Write(frame.Payload)
+	return err
+}
+
+func (client *tcpPlainUpstreamClient) SendInit(features byte) error {
 	return nil
 }
 

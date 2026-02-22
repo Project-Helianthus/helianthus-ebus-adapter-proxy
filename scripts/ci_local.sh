@@ -21,6 +21,8 @@ GOWORK=off go vet ./...
 echo "==> terminology gate"
 ./scripts/terminology-gate.sh
 
+echo "==> transport gate"
+./scripts/transport_gate.sh
+
 echo "==> runbook docs gate"
 ./scripts/runbook-gate.sh
-

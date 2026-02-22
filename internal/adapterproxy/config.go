@@ -8,6 +8,7 @@ const (
 	UpstreamENH      UpstreamTransport = "enh"
 	UpstreamENS      UpstreamTransport = "ens"
 	UpstreamUDPPlain UpstreamTransport = "udp-plain"
+	UpstreamTCPPlain UpstreamTransport = "tcp-plain"
 )
 
 type Config struct {

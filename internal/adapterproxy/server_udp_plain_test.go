@@ -354,3 +354,86 @@ func TestHandleStartUDPPlainBootstrapsWithoutObservedSyn(t *testing.T) {
 		t.Fatalf("expected start response for udp bootstrap flow")
 	}
 }
+
+func TestHandleStartAutoJoinReusesExistingLease(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{
+		UpstreamTransport:      UpstreamUDPPlain,
+		AutoJoinActivityWindow: time.Minute,
+	})
+	server.upstream = newFakeUpstream()
+
+	sessionState := &session{
+		id:     1,
+		sendCh: make(chan downstream.Frame, 2),
+		done:   make(chan struct{}),
+	}
+	server.sessions = map[uint64]*session{1: sessionState}
+
+	if _, err := server.acquireLease(1, 0xF7); err != nil {
+		t.Fatalf("acquireLease(session=1) error = %v", err)
+	}
+
+	go func() {
+		deadline := time.Now().Add(1500 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if server.isStartPending() {
+				_ = server.deliverPendingStartFromArbByte(0xF7)
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	server.handleStart(context.Background(), 1, 0x00)
+
+	select {
+	case frame := <-sessionState.sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
+			t.Fatalf("command = 0x%02X; want ENHResStarted", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0xF7 {
+			t.Fatalf("payload = %x; want [f7]", frame.Payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected start response for leased auto-join flow")
+	}
+}
+
+func TestHandleStartReleasesLeaseOnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = newFakeUpstream()
+	sessionState := &session{
+		id:     1,
+		sendCh: make(chan downstream.Frame, 2),
+		done:   make(chan struct{}),
+	}
+	server.sessions = map[uint64]*session{1: sessionState}
+
+	if _, err := server.acquireLease(1, 0x31); err != nil {
+		t.Fatalf("acquireLease(session=1) error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		server.handleStart(ctx, 1, 0x31)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handleStart did not return after context cancellation")
+	}
+
+	if _, ok := server.sessionLeaseAddress(1); ok {
+		t.Fatalf("lease still present after canceled start; want released")
+	}
+}
