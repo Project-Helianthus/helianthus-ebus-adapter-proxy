@@ -35,6 +35,12 @@ func TestNormalizeUpstreamEndpoint(t *testing.T) {
 			wantAddress:   "127.0.0.1:9999",
 		},
 		{
+			name:          "tcp plain scheme",
+			input:         "tcp-plain://127.0.0.1:9999",
+			wantTransport: adapterproxy.UpstreamTCPPlain,
+			wantAddress:   "127.0.0.1:9999",
+		},
+		{
 			name:          "hostport defaults to enh",
 			input:         "127.0.0.1:9999",
 			wantTransport: adapterproxy.UpstreamENH,

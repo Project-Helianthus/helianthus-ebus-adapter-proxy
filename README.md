@@ -83,6 +83,16 @@ go run ./cmd/helianthus-ebus-adapter-proxy \
 
 `--wire-log` stores timestamped TX/RX bytes only (no client addresses/credentials).
 
+For unstable plain-wire links (Wi-Fi/VPN jitter), tune START handling:
+
+```bash
+go run ./cmd/helianthus-ebus-adapter-proxy \
+  --listen 0.0.0.0:19001 \
+  --upstream udp-plain://203.0.113.10:9999 \
+  --udp-plain-start-wait 8s \
+  --udp-plain-disable-start-fallback=false
+```
+
 ## Local Smoke-Test Configuration Examples
 
 ### A) Gateway direct-proxy smoke profile (issue #15)

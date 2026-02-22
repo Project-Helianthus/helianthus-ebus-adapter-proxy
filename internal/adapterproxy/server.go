@@ -21,18 +21,19 @@ import (
 )
 
 const (
-	defaultLeaseDuration  = 30 * time.Minute
-	ebusSyn               = byte(0xAA)
-	busIdleReleaseGrace   = 400 * time.Millisecond
-	udpPlainSynWait       = 5 * time.Second
-	udpPlainBootstrapWait = 250 * time.Millisecond
-	udpPlainStartWait     = 5 * time.Second
-	udpPlainMaxAttempts   = 4
-	udpPlainBackoffBase   = 25 * time.Millisecond
-	udpPlainBackoffMax    = 400 * time.Millisecond
-	defaultRetryJitter    = 0.2
-	defaultAutoJoinWarmup = 5 * time.Second
-	udpNorthboundQueueCap = 1024
+	defaultLeaseDuration     = 30 * time.Minute
+	ebusSyn                  = byte(0xAA)
+	udpBridgeOwnerID         = ^uint64(0)
+	busIdleReleaseGrace      = 400 * time.Millisecond
+	udpPlainSynWait          = 5 * time.Second
+	udpPlainBootstrapWait    = 250 * time.Millisecond
+	udpPlainStartWaitDefault = 5 * time.Second
+	udpPlainMaxAttempts      = 4
+	udpPlainBackoffBase      = 25 * time.Millisecond
+	udpPlainBackoffMax       = 400 * time.Millisecond
+	defaultRetryJitter       = 0.2
+	defaultAutoJoinWarmup    = 5 * time.Second
+	udpNorthboundQueueCap    = 1024
 )
 
 type udpDatagram struct {
@@ -133,6 +134,9 @@ func NewServer(cfg Config) *Server {
 	}
 	if cfg.UDPPlainRetryJitter == 0 {
 		cfg.UDPPlainRetryJitter = defaultRetryJitter
+	}
+	if cfg.UDPPlainStartWait <= 0 {
+		cfg.UDPPlainStartWait = udpPlainStartWaitDefault
 	}
 
 	server := &Server{
@@ -383,7 +387,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 
 	if initiator == ebusSyn {
 		server.handleStartCancel(sessionID)
-		if server.cfg.UpstreamTransport != UpstreamUDPPlain {
+		if !server.isWirePlainUpstream() {
 			// Forward best-effort cancellation upstream. The enhanced protocol does not
 			// mandate a response for START+SYN, so we must not block waiting for one.
 			_ = server.upstream.WriteFrame(downstream.Frame{
@@ -395,15 +399,22 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 
 	if initiator == 0x00 {
-		selected, err := server.selectAutoInitiator()
-		if err != nil {
-			server.reply(sessionID, downstream.Frame{
-				Command: byte(southboundenh.ENHResErrorHost),
-				Payload: []byte{0x00},
-			})
-			return
+		if leasedAddress, ok := server.sessionLeaseAddress(sessionID); ok {
+			initiator = leasedAddress
+			if server.cfg.Debug {
+				log.Printf("session=%d auto_join_reuse_lease=0x%02X", sessionID, leasedAddress)
+			}
+		} else {
+			selected, err := server.selectAutoInitiator()
+			if err != nil {
+				server.reply(sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				})
+				return
+			}
+			initiator = selected
 		}
-		initiator = selected
 		if server.cfg.Debug {
 			log.Printf("session=%d auto_join_initiator=0x%02X", sessionID, initiator)
 		}
@@ -438,7 +449,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 	initiator = selectedInitiator
 
-	if server.cfg.UpstreamTransport == UpstreamUDPPlain {
+	if server.isWirePlainUpstream() {
 		server.handleStartUDPPlain(ctx, sessionID, initiator)
 		return
 	}
@@ -481,10 +492,16 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	select {
 	case <-ctx.Done():
 		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		if !ownedBySession {
 			server.releaseBusToken()
 		}
 		return
 	case <-sess.done:
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
 		if !ownedBySession {
 			server.releaseBusToken()
 		}
@@ -508,6 +525,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 	if err := server.upstream.WriteFrame(startFrame); err != nil {
 		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
 		if !ownedBySession {
 			server.releaseBusToken()
 		}
@@ -546,6 +566,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 					server.markSessionCollision(sessionID, 0x00)
 				}
 			}
+			if !ownedBySession {
+				server.releaseLease(sessionID)
+			}
 			if southboundenh.ENHCommand(response.Command) == southboundenh.ENHResFailed ||
 				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorEBUS ||
 				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorHost {
@@ -558,6 +581,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 	case <-time.After(5 * time.Second):
 		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
 		server.releaseBusIfOwner(sessionID)
 		if !ownedBySession {
 			server.releaseBusToken()
@@ -569,6 +595,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
 		server.releaseBusIfOwner(sessionID)
 		if !ownedBySession {
 			server.releaseBusToken()
@@ -586,6 +615,7 @@ func (server *Server) handleStartCancel(sessionID uint64) {
 	server.pendingStartMu.Unlock()
 
 	server.releaseBusIfOwner(sessionID)
+	server.releaseLease(sessionID)
 }
 
 func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64, initiator byte) {
@@ -628,6 +658,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		owner := server.busOwner
 		server.mutex.Unlock()
 		if owner != sessionID {
+			server.releaseLease(sessionID)
 			server.releaseBusToken()
 		}
 	}()
@@ -715,18 +746,37 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			default:
 				return
 			}
-		case <-time.After(udpPlainStartWait):
+		case <-time.After(server.cfg.UDPPlainStartWait):
 			server.clearPendingStart(sessionID)
+			if server.cfg.DisableUDPPlainStartFallback {
+				server.releaseLease(sessionID)
+				server.reply(sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				})
+				return
+			}
+			if server.cfg.Debug {
+				log.Printf("session=%d start_timeout_fallback=true", sessionID)
+			}
+			server.mutex.Lock()
+			server.busOwner = sessionID
+			server.busDirty = true
+			server.busOwned = time.Now().UTC()
+			server.mutex.Unlock()
+			server.clearSessionCollision(sessionID)
 			server.reply(sessionID, downstream.Frame{
-				Command: byte(southboundenh.ENHResErrorHost),
-				Payload: []byte{0x00},
+				Command: byte(southboundenh.ENHResStarted),
+				Payload: []byte{initiator},
 			})
 			return
 		case <-ctx.Done():
 			server.clearPendingStart(sessionID)
+			server.releaseLease(sessionID)
 			return
 		case <-sess.done:
 			server.clearPendingStart(sessionID)
+			server.releaseLease(sessionID)
 			return
 		}
 	}
@@ -843,6 +893,14 @@ func (server *Server) runUDPPlainReader(ctx context.Context) {
 
 		server.registerUDPPlainClient(remoteAddr)
 		payload := append([]byte(nil), buffer[:n]...)
+		if server.cfg.Debug {
+			log.Printf(
+				"udp_plain_rx client=%s len=%d first=0x%02X",
+				remoteAddr.String(),
+				len(payload),
+				payload[0],
+			)
+		}
 
 		select {
 		case server.udpQueue <- udpDatagram{payload: payload}:
@@ -878,13 +936,44 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	if len(payload) == 0 {
 		return nil
 	}
+	if server.cfg.Debug {
+		log.Printf(
+			"udp_plain_forward begin len=%d first=0x%02X wire_plain_upstream=%t",
+			len(payload),
+			payload[0],
+			server.isWirePlainUpstream(),
+		)
+	}
 
 	select {
 	case <-server.busToken:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer server.releaseBusToken()
+
+	releaseToken := true
+	defer func() {
+		if releaseToken {
+			server.releaseBusToken()
+		}
+	}()
+
+	if !server.isWirePlainUpstream() {
+		initiator := payload[0]
+		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
+			return err
+		}
+		server.mutex.Lock()
+		server.busOwner = udpBridgeOwnerID
+		server.busDirty = true
+		server.busOwned = time.Now().UTC()
+		server.mutex.Unlock()
+		releaseToken = false
+		payload = payload[1:]
+		if len(payload) == 0 {
+			return nil
+		}
+	}
 
 	for _, symbol := range payload {
 		server.logWireTX(symbol)
@@ -892,8 +981,15 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 			Command: byte(southboundenh.ENHReqSend),
 			Payload: []byte{symbol},
 		}); err != nil {
+			if !releaseToken {
+				server.releaseBusIfOwner(udpBridgeOwnerID)
+				releaseToken = true
+			}
 			return err
 		}
+	}
+	if server.cfg.Debug {
+		log.Printf("udp_plain_forward done len=%d", len(payload))
 	}
 	return nil
 }
@@ -907,6 +1003,63 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 	server.udpClientsMu.Lock()
 	server.udpClients[clientAddress] = remoteAddr
 	server.udpClientsMu.Unlock()
+}
+
+func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) error {
+	respCh := make(chan downstream.Frame, 1)
+	startMode := pendingStartModeENH
+	if server.isWirePlainUpstream() {
+		startMode = pendingStartModeUDPPlain
+	}
+
+	server.pendingStartMu.Lock()
+	if server.pendingStart != nil {
+		server.pendingStartMu.Unlock()
+		return fmt.Errorf("upstream start already pending")
+	}
+	server.pendingStart = &pendingStart{
+		sessionID: 0,
+		respCh:    respCh,
+		mode:      startMode,
+		initiator: initiator,
+	}
+	server.pendingStartMu.Unlock()
+
+	if err := server.upstream.WriteFrame(downstream.Frame{
+		Command: byte(southboundenh.ENHReqStart),
+		Payload: []byte{initiator},
+	}); err != nil {
+		server.clearPendingStart(0)
+		return err
+	}
+
+	select {
+	case response := <-respCh:
+		command := southboundenh.ENHCommand(response.Command)
+		switch command {
+		case southboundenh.ENHResStarted:
+			return nil
+		case southboundenh.ENHResFailed:
+			if len(response.Payload) == 1 {
+				return fmt.Errorf("upstream start failed (winner=0x%02X)", response.Payload[0])
+			}
+			return fmt.Errorf("upstream start failed")
+		default:
+			return fmt.Errorf("upstream start unexpected response 0x%02X", response.Command)
+		}
+	case <-ctx.Done():
+		server.clearPendingStart(0)
+		return ctx.Err()
+	case <-time.After(server.cfg.UDPPlainStartWait):
+		server.clearPendingStart(0)
+		if !server.cfg.DisableUDPPlainStartFallback {
+			if server.cfg.Debug {
+				log.Printf("udp_plain_bridge_start_timeout_fallback=true initiator=0x%02X", initiator)
+			}
+			return nil
+		}
+		return fmt.Errorf("upstream start timeout")
+	}
 }
 
 func (server *Server) runUpstreamReader(ctx context.Context) {
@@ -1090,7 +1243,16 @@ func (server *Server) isStartPending() bool {
 }
 
 func (server *Server) shouldUseWireArbitrationResult() bool {
-	return server.cfg.UpstreamTransport == UpstreamUDPPlain
+	return server.isWirePlainUpstream()
+}
+
+func (server *Server) isWirePlainUpstream() bool {
+	switch server.cfg.UpstreamTransport {
+	case UpstreamUDPPlain, UpstreamTCPPlain:
+		return true
+	default:
+		return false
+	}
 }
 
 func (server *Server) clearSynSignal() {
@@ -1475,6 +1637,21 @@ func (server *Server) releaseLease(sessionID uint64) {
 	if ok {
 		_, _ = server.leaseManager.Release(lease.OwnerID)
 	}
+}
+
+func (server *Server) sessionLeaseAddress(sessionID uint64) (byte, bool) {
+	if server.leaseManager == nil {
+		return 0, false
+	}
+
+	server.leasesMu.Lock()
+	defer server.leasesMu.Unlock()
+
+	lease, ok := server.leasedBySess[sessionID]
+	if !ok {
+		return 0, false
+	}
+	return lease.Address, true
 }
 
 func (server *Server) noteObservedInitiatorByte(byteValue byte) {

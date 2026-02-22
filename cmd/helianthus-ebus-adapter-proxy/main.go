@@ -19,13 +19,15 @@ import (
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:19001", "listen address for downstream ebusd-compatible enhanced protocol clients")
 	listenUDPPlainAddr := flag.String("listen-udp-plain", "", "optional udp listen address for northbound raw-byte clients")
-	upstream := flag.String("upstream", "", "upstream adapter endpoint (e.g. enh://host:port, ens://host:port, or udp-plain://host:port)")
+	upstream := flag.String("upstream", "", "upstream adapter endpoint (e.g. enh://host:port, ens://host:port, udp-plain://host:port, or tcp-plain://host:port)")
 	dialTimeout := flag.Duration("dial-timeout", 3*time.Second, "upstream dial timeout")
 	readTimeout := flag.Duration("read-timeout", 200*time.Millisecond, "read timeout applied to upstream and downstream sockets")
 	writeTimeout := flag.Duration("write-timeout", 2*time.Second, "write timeout applied to upstream and downstream sockets")
 	autoJoinWarmup := flag.Duration("auto-join-warmup", 5*time.Second, "passive warmup duration before selecting auto initiator")
 	autoJoinActivityWindow := flag.Duration("auto-join-activity-window", 5*time.Second, "activity freshness window for auto initiator selection")
 	udpRetryJitter := flag.Float64("udp-retry-jitter", 0.2, "jitter factor [0..1] for udp-plain arbitration retry backoff")
+	udpStartWait := flag.Duration("udp-plain-start-wait", 5*time.Second, "maximum wait for udp-plain START arbitration before timeout/fallback")
+	udpDisableStartFallback := flag.Bool("udp-plain-disable-start-fallback", false, "disable udp-plain START timeout fallback to STARTED")
 	wireLogPath := flag.String("wire-log", "", "optional file path to write timestamped upstream tx/rx bytes (no addresses)")
 	debug := flag.Bool("debug", false, "enable debug logging (no client addresses)")
 	flag.Parse()
@@ -52,18 +54,20 @@ func main() {
 	log.Printf("Upstream: (configured)")
 
 	server := adapterproxy.NewServer(adapterproxy.Config{
-		ListenAddr:             normalizedListen,
-		UDPPlainListenAddr:     normalizedUDPPlainListen,
-		UpstreamTransport:      upstreamTransport,
-		UpstreamAddr:           normalizedUpstream,
-		DialTimeout:            *dialTimeout,
-		ReadTimeout:            *readTimeout,
-		WriteTimeout:           *writeTimeout,
-		AutoJoinWarmup:         *autoJoinWarmup,
-		AutoJoinActivityWindow: *autoJoinActivityWindow,
-		UDPPlainRetryJitter:    *udpRetryJitter,
-		WireLogPath:            strings.TrimSpace(*wireLogPath),
-		Debug:                  *debug,
+		ListenAddr:                   normalizedListen,
+		UDPPlainListenAddr:           normalizedUDPPlainListen,
+		UpstreamTransport:            upstreamTransport,
+		UpstreamAddr:                 normalizedUpstream,
+		DialTimeout:                  *dialTimeout,
+		ReadTimeout:                  *readTimeout,
+		WriteTimeout:                 *writeTimeout,
+		AutoJoinWarmup:               *autoJoinWarmup,
+		AutoJoinActivityWindow:       *autoJoinActivityWindow,
+		UDPPlainRetryJitter:          *udpRetryJitter,
+		UDPPlainStartWait:            *udpStartWait,
+		DisableUDPPlainStartFallback: *udpDisableStartFallback,
+		WireLogPath:                  strings.TrimSpace(*wireLogPath),
+		Debug:                        *debug,
 	})
 
 	if err := server.Serve(ctx); err != nil {
@@ -117,6 +121,8 @@ func normalizeUpstreamEndpoint(raw string) (adapterproxy.UpstreamTransport, stri
 			return adapterproxy.UpstreamENS, parsed.Host, nil
 		case "udp-plain":
 			return adapterproxy.UpstreamUDPPlain, parsed.Host, nil
+		case "tcp-plain":
+			return adapterproxy.UpstreamTCPPlain, parsed.Host, nil
 		default:
 			return "", "", fmt.Errorf("upstream endpoint unsupported scheme %q", scheme)
 		}
