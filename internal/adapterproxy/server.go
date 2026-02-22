@@ -23,6 +23,7 @@ import (
 const (
 	defaultLeaseDuration  = 30 * time.Minute
 	ebusSyn               = byte(0xAA)
+	udpBridgeOwnerID      = ^uint64(0)
 	busIdleReleaseGrace   = 400 * time.Millisecond
 	udpPlainSynWait       = 5 * time.Second
 	udpPlainBootstrapWait = 250 * time.Millisecond
@@ -914,13 +915,25 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer server.releaseBusToken()
+
+	releaseToken := true
+	defer func() {
+		if releaseToken {
+			server.releaseBusToken()
+		}
+	}()
 
 	if !server.isWirePlainUpstream() {
 		initiator := payload[0]
 		if err := server.startUDPPlainBridge(initiator); err != nil {
 			return err
 		}
+		server.mutex.Lock()
+		server.busOwner = udpBridgeOwnerID
+		server.busDirty = true
+		server.busOwned = time.Now().UTC()
+		server.mutex.Unlock()
+		releaseToken = false
 		payload = payload[1:]
 		if len(payload) == 0 {
 			return nil
@@ -933,6 +946,10 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 			Command: byte(southboundenh.ENHReqSend),
 			Payload: []byte{symbol},
 		}); err != nil {
+			if !releaseToken {
+				server.releaseBusIfOwner(udpBridgeOwnerID)
+				releaseToken = true
+			}
 			return err
 		}
 	}

@@ -148,6 +148,25 @@ func TestForwardUDPPlainDatagramBridgesStartForENHUpstream(t *testing.T) {
 		t.Fatalf("forwardUDPPlainDatagram error = %v", err)
 	}
 
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	server.busOwned = time.Now().Add(-time.Second)
+	server.mutex.Unlock()
+
+	if owner != udpBridgeOwnerID {
+		t.Fatalf("bus owner = %d; want udp bridge owner", owner)
+	}
+	if !dirty {
+		t.Fatalf("busDirty = false; want true for active udp bridge owner")
+	}
+
+	select {
+	case <-server.busToken:
+		t.Fatalf("bus token released early; expected hold until idle SYN")
+	default:
+	}
+
 	started, payloads := upstream.snapshot()
 	if len(started) != 1 || started[0] != 0x31 {
 		t.Fatalf("start frame payloads = %x; want [31]", started)
@@ -161,6 +180,31 @@ func TestForwardUDPPlainDatagramBridgesStartForENHUpstream(t *testing.T) {
 		if payloads[index] != wantPayloads[index] {
 			t.Fatalf("payload[%d] = 0x%02X; want 0x%02X", index, payloads[index], wantPayloads[index])
 		}
+	}
+
+	server.noteBusWireSymbol(ebusSyn)
+	server.mutex.Lock()
+	owner = server.busOwner
+	dirty = server.busDirty
+	server.mutex.Unlock()
+	if owner != udpBridgeOwnerID {
+		t.Fatalf("bus owner after first SYN = %d; want udp bridge owner", owner)
+	}
+	if dirty {
+		t.Fatalf("busDirty after first SYN = true; want false boundary marker")
+	}
+
+	server.noteBusWireSymbol(ebusSyn)
+	server.mutex.Lock()
+	owner = server.busOwner
+	server.mutex.Unlock()
+	if owner != 0 {
+		t.Fatalf("bus owner after idle SYN = %d; want 0", owner)
+	}
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("bus token not released after idle SYN")
 	}
 
 	cancel()
