@@ -204,6 +204,7 @@ func (listener *Listener) serveSession(
 		if err != nil {
 			switch {
 			case isTimeoutError(err):
+				resetIfSupported(parser)
 				continue
 			case errors.Is(err, io.EOF) || listener.isClosedError(err):
 				disconnectCause = err
@@ -332,4 +333,11 @@ func isTimeoutError(err error) bool {
 	}
 
 	return false
+}
+
+func resetIfSupported(parser any) {
+	resetter, ok := parser.(interface{ Reset() })
+	if ok {
+		resetter.Reset()
+	}
 }

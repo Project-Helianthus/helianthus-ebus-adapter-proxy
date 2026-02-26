@@ -172,6 +172,7 @@ func (driver *Driver) readLocked() (downstream.Frame, error) {
 	frame, err := driver.parser.Parse(connection)
 	if err != nil {
 		if isTimeoutError(err) {
+			resetIfSupported(driver.parser)
 			return downstream.Frame{}, wrapError(ErrReadTimeout, err)
 		}
 
@@ -347,5 +348,12 @@ func callHook(hook func()) {
 func callHookWithError(hook func(error), err error) {
 	if hook != nil {
 		hook(err)
+	}
+}
+
+func resetIfSupported(parser any) {
+	resetter, ok := parser.(interface{ Reset() })
+	if ok {
+		resetter.Reset()
 	}
 }
