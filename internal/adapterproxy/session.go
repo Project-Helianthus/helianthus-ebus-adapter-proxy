@@ -109,6 +109,7 @@ func (s *session) runReader(onFrame func(downstream.Frame), onError func(error))
 		frame, err := s.parser.Parse(s.reader)
 		if err != nil {
 			if isTimeoutError(err) {
+				s.parser.Reset()
 				continue
 			}
 			if err == io.EOF {
