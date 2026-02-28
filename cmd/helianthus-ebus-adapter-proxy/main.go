@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/adapterproxy"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/adapterproxy"
 )
 
 func main() {

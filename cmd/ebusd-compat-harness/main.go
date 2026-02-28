@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/compat/ebusd"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/compat/ebusd"
 )
 
 func main() {

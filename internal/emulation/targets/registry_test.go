@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/config"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/config"
 )
 
 func TestRegistryRegisterAndLookup(t *testing.T) {

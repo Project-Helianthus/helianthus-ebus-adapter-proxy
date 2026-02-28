@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
 )
 
 var ErrMalformedFrame = errors.New("enh malformed frame")

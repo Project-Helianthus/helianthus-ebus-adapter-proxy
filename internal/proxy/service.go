@@ -1,9 +1,9 @@
 package proxy
 
 import (
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/routing"
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/upstream"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/routing"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/upstream"
 )
 
 type Service struct {

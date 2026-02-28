@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
 )
 
 func TestManagerConnectDisconnectReconnectLifecycle(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
-	southboundens "github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/southbound/ens"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	southboundens "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/southbound/ens"
 )
 
 type Parser interface {

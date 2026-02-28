@@ -221,14 +221,14 @@ ha_branch="$(git -C "${HA_REPO}" rev-parse --abbrev-ref HEAD)"
 if [[ "${ALLOW_NON_MAIN}" -eq 0 && "${ha_branch}" != "main" ]]; then
 	echo "ha integration repo must be on main for issue #17 verification (current: ${ha_branch})"
 	echo "run: git -C '${HA_REPO}' checkout main && git -C '${HA_REPO}' pull --ff-only origin main"
-	echo "or rerun with --allow-non-main when coordinating with d3vi1/helianthus-ha-integration#59"
+	echo "or rerun with --allow-non-main when coordinating with Project-Helianthus/helianthus-ha-integration#59"
 	exit 1
 fi
 
 HA_SMOKE_SCRIPT="${HA_REPO}/scripts/run-ha-dual-topology-smoke.sh"
 if [[ ! -f "${HA_SMOKE_SCRIPT}" ]]; then
 	echo "ha dual-topology smoke script not found: ${HA_SMOKE_SCRIPT}"
-	echo "requires d3vi1/helianthus-ha-integration#59 or newer"
+	echo "requires Project-Helianthus/helianthus-ha-integration#59 or newer"
 	exit 1
 fi
 

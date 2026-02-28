@@ -38,7 +38,7 @@ adapter endpoint/ebusd -> helianthus-ebus-adapter-proxy -> helianthus-ebusgatewa
 ### 1) Clone and baseline validation
 
 ```bash
-git clone https://github.com/d3vi1/helianthus-ebus-adapter-proxy.git
+git clone https://github.com/Project-Helianthus/helianthus-ebus-adapter-proxy.git
 cd helianthus-ebus-adapter-proxy
 ./scripts/ci_local.sh
 ```
@@ -150,10 +150,10 @@ Use when `../helianthus-ha-integration` is available for coexistence checks:
 
 ### Related repos/docs
 
-- Gateway runtime: https://github.com/d3vi1/helianthus-ebusgateway
-- HA integration: https://github.com/d3vi1/helianthus-ha-integration
-- HA add-on: https://github.com/d3vi1/helianthus-ha-addon
-- eBUS docs hub: https://github.com/d3vi1/helianthus-docs-ebus
+- Gateway runtime: https://github.com/Project-Helianthus/helianthus-ebusgateway
+- HA integration: https://github.com/Project-Helianthus/helianthus-ha-integration
+- HA add-on: https://github.com/Project-Helianthus/helianthus-ha-addon
+- eBUS docs hub: https://github.com/Project-Helianthus/helianthus-docs-ebus
 
 ### Issue workflow conventions
 

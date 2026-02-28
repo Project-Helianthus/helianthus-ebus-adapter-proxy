@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	southboundenh "github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/southbound/enh"
+	southboundenh "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/southbound/enh"
 )
 
 const (

@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/sourcepolicy"
-	southboundenh "github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/southbound/enh"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/sourcepolicy"
+	southboundenh "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/southbound/enh"
 )
 
 const (

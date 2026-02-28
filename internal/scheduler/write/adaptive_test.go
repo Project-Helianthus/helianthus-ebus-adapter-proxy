@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/domain/downstream"
-	sessionmanager "github.com/d3vi1/helianthus-ebus-adapter-proxy/internal/session"
+	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	sessionmanager "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/session"
 )
 
 func TestAdaptiveSchedulerBalancedLoad(t *testing.T) {
