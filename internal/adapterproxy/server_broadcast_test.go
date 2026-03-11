@@ -191,3 +191,115 @@ func TestRunUpstreamReaderBroadcastsReceivedWhileStartPendingENH(t *testing.T) {
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffic(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                 Config{UpstreamTransport: UpstreamENH},
+		upstream:            upstream,
+		sessions:            map[uint64]*session{},
+		synCh:               make(chan struct{}, 1),
+		startOfTelegram:     true,
+		observedInitiatorAt: make(map[byte]time.Time),
+		busOwner:            1,
+		busOwnerInitiator:   0xF7,
+		busDirty:            true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	wireSymbols := []byte{
+		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+	if !containsGatewayStyleTransaction(observerSymbols, 0xF7, 0x15, 0xB5, 0x24) {
+		t.Fatalf("observer symbols = % X; want reconstructible gateway-style transaction", observerSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func readReceivedSymbols(t *testing.T, sessionState *session, count int) []byte {
+	t.Helper()
+
+	symbols := make([]byte, 0, count)
+	for len(symbols) < count {
+		select {
+		case frame := <-sessionState.sendCh:
+			if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResReceived {
+				t.Fatalf("command = 0x%02X; want ENHResReceived", frame.Command)
+			}
+			if len(frame.Payload) != 1 {
+				t.Fatalf("payload len = %d; want 1", len(frame.Payload))
+			}
+			symbols = append(symbols, frame.Payload[0])
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for %d received symbols; got %d", count, len(symbols))
+		}
+	}
+
+	return symbols
+}
+
+func equalBytes(left []byte, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsGatewayStyleTransaction(symbols []byte, initiator byte, target byte, primary byte, secondary byte) bool {
+	if len(symbols) < 5 {
+		return false
+	}
+
+	for index := 0; index <= len(symbols)-5; index++ {
+		if symbols[index] != initiator ||
+			symbols[index+1] != target ||
+			symbols[index+2] != primary ||
+			symbols[index+3] != secondary {
+			continue
+		}
+		for tail := index + 4; tail < len(symbols); tail++ {
+			if symbols[tail] == ebusSyn {
+				return true
+			}
+		}
+	}
+
+	return false
+}

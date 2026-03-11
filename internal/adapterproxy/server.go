@@ -73,10 +73,11 @@ type Server struct {
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
 
-	busToken chan struct{}
-	busOwner uint64
-	busDirty bool
-	busOwned time.Time
+	busToken          chan struct{}
+	busOwner          uint64
+	busOwnerInitiator byte
+	busDirty          bool
+	busOwned          time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -551,11 +552,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 		switch southboundenh.ENHCommand(response.Command) {
 		case southboundenh.ENHResStarted:
-			server.mutex.Lock()
-			server.busOwner = sessionID
-			server.busDirty = true
-			server.busOwned = time.Now().UTC()
-			server.mutex.Unlock()
+			server.setBusOwner(sessionID, initiator)
 			server.clearSessionCollision(sessionID)
 			return
 		default:
@@ -702,11 +699,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			server.clearPendingStart(sessionID)
 			switch southboundenh.ENHCommand(response.Command) {
 			case southboundenh.ENHResStarted:
-				server.mutex.Lock()
-				server.busOwner = sessionID
-				server.busDirty = true
-				server.busOwned = time.Now().UTC()
-				server.mutex.Unlock()
+				server.setBusOwner(sessionID, initiator)
 				server.clearSessionCollision(sessionID)
 				server.reply(sessionID, downstream.Frame{
 					Command: byte(southboundenh.ENHResStarted),
@@ -759,11 +752,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			if server.cfg.Debug {
 				log.Printf("session=%d start_timeout_fallback=true", sessionID)
 			}
-			server.mutex.Lock()
-			server.busOwner = sessionID
-			server.busDirty = true
-			server.busOwned = time.Now().UTC()
-			server.mutex.Unlock()
+			server.setBusOwner(sessionID, initiator)
 			server.clearSessionCollision(sessionID)
 			server.reply(sessionID, downstream.Frame{
 				Command: byte(southboundenh.ENHResStarted),
@@ -963,11 +952,7 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
-		server.mutex.Lock()
-		server.busOwner = udpBridgeOwnerID
-		server.busDirty = true
-		server.busOwned = time.Now().UTC()
-		server.mutex.Unlock()
+		server.setBusOwner(udpBridgeOwnerID, initiator)
 		releaseToken = false
 		payload = payload[1:]
 		if len(payload) == 0 {
@@ -1089,6 +1074,8 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
+				prefixFrame, prefixSkipOwner, prefixSkipPending, injectPrefix :=
+					server.observerPrefixFrameForWireSymbol(frame.Payload[0])
 				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
 				if server.cfg.Debug {
 					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
@@ -1105,6 +1092,16 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				}
 
 				if server.shouldUseWireArbitrationResult() && server.isStartPending() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
+					continue
+				}
+
+				if injectPrefix {
+					server.broadcastReceivedWithObserverPrefix(
+						prefixFrame,
+						prefixSkipOwner,
+						prefixSkipPending,
+						frame,
+					)
 					continue
 				}
 			}
@@ -1408,6 +1405,39 @@ func (server *Server) clearPendingInfo(sessionID uint64) {
 	server.pendingInfoMu.Unlock()
 }
 
+func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.Frame, uint64, uint64, bool) {
+	if symbol == ebusSyn || isInitiatorAddress(symbol) {
+		return downstream.Frame{}, 0, 0, false
+	}
+
+	server.observedMu.Lock()
+	atTelegramStart := server.startOfTelegram
+	server.observedMu.Unlock()
+	if !atTelegramStart {
+		return downstream.Frame{}, 0, 0, false
+	}
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	initiator := server.busOwnerInitiator
+	server.mutex.Unlock()
+	if owner == 0 || initiator == 0 {
+		return downstream.Frame{}, 0, 0, false
+	}
+
+	var pendingSessionID uint64
+	server.pendingStartMu.Lock()
+	if server.pendingStart != nil {
+		pendingSessionID = server.pendingStart.sessionID
+	}
+	server.pendingStartMu.Unlock()
+
+	return downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{initiator},
+	}, owner, pendingSessionID, true
+}
+
 func (server *Server) broadcast(frame downstream.Frame) {
 	server.mutex.Lock()
 	sessions := make([]*session, 0, len(server.sessions))
@@ -1417,6 +1447,27 @@ func (server *Server) broadcast(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	for _, sess := range sessions {
+		server.enqueueOrClose(sess, frame, "broadcast")
+	}
+}
+
+func (server *Server) broadcastReceivedWithObserverPrefix(
+	prefix downstream.Frame,
+	skipOwnerID uint64,
+	skipPendingID uint64,
+	frame downstream.Frame,
+) {
+	server.mutex.Lock()
+	sessions := make([]*session, 0, len(server.sessions))
+	for _, sess := range server.sessions {
+		sessions = append(sessions, sess)
+	}
+	server.mutex.Unlock()
+
+	for _, sess := range sessions {
+		if sess.id != skipOwnerID && sess.id != skipPendingID {
+			server.enqueueOrClose(sess, prefix, "broadcast_observer_prefix")
+		}
 		server.enqueueOrClose(sess, frame, "broadcast")
 	}
 }
@@ -1532,11 +1583,21 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 		return
 	}
 	server.busOwner = 0
+	server.busOwnerInitiator = 0
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
 
 	server.releaseBusToken()
+}
+
+func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
+	server.mutex.Lock()
+	server.busOwner = sessionID
+	server.busOwnerInitiator = initiator
+	server.busDirty = true
+	server.busOwned = time.Now().UTC()
+	server.mutex.Unlock()
 }
 
 func (server *Server) releaseBusIfIdleSyn() {
