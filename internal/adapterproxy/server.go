@@ -1609,10 +1609,6 @@ func (server *Server) deliverUpstreamError(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	if owner != 0 {
-		observerFrames, skipPendingID := server.takeObserverReplayForAbort()
-		if len(observerFrames) > 0 {
-			server.broadcastObserverFrames(observerFrames, skipPendingID)
-		}
 		winner := byte(0x00)
 		if len(frame.Payload) == 1 {
 			winner = frame.Payload[0]
@@ -1632,10 +1628,6 @@ func (server *Server) deliverUpstreamFailed(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	if owner != 0 {
-		observerFrames, skipPendingID := server.takeObserverReplayForAbort()
-		if len(observerFrames) > 0 {
-			server.broadcastObserverFrames(observerFrames, skipPendingID)
-		}
 		server.reply(owner, frame)
 		server.releaseBusIfOwner(owner)
 		return
@@ -1645,10 +1637,22 @@ func (server *Server) deliverUpstreamFailed(frame downstream.Frame) {
 }
 
 func (server *Server) releaseBusIfOwner(sessionID uint64) {
+	var observerFrames []downstream.Frame
+	var sessions []*session
+
 	server.mutex.Lock()
 	if server.busOwner != sessionID {
 		server.mutex.Unlock()
 		return
+	}
+	if len(server.ownerObserverSeen) > 0 {
+		observerFrames = appendRawObserverFrames(nil, server.ownerObserverSeen)
+		for _, sess := range server.sessions {
+			if sess.id == sessionID {
+				continue
+			}
+			sessions = append(sessions, sess)
+		}
 	}
 	server.busOwner = 0
 	server.busOwnerInitiator = 0
@@ -1658,6 +1662,18 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
+
+	if len(observerFrames) > 0 {
+		skipPendingID := server.pendingUDPPlainStartSessionID()
+		for _, sess := range sessions {
+			if sess.id == skipPendingID {
+				continue
+			}
+			for _, frame := range observerFrames {
+				server.enqueueOrClose(sess, frame, "broadcast_observer_release")
+			}
+		}
+	}
 
 	server.releaseBusToken()
 }
