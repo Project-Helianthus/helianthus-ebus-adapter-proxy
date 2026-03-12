@@ -1071,6 +1071,10 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				continue
 			}
 			if errors.Is(err, io.EOF) || isClosedNetworkError(err) {
+				observerFrames, skipPendingID := server.takeObserverReplayForAbort()
+				if len(observerFrames) > 0 {
+					server.broadcastObserverFrames(observerFrames, skipPendingID)
+				}
 				return
 			}
 			continue

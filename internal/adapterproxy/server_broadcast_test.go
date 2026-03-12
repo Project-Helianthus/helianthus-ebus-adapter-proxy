@@ -446,6 +446,56 @@ func TestRunUpstreamReaderAbortBeforeSynPreservesProvenWireBytesToObservers(t *t
 	server.waitGroup.Wait()
 }
 
+func TestRunUpstreamReaderEOFBeforeSynPreservesProvenWireBytesToObservers(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	ownerSymbols := readReceivedSymbols(t, server.sessions[1], 1)
+	if !equalBytes(ownerSymbols, []byte{0x15}) {
+		t.Fatalf("owner symbols = % X; want % X", ownerSymbols, []byte{0x15})
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 1)
+	if !equalBytes(observerSymbols, []byte{0x15}) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, []byte{0x15})
+	}
+}
+
 func TestRunUpstreamReaderDoesNotSuppressForeignInterleavingByteDuringReplaySuppression(t *testing.T) {
 	t.Parallel()
 
