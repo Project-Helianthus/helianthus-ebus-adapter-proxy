@@ -1427,7 +1427,7 @@ func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.
 
 	var pendingSessionID uint64
 	server.pendingStartMu.Lock()
-	if server.pendingStart != nil {
+	if server.pendingStart != nil && server.pendingStart.mode == pendingStartModeUDPPlain {
 		pendingSessionID = server.pendingStart.sessionID
 	}
 	server.pendingStartMu.Unlock()
