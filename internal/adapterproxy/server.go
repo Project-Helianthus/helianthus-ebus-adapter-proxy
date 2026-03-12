@@ -73,14 +73,14 @@ type Server struct {
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
 
-	busToken                   chan struct{}
-	busOwner                   uint64
-	busOwnerInitiator          byte
-	ownerObserverAtStart       bool
-	ownerObserverReplay        []downstream.Frame
-	ownerObserverSuppressCount int
-	busDirty                   bool
-	busOwned                   time.Time
+	busToken              chan struct{}
+	busOwner              uint64
+	busOwnerInitiator     byte
+	ownerObserverAtStart  bool
+	ownerObserverReplay   []downstream.Frame
+	ownerObserverSuppress []byte
+	busDirty              bool
+	busOwned              time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -1438,18 +1438,23 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 		} else {
 			server.ownerObserverAtStart = false
 		}
-		server.ownerObserverSuppressCount = 0
+		server.ownerObserverSuppress = nil
 		server.mutex.Unlock()
 		if len(frames) == 0 {
 			return nil, 0, false
 		}
 		return frames, server.pendingUDPPlainStartSessionID(), false
 	}
-	if server.ownerObserverSuppressCount > 0 {
-		server.ownerObserverSuppressCount--
-		suppress = true
-		server.mutex.Unlock()
-		return nil, 0, suppress
+	if len(server.ownerObserverSuppress) > 0 {
+		if symbol == server.ownerObserverSuppress[0] {
+			server.ownerObserverSuppress = server.ownerObserverSuppress[1:]
+			suppress = true
+			server.mutex.Unlock()
+			return nil, 0, suppress
+		}
+		server.ownerObserverReplay = nil
+		server.ownerObserverSuppress = nil
+		server.ownerObserverAtStart = false
 	}
 	if len(server.ownerObserverReplay) > 0 {
 		frames = append([]downstream.Frame(nil), server.ownerObserverReplay...)
@@ -1622,7 +1627,7 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	server.busOwnerInitiator = 0
 	server.ownerObserverAtStart = false
 	server.ownerObserverReplay = nil
-	server.ownerObserverSuppressCount = 0
+	server.ownerObserverSuppress = nil
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
@@ -1636,7 +1641,7 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.busOwnerInitiator = initiator
 	server.ownerObserverAtStart = true
 	server.ownerObserverReplay = nil
-	server.ownerObserverSuppressCount = 0
+	server.ownerObserverSuppress = nil
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
 	server.mutex.Unlock()
@@ -1659,7 +1664,7 @@ func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool
 		Command: byte(southboundenh.ENHResReceived),
 		Payload: []byte{data},
 	})
-	server.ownerObserverSuppressCount++
+	server.ownerObserverSuppress = append(server.ownerObserverSuppress, data)
 	return true
 }
 
@@ -1670,8 +1675,8 @@ func (server *Server) rollbackOwnerObserverReplay(sessionID uint64) {
 		return
 	}
 
-	if server.ownerObserverSuppressCount > 0 {
-		server.ownerObserverSuppressCount--
+	if len(server.ownerObserverSuppress) > 0 {
+		server.ownerObserverSuppress = server.ownerObserverSuppress[:len(server.ownerObserverSuppress)-1]
 	}
 	server.ownerObserverReplay = server.ownerObserverReplay[:len(server.ownerObserverReplay)-1]
 
