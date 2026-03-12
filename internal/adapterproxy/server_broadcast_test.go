@@ -197,15 +197,16 @@ func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffi
 
 	upstream := newFakeUpstream()
 	server := &Server{
-		cfg:                 Config{UpstreamTransport: UpstreamENH},
-		upstream:            upstream,
-		sessions:            map[uint64]*session{},
-		synCh:               make(chan struct{}, 1),
-		startOfTelegram:     true,
-		observedInitiatorAt: make(map[byte]time.Time),
-		busOwner:            1,
-		busOwnerInitiator:   0xF7,
-		busDirty:            true,
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
 	}
 	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
 	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
@@ -256,15 +257,16 @@ func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testin
 
 	upstream := newFakeUpstream()
 	server := &Server{
-		cfg:                 Config{UpstreamTransport: UpstreamENH},
-		upstream:            upstream,
-		sessions:            map[uint64]*session{},
-		synCh:               make(chan struct{}, 1),
-		startOfTelegram:     true,
-		observedInitiatorAt: make(map[byte]time.Time),
-		busOwner:            1,
-		busOwnerInitiator:   0xF7,
-		busDirty:            true,
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
 		pendingStart: &pendingStart{
 			sessionID: 2,
 			respCh:    make(chan downstream.Frame, 1),
@@ -282,14 +284,25 @@ func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testin
 	go server.runUpstreamReader(ctx)
 
 	server.handleSend(1, 0x15)
-	server.handleSend(1, 0xB5)
 
 	wireSymbols := []byte{
-		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
-		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
-		0xAA,
+		0x15,
 	}
 	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	server.handleSend(1, 0xB5)
+
+	wireSymbols = append(wireSymbols,
+		0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	)
+	for _, symbol := range wireSymbols[1:] {
 		upstream.readCh <- downstream.Frame{
 			Command: byte(southboundenh.ENHResReceived),
 			Payload: []byte{symbol},
@@ -321,15 +334,16 @@ func TestRunUpstreamReaderPrefixesShorthandTargetThatLooksLikeInitiator(t *testi
 
 	upstream := newFakeUpstream()
 	server := &Server{
-		cfg:                 Config{UpstreamTransport: UpstreamENH},
-		upstream:            upstream,
-		sessions:            map[uint64]*session{},
-		synCh:               make(chan struct{}, 1),
-		startOfTelegram:     true,
-		observedInitiatorAt: make(map[byte]time.Time),
-		busOwner:            1,
-		busOwnerInitiator:   0xF7,
-		busDirty:            true,
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
 	}
 	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
 	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
@@ -399,9 +413,6 @@ func TestRunUpstreamReaderDoesNotPrefixFullForeignTelegramAtBoundary(t *testing.
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
-	server.handleSend(1, 0x15)
-	server.handleSend(1, 0xB5)
-
 	wireSymbols := []byte{
 		0x31, 0x08, 0xB5, 0x24, 0x02, 0x15, 0x10, 0x00,
 		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
@@ -453,9 +464,6 @@ func TestRunUpstreamReaderDoesNotPrefixForeignTelegramWhenFirstByteMatchesOwnerS
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
-	server.handleSend(1, 0x31)
-	server.handleSend(1, 0xB5)
-
 	wireSymbols := []byte{
 		0x31, 0x08, 0xB5, 0x24, 0x02, 0x15, 0x10, 0x00,
 		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
@@ -476,6 +484,68 @@ func TestRunUpstreamReaderDoesNotPrefixForeignTelegramWhenFirstByteMatchesOwnerS
 	}
 	if !equalBytes(observerSymbols, wireSymbols) {
 		t.Fatalf("observer symbols = % X; want % X (no synthetic prefix on overlapping foreign telegram)", observerSymbols, wireSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderPreservesObserverContextWhenFirstRXPrecedesSecondSend(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		busDirty:             true,
+		ownerObserverAtStart: true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	server.handleSend(1, 0xB5)
+
+	wireSymbols := []byte{
+		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols[1:] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
 	}
 
 	cancel()
