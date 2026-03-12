@@ -1427,7 +1427,11 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 	server.mutex.Lock()
 	owner := server.busOwner
 	suppress := false
+	var frames []downstream.Frame
 	if symbol == ebusSyn {
+		if len(server.ownerObserverReplay) > 0 {
+			frames = append([]downstream.Frame(nil), server.ownerObserverReplay...)
+		}
 		server.ownerObserverReplay = nil
 		if owner != 0 {
 			server.ownerObserverAtStart = true
@@ -1436,13 +1440,20 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 		}
 		server.ownerObserverSuppressCount = 0
 		server.mutex.Unlock()
-		return nil, 0, false
+		if len(frames) == 0 {
+			return nil, 0, false
+		}
+		return frames, server.pendingUDPPlainStartSessionID(), false
 	}
-	frames := append([]downstream.Frame(nil), server.ownerObserverReplay...)
-	server.ownerObserverReplay = nil
 	if server.ownerObserverSuppressCount > 0 {
 		server.ownerObserverSuppressCount--
 		suppress = true
+		server.mutex.Unlock()
+		return nil, 0, suppress
+	}
+	if len(server.ownerObserverReplay) > 0 {
+		frames = append([]downstream.Frame(nil), server.ownerObserverReplay...)
+		server.ownerObserverReplay = nil
 	}
 	server.mutex.Unlock()
 

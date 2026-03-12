@@ -225,7 +225,16 @@ func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffi
 		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
 		0xAA,
 	}
-	for _, symbol := range wireSymbols {
+	for _, symbol := range wireSymbols[:2] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	for _, symbol := range wireSymbols[2:] {
 		upstream.readCh <- downstream.Frame{
 			Command: byte(southboundenh.ENHResReceived),
 			Payload: []byte{symbol},
@@ -245,6 +254,67 @@ func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffi
 	}
 	if !containsGatewayStyleTransaction(observerSymbols, 0xF7, 0x15, 0xB5, 0x24) {
 		t.Fatalf("observer symbols = % X; want reconstructible gateway-style transaction", observerSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderFlushesBufferedObserverRequestOnTerminalSyn(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{ebusSyn},
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], 3)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 4)
+
+	if !equalBytes(activeSymbols, []byte{0x15, 0xB5, ebusSyn}) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, []byte{0x15, 0xB5, ebusSyn})
+	}
+
+	wantObserver := []byte{0xF7, 0x15, 0xB5, ebusSyn}
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
 	}
 
 	cancel()
@@ -295,14 +365,22 @@ func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testin
 		}
 	}
 
+	assertNoReceivedFrames(t, server.sessions[2])
+
 	server.handleSend(1, 0xB5)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
 
 	wireSymbols = append(wireSymbols,
 		0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
 		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
 		0xAA,
 	)
-	for _, symbol := range wireSymbols[1:] {
+	for _, symbol := range wireSymbols[2:] {
 		upstream.readCh <- downstream.Frame{
 			Command: byte(southboundenh.ENHResReceived),
 			Payload: []byte{symbol},
@@ -522,14 +600,22 @@ func TestRunUpstreamReaderPreservesObserverContextWhenFirstRXPrecedesSecondSend(
 		Payload: []byte{0x15},
 	}
 
+	assertNoReceivedFrames(t, server.sessions[2])
+
 	server.handleSend(1, 0xB5)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
 
 	wireSymbols := []byte{
 		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
 		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
 		0xAA,
 	}
-	for _, symbol := range wireSymbols[1:] {
+	for _, symbol := range wireSymbols[2:] {
 		upstream.readCh <- downstream.Frame{
 			Command: byte(southboundenh.ENHResReceived),
 			Payload: []byte{symbol},
@@ -573,6 +659,16 @@ func readReceivedSymbols(t *testing.T, sessionState *session, count int) []byte 
 	}
 
 	return symbols
+}
+
+func assertNoReceivedFrames(t *testing.T, sessionState *session) {
+	t.Helper()
+
+	select {
+	case frame := <-sessionState.sendCh:
+		t.Fatalf("unexpected frame while observer replay should still be buffered: cmd=0x%02X payload=% X", frame.Command, frame.Payload)
+	case <-time.After(75 * time.Millisecond):
+	}
 }
 
 func equalBytes(left []byte, right []byte) bool {
