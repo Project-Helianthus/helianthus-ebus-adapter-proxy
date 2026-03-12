@@ -73,10 +73,14 @@ type Server struct {
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
 
-	busToken chan struct{}
-	busOwner uint64
-	busDirty bool
-	busOwned time.Time
+	busToken              chan struct{}
+	busOwner              uint64
+	busOwnerInitiator     byte
+	ownerObserverAtStart  bool
+	ownerObserverExpected []byte
+	ownerObserverSeen     []byte
+	busDirty              bool
+	busOwned              time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -551,11 +555,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 		switch southboundenh.ENHCommand(response.Command) {
 		case southboundenh.ENHResStarted:
-			server.mutex.Lock()
-			server.busOwner = sessionID
-			server.busDirty = true
-			server.busOwned = time.Now().UTC()
-			server.mutex.Unlock()
+			server.setBusOwner(sessionID, initiator)
 			server.clearSessionCollision(sessionID)
 			return
 		default:
@@ -702,11 +702,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			server.clearPendingStart(sessionID)
 			switch southboundenh.ENHCommand(response.Command) {
 			case southboundenh.ENHResStarted:
-				server.mutex.Lock()
-				server.busOwner = sessionID
-				server.busDirty = true
-				server.busOwned = time.Now().UTC()
-				server.mutex.Unlock()
+				server.setBusOwner(sessionID, initiator)
 				server.clearSessionCollision(sessionID)
 				server.reply(sessionID, downstream.Frame{
 					Command: byte(southboundenh.ENHResStarted),
@@ -759,11 +755,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			if server.cfg.Debug {
 				log.Printf("session=%d start_timeout_fallback=true", sessionID)
 			}
-			server.mutex.Lock()
-			server.busOwner = sessionID
-			server.busDirty = true
-			server.busOwned = time.Now().UTC()
-			server.mutex.Unlock()
+			server.setBusOwner(sessionID, initiator)
 			server.clearSessionCollision(sessionID)
 			server.reply(sessionID, downstream.Frame{
 				Command: byte(southboundenh.ENHResStarted),
@@ -834,6 +826,8 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		return
 	}
 
+	queuedObserverFrames := server.queueOwnerObserverReplay(sessionID, data)
+
 	server.mutex.Lock()
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
@@ -848,6 +842,9 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	}
 	server.logWireTX(data)
 	if err := server.upstream.WriteFrame(sendFrame); err != nil {
+		if queuedObserverFrames {
+			server.rollbackOwnerObserverReplay(sessionID)
+		}
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
 			Payload: []byte{0x00},
@@ -963,11 +960,7 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
-		server.mutex.Lock()
-		server.busOwner = udpBridgeOwnerID
-		server.busDirty = true
-		server.busOwned = time.Now().UTC()
-		server.mutex.Unlock()
+		server.setBusOwner(udpBridgeOwnerID, initiator)
 		releaseToken = false
 		payload = payload[1:]
 		if len(payload) == 0 {
@@ -1078,6 +1071,10 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				continue
 			}
 			if errors.Is(err, io.EOF) || isClosedNetworkError(err) {
+				observerFrames, skipPendingID := server.takeObserverReplayForAbort()
+				if len(observerFrames) > 0 {
+					server.broadcastObserverFrames(observerFrames, skipPendingID)
+				}
 				return
 			}
 			continue
@@ -1105,6 +1102,15 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				}
 
 				if server.shouldUseWireArbitrationResult() && server.isStartPending() && server.deliverPendingStartFromArbByte(frame.Payload[0]) {
+					continue
+				}
+
+				observerFrames, skipPendingID, suppressObservers := server.takeObserverReplayForReceived(frame.Payload[0])
+				if len(observerFrames) > 0 {
+					server.broadcastObserverFrames(observerFrames, skipPendingID)
+				}
+				if suppressObservers {
+					server.broadcastReceivedToOwner(frame, server.currentBusOwner())
 					continue
 				}
 			}
@@ -1421,6 +1427,111 @@ func (server *Server) broadcast(frame downstream.Frame) {
 	}
 }
 
+func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.Frame, uint64, bool) {
+	server.mutex.Lock()
+	owner := server.busOwner
+	suppress := false
+	var frames []downstream.Frame
+	if symbol == ebusSyn {
+		if len(server.ownerObserverSeen) > 0 {
+			frames = appendObserverRequestSegmentFrames(
+				frames,
+				server.busOwnerInitiator,
+				server.ownerObserverSeen,
+				server.ownerObserverAtStart,
+			)
+		}
+		server.ownerObserverExpected = nil
+		server.ownerObserverSeen = nil
+		if owner != 0 {
+			server.ownerObserverAtStart = true
+		} else {
+			server.ownerObserverAtStart = false
+		}
+		server.mutex.Unlock()
+		if len(frames) == 0 {
+			return nil, 0, false
+		}
+		return frames, server.pendingUDPPlainStartSessionID(), true
+	}
+	if len(server.ownerObserverExpected) > 0 {
+		if symbol == server.ownerObserverExpected[0] {
+			server.ownerObserverExpected = server.ownerObserverExpected[1:]
+			server.ownerObserverSeen = append(server.ownerObserverSeen, symbol)
+			suppress = true
+			server.mutex.Unlock()
+			return nil, 0, suppress
+		}
+		if len(server.ownerObserverSeen) > 0 {
+			frames = appendRawObserverFrames(frames, server.ownerObserverSeen)
+		}
+		server.ownerObserverExpected = nil
+		server.ownerObserverSeen = nil
+		server.ownerObserverAtStart = false
+	}
+	if len(server.ownerObserverSeen) > 0 {
+		frames = appendObserverRequestSegmentFrames(
+			frames,
+			server.busOwnerInitiator,
+			server.ownerObserverSeen,
+			server.ownerObserverAtStart,
+		)
+		server.ownerObserverSeen = nil
+		server.ownerObserverAtStart = false
+	}
+	server.mutex.Unlock()
+
+	if len(frames) == 0 {
+		return nil, 0, suppress
+	}
+	return frames, server.pendingUDPPlainStartSessionID(), suppress
+}
+
+func (server *Server) broadcastObserverFrames(
+	frames []downstream.Frame,
+	skipPendingID uint64,
+) {
+	if len(frames) == 0 {
+		return
+	}
+
+	server.mutex.Lock()
+	ownerID := server.busOwner
+	sessions := make([]*session, 0, len(server.sessions))
+	for _, sess := range server.sessions {
+		sessions = append(sessions, sess)
+	}
+	server.mutex.Unlock()
+
+	for _, sess := range sessions {
+		if sess.id == ownerID || sess.id == skipPendingID {
+			continue
+		}
+		for _, frame := range frames {
+			server.enqueueOrClose(sess, frame, "broadcast_observer_prefix")
+		}
+	}
+}
+
+func (server *Server) currentBusOwner() uint64 {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return server.busOwner
+}
+
+func (server *Server) broadcastReceivedToOwner(frame downstream.Frame, ownerID uint64) {
+	if ownerID == 0 {
+		return
+	}
+	server.mutex.Lock()
+	sess := server.sessions[ownerID]
+	server.mutex.Unlock()
+	if sess == nil {
+		return
+	}
+	server.enqueueOrClose(sess, frame, "broadcast_owner_only")
+}
+
 func (server *Server) broadcastUDPPlainByte(value byte) {
 	if server.udpListener == nil {
 		return
@@ -1526,17 +1637,141 @@ func (server *Server) deliverUpstreamFailed(frame downstream.Frame) {
 }
 
 func (server *Server) releaseBusIfOwner(sessionID uint64) {
+	var observerFrames []downstream.Frame
+	var sessions []*session
+
 	server.mutex.Lock()
 	if server.busOwner != sessionID {
 		server.mutex.Unlock()
 		return
 	}
+	if len(server.ownerObserverSeen) > 0 {
+		observerFrames = appendRawObserverFrames(nil, server.ownerObserverSeen)
+		for _, sess := range server.sessions {
+			if sess.id == sessionID {
+				continue
+			}
+			sessions = append(sessions, sess)
+		}
+	}
 	server.busOwner = 0
+	server.busOwnerInitiator = 0
+	server.ownerObserverAtStart = false
+	server.ownerObserverExpected = nil
+	server.ownerObserverSeen = nil
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
 
+	if len(observerFrames) > 0 {
+		skipPendingID := server.pendingUDPPlainStartSessionID()
+		for _, sess := range sessions {
+			if sess.id == skipPendingID {
+				continue
+			}
+			for _, frame := range observerFrames {
+				server.enqueueOrClose(sess, frame, "broadcast_observer_release")
+			}
+		}
+	}
+
 	server.releaseBusToken()
+}
+
+func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
+	server.mutex.Lock()
+	server.busOwner = sessionID
+	server.busOwnerInitiator = initiator
+	server.ownerObserverAtStart = true
+	server.ownerObserverExpected = nil
+	server.ownerObserverSeen = nil
+	server.busDirty = true
+	server.busOwned = time.Now().UTC()
+	server.mutex.Unlock()
+}
+
+func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.busOwner != sessionID {
+		return false
+	}
+	server.ownerObserverExpected = append(server.ownerObserverExpected, data)
+	return true
+}
+
+func (server *Server) rollbackOwnerObserverReplay(sessionID uint64) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.busOwner != sessionID || len(server.ownerObserverExpected) == 0 {
+		return
+	}
+	server.ownerObserverExpected = server.ownerObserverExpected[:len(server.ownerObserverExpected)-1]
+}
+
+func appendObserverReplayFrames(
+	dst []downstream.Frame,
+	initiator byte,
+	symbols []byte,
+	includeInitiator bool,
+) []downstream.Frame {
+	if len(symbols) == 0 {
+		return dst
+	}
+	if includeInitiator {
+		dst = append(dst, downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{initiator},
+		})
+	}
+	return appendRawObserverFrames(dst, symbols)
+}
+
+func appendObserverRequestSegmentFrames(
+	dst []downstream.Frame,
+	initiator byte,
+	symbols []byte,
+	includeInitiator bool,
+) []downstream.Frame {
+	dst = appendObserverReplayFrames(dst, initiator, symbols, includeInitiator)
+	return appendRawObserverFrames(dst, []byte{ebusSyn})
+}
+
+func appendRawObserverFrames(dst []downstream.Frame, symbols []byte) []downstream.Frame {
+	for _, symbol := range symbols {
+		dst = append(dst, downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		})
+	}
+	return dst
+}
+
+func (server *Server) takeObserverReplayForAbort() ([]downstream.Frame, uint64) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	if len(server.ownerObserverSeen) == 0 {
+		server.ownerObserverExpected = nil
+		server.ownerObserverSeen = nil
+		server.ownerObserverAtStart = false
+		return nil, 0
+	}
+
+	frames := appendRawObserverFrames(nil, server.ownerObserverSeen)
+	server.ownerObserverExpected = nil
+	server.ownerObserverSeen = nil
+	server.ownerObserverAtStart = false
+	return frames, server.pendingUDPPlainStartSessionID()
+}
+
+func (server *Server) pendingUDPPlainStartSessionID() uint64 {
+	server.pendingStartMu.Lock()
+	defer server.pendingStartMu.Unlock()
+	if server.pendingStart != nil && server.pendingStart.mode == pendingStartModeUDPPlain {
+		return server.pendingStart.sessionID
+	}
+	return 0
 }
 
 func (server *Server) releaseBusIfIdleSyn() {

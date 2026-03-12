@@ -191,3 +191,850 @@ func TestRunUpstreamReaderBroadcastsReceivedWhileStartPendingENH(t *testing.T) {
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffic(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	wireSymbols := []byte{
+		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols[:2] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	for _, symbol := range wireSymbols[2:] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderFlushesBufferedObserverRequestOnTerminalSyn(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{ebusSyn},
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], 3)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 4)
+
+	if !equalBytes(activeSymbols, []byte{0x15, 0xB5, ebusSyn}) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, []byte{0x15, 0xB5, ebusSyn})
+	}
+
+	wantObserver := []byte{0xF7, 0x15, 0xB5, ebusSyn}
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderDoesNotReplayUnconfirmedOwnerBytesOnTerminalSyn(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{ebusSyn},
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], 2)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 3)
+
+	if !equalBytes(activeSymbols, []byte{0x15, ebusSyn}) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, []byte{0x15, ebusSyn})
+	}
+
+	wantObserver := []byte{0xF7, 0x15, ebusSyn}
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderAbortBeforeSynPreservesProvenWireBytesToObservers(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResErrorEBUS),
+		Payload: []byte{0x31},
+	}
+
+	ownerSymbols := readReceivedSymbols(t, server.sessions[1], 1)
+	if !equalBytes(ownerSymbols, []byte{0x15}) {
+		t.Fatalf("owner symbols = % X; want % X", ownerSymbols, []byte{0x15})
+	}
+
+	ownerFrame := readFrame(t, server.sessions[1])
+	if southboundenh.ENHCommand(ownerFrame.Command) != southboundenh.ENHResErrorEBUS {
+		t.Fatalf("owner command = 0x%02X; want ENHResErrorEBUS", ownerFrame.Command)
+	}
+	if !equalBytes(ownerFrame.Payload, []byte{0x31}) {
+		t.Fatalf("owner payload = % X; want 31", ownerFrame.Payload)
+	}
+
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 1)
+	if !equalBytes(observerSymbols, []byte{0x15}) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, []byte{0x15})
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderEOFBeforeSynPreservesProvenWireBytesToObservers(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	ownerSymbols := readReceivedSymbols(t, server.sessions[1], 1)
+	if !equalBytes(ownerSymbols, []byte{0x15}) {
+		t.Fatalf("owner symbols = % X; want % X", ownerSymbols, []byte{0x15})
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 1)
+	if !equalBytes(observerSymbols, []byte{0x15}) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, []byte{0x15})
+	}
+}
+
+func TestUnregisterSessionPreservesProvenWireBytesToObservers(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	server.unregisterSession(1)
+
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 1)
+	if !equalBytes(observerSymbols, []byte{0x15}) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, []byte{0x15})
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderDoesNotSuppressForeignInterleavingByteDuringReplaySuppression(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	wireSymbols := []byte{0x31, 0x15, 0xB5, ebusSyn}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols))
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+	if !equalBytes(observerSymbols, wireSymbols) {
+		t.Fatalf("observer symbols = % X; want % X (foreign interleaving must pass raw and abort replay)", observerSymbols, wireSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderReplaysSuppressedWireBytesRawWhenLaterByteMismatches(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	wireSymbols := []byte{0x15, 0x31, ebusSyn}
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{wireSymbols[0]},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	for _, symbol := range wireSymbols[1:] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols))
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+	if !equalBytes(observerSymbols, wireSymbols) {
+		t.Fatalf("observer symbols = % X; want % X (suppressed proven wire bytes must be restored raw on later mismatch)", observerSymbols, wireSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+		pendingStart: &pendingStart{
+			sessionID: 2,
+			respCh:    make(chan downstream.Frame, 1),
+			mode:      pendingStartModeENH,
+			initiator: 0x31,
+		},
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+
+	wireSymbols := []byte{
+		0x15,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	server.handleSend(1, 0xB5)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	wireSymbols = append(wireSymbols,
+		0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	)
+	for _, symbol := range wireSymbols[2:] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	pendingObserverSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
+	if !equalBytes(pendingObserverSymbols, wantObserver) {
+		t.Fatalf("pending observer symbols = % X; want % X", pendingObserverSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderPrefixesShorthandTargetThatLooksLikeInitiator(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x31)
+	server.handleSend(1, 0xB5)
+
+	wireSymbols := []byte{
+		0x31, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7, 0x31, 0xB5, ebusSyn}, wireSymbols[2:]...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderDoesNotPrefixFullForeignTelegramAtBoundary(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                 Config{UpstreamTransport: UpstreamENH},
+		upstream:            upstream,
+		sessions:            map[uint64]*session{},
+		synCh:               make(chan struct{}, 1),
+		startOfTelegram:     true,
+		observedInitiatorAt: make(map[byte]time.Time),
+		busOwner:            1,
+		busOwnerInitiator:   0xF7,
+		busDirty:            true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	wireSymbols := []byte{
+		0x31, 0x08, 0xB5, 0x24, 0x02, 0x15, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols))
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+	if !equalBytes(observerSymbols, wireSymbols) {
+		t.Fatalf("observer symbols = % X; want % X (no synthetic prefix on foreign full telegram)", observerSymbols, wireSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderDoesNotPrefixForeignTelegramWhenFirstByteMatchesOwnerShorthand(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                 Config{UpstreamTransport: UpstreamENH},
+		upstream:            upstream,
+		sessions:            map[uint64]*session{},
+		synCh:               make(chan struct{}, 1),
+		startOfTelegram:     true,
+		observedInitiatorAt: make(map[byte]time.Time),
+		busOwner:            1,
+		busOwnerInitiator:   0xF7,
+		busDirty:            true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	wireSymbols := []byte{
+		0x31, 0x08, 0xB5, 0x24, 0x02, 0x15, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols))
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+	if !equalBytes(observerSymbols, wireSymbols) {
+		t.Fatalf("observer symbols = % X; want % X (no synthetic prefix on overlapping foreign telegram)", observerSymbols, wireSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderPreservesObserverContextWhenFirstRXPrecedesSecondSend(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		busDirty:             true,
+		ownerObserverAtStart: true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	server.handleSend(1, 0xB5)
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0xB5},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	wireSymbols := []byte{
+		0x15, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols[2:] {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func readReceivedSymbols(t *testing.T, sessionState *session, count int) []byte {
+	t.Helper()
+
+	symbols := make([]byte, 0, count)
+	for len(symbols) < count {
+		select {
+		case frame := <-sessionState.sendCh:
+			if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResReceived {
+				t.Fatalf("command = 0x%02X; want ENHResReceived", frame.Command)
+			}
+			if len(frame.Payload) != 1 {
+				t.Fatalf("payload len = %d; want 1", len(frame.Payload))
+			}
+			symbols = append(symbols, frame.Payload[0])
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("timed out waiting for %d received symbols; got %d", count, len(symbols))
+		}
+	}
+
+	return symbols
+}
+
+func readFrame(t *testing.T, sessionState *session) downstream.Frame {
+	t.Helper()
+
+	select {
+	case frame := <-sessionState.sendCh:
+		return frame
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for frame")
+		return downstream.Frame{}
+	}
+}
+
+func assertNoReceivedFrames(t *testing.T, sessionState *session) {
+	t.Helper()
+
+	select {
+	case frame := <-sessionState.sendCh:
+		t.Fatalf("unexpected frame while observer replay should still be buffered: cmd=0x%02X payload=% X", frame.Command, frame.Payload)
+	case <-time.After(75 * time.Millisecond):
+	}
+}
+
+func equalBytes(left []byte, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func containsGatewayStyleTransaction(symbols []byte, initiator byte, target byte, primary byte, secondary byte) bool {
+	if len(symbols) < 5 {
+		return false
+	}
+
+	for index := 0; index <= len(symbols)-5; index++ {
+		if symbols[index] != initiator ||
+			symbols[index+1] != target ||
+			symbols[index+2] != primary ||
+			symbols[index+3] != secondary {
+			continue
+		}
+		for tail := index + 4; tail < len(symbols); tail++ {
+			if symbols[tail] == ebusSyn {
+				return true
+			}
+		}
+	}
+
+	return false
+}
