@@ -73,11 +73,13 @@ type Server struct {
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
 
-	busToken          chan struct{}
-	busOwner          uint64
-	busOwnerInitiator byte
-	busDirty          bool
-	busOwned          time.Time
+	busToken                   chan struct{}
+	busOwner                   uint64
+	busOwnerInitiator          byte
+	busOwnerShorthandPending   bool
+	busOwnerShorthandFirstByte byte
+	busDirty                   bool
+	busOwned                   time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -827,6 +829,7 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
 	server.mutex.Unlock()
+	server.noteOwnerShorthandSend(sessionID, data)
 
 	sendFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqSend),
@@ -1420,11 +1423,17 @@ func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.
 	server.mutex.Lock()
 	owner := server.busOwner
 	initiator := server.busOwnerInitiator
+	pending := server.busOwnerShorthandPending
+	expectedSymbol := server.busOwnerShorthandFirstByte
+	if pending {
+		server.busOwnerShorthandPending = false
+		server.busOwnerShorthandFirstByte = 0
+	}
 	server.mutex.Unlock()
 	if owner == 0 || initiator == 0 {
 		return downstream.Frame{}, 0, 0, false
 	}
-	if symbol == initiator {
+	if !pending || symbol != expectedSymbol {
 		return downstream.Frame{}, 0, 0, false
 	}
 
@@ -1587,6 +1596,8 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	}
 	server.busOwner = 0
 	server.busOwnerInitiator = 0
+	server.busOwnerShorthandPending = false
+	server.busOwnerShorthandFirstByte = 0
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
@@ -1598,9 +1609,28 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.mutex.Lock()
 	server.busOwner = sessionID
 	server.busOwnerInitiator = initiator
+	server.busOwnerShorthandPending = false
+	server.busOwnerShorthandFirstByte = 0
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
 	server.mutex.Unlock()
+}
+
+func (server *Server) noteOwnerShorthandSend(sessionID uint64, firstByte byte) {
+	server.observedMu.Lock()
+	atTelegramStart := server.startOfTelegram
+	server.observedMu.Unlock()
+	if !atTelegramStart {
+		return
+	}
+
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.busOwner != sessionID || server.busOwnerShorthandPending {
+		return
+	}
+	server.busOwnerShorthandPending = true
+	server.busOwnerShorthandFirstByte = firstByte
 }
 
 func (server *Server) releaseBusIfIdleSyn() {
