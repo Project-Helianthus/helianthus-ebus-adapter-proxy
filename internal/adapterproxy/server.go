@@ -1605,6 +1605,10 @@ func (server *Server) deliverUpstreamError(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	if owner != 0 {
+		observerFrames, skipPendingID := server.takeObserverReplayForAbort()
+		if len(observerFrames) > 0 {
+			server.broadcastObserverFrames(observerFrames, skipPendingID)
+		}
 		winner := byte(0x00)
 		if len(frame.Payload) == 1 {
 			winner = frame.Payload[0]
@@ -1624,6 +1628,10 @@ func (server *Server) deliverUpstreamFailed(frame downstream.Frame) {
 	server.mutex.Unlock()
 
 	if owner != 0 {
+		observerFrames, skipPendingID := server.takeObserverReplayForAbort()
+		if len(observerFrames) > 0 {
+			server.broadcastObserverFrames(observerFrames, skipPendingID)
+		}
 		server.reply(owner, frame)
 		server.releaseBusIfOwner(owner)
 		return
@@ -1707,6 +1715,24 @@ func appendRawObserverFrames(dst []downstream.Frame, symbols []byte) []downstrea
 		})
 	}
 	return dst
+}
+
+func (server *Server) takeObserverReplayForAbort() ([]downstream.Frame, uint64) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	if len(server.ownerObserverSeen) == 0 {
+		server.ownerObserverExpected = nil
+		server.ownerObserverSeen = nil
+		server.ownerObserverAtStart = false
+		return nil, 0
+	}
+
+	frames := appendRawObserverFrames(nil, server.ownerObserverSeen)
+	server.ownerObserverExpected = nil
+	server.ownerObserverSeen = nil
+	server.ownerObserverAtStart = false
+	return frames, server.pendingUDPPlainStartSessionID()
 }
 
 func (server *Server) pendingUDPPlainStartSessionID() uint64 {

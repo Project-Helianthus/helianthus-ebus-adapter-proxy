@@ -203,6 +203,7 @@ func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffi
 		synCh:                make(chan struct{}, 1),
 		startOfTelegram:      true,
 		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
 		busOwner:             1,
 		busOwnerInitiator:    0xF7,
 		ownerObserverAtStart: true,
@@ -272,6 +273,7 @@ func TestRunUpstreamReaderFlushesBufferedObserverRequestOnTerminalSyn(t *testing
 		synCh:                make(chan struct{}, 1),
 		startOfTelegram:      true,
 		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
 		busOwner:             1,
 		busOwnerInitiator:    0xF7,
 		ownerObserverAtStart: true,
@@ -333,6 +335,7 @@ func TestRunUpstreamReaderDoesNotReplayUnconfirmedOwnerBytesOnTerminalSyn(t *tes
 		synCh:                make(chan struct{}, 1),
 		startOfTelegram:      true,
 		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
 		busOwner:             1,
 		busOwnerInitiator:    0xF7,
 		ownerObserverAtStart: true,
@@ -372,6 +375,70 @@ func TestRunUpstreamReaderDoesNotReplayUnconfirmedOwnerBytesOnTerminalSyn(t *tes
 	wantObserver := []byte{0xF7, 0x15, ebusSyn}
 	if !equalBytes(observerSymbols, wantObserver) {
 		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderAbortBeforeSynPreservesProvenWireBytesToObservers(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                  Config{UpstreamTransport: UpstreamENH},
+		upstream:             upstream,
+		sessions:             map[uint64]*session{},
+		synCh:                make(chan struct{}, 1),
+		startOfTelegram:      true,
+		observedInitiatorAt:  make(map[byte]time.Time),
+		collisionBySession:   make(map[uint64]byte),
+		busOwner:             1,
+		busOwnerInitiator:    0xF7,
+		ownerObserverAtStart: true,
+		busDirty:             true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	server.handleSend(1, 0x15)
+	server.handleSend(1, 0xB5)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{0x15},
+	}
+
+	assertNoReceivedFrames(t, server.sessions[2])
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResErrorEBUS),
+		Payload: []byte{0x31},
+	}
+
+	ownerSymbols := readReceivedSymbols(t, server.sessions[1], 1)
+	if !equalBytes(ownerSymbols, []byte{0x15}) {
+		t.Fatalf("owner symbols = % X; want % X", ownerSymbols, []byte{0x15})
+	}
+
+	ownerFrame := readFrame(t, server.sessions[1])
+	if southboundenh.ENHCommand(ownerFrame.Command) != southboundenh.ENHResErrorEBUS {
+		t.Fatalf("owner command = 0x%02X; want ENHResErrorEBUS", ownerFrame.Command)
+	}
+	if !equalBytes(ownerFrame.Payload, []byte{0x31}) {
+		t.Fatalf("owner payload = % X; want 31", ownerFrame.Payload)
+	}
+
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], 1)
+	if !equalBytes(observerSymbols, []byte{0x15}) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, []byte{0x15})
 	}
 
 	cancel()
@@ -825,6 +892,18 @@ func readReceivedSymbols(t *testing.T, sessionState *session, count int) []byte 
 	}
 
 	return symbols
+}
+
+func readFrame(t *testing.T, sessionState *session) downstream.Frame {
+	t.Helper()
+
+	select {
+	case frame := <-sessionState.sendCh:
+		return frame
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("timed out waiting for frame")
+		return downstream.Frame{}
+	}
 }
 
 func assertNoReceivedFrames(t *testing.T, sessionState *session) {
