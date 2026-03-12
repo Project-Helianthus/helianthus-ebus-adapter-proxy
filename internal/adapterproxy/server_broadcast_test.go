@@ -310,6 +310,62 @@ func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testin
 	server.waitGroup.Wait()
 }
 
+func TestRunUpstreamReaderPrefixesShorthandTargetThatLooksLikeInitiator(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                 Config{UpstreamTransport: UpstreamENH},
+		upstream:            upstream,
+		sessions:            map[uint64]*session{},
+		synCh:               make(chan struct{}, 1),
+		startOfTelegram:     true,
+		observedInitiatorAt: make(map[byte]time.Time),
+		busOwner:            1,
+		busOwnerInitiator:   0xF7,
+		busDirty:            true,
+	}
+	server.sessions[1] = &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[2] = &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	wireSymbols := []byte{
+		0x31, 0xB5, 0x24, 0x02, 0x08, 0x10, 0x00,
+		0x00, 0x03, 0x01, 0x42, 0x99, 0x00,
+		0xAA,
+	}
+	for _, symbol := range wireSymbols {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		}
+	}
+
+	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+
+	if !equalBytes(activeSymbols, wireSymbols) {
+		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
+	}
+
+	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	if !equalBytes(observerSymbols, wantObserver) {
+		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
+	}
+	if !containsGatewayStyleTransaction(observerSymbols, 0xF7, 0x31, 0xB5, 0x24) {
+		t.Fatalf("observer symbols = % X; want reconstructible overlapped-target transaction", observerSymbols)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
 func readReceivedSymbols(t *testing.T, sessionState *session, count int) []byte {
 	t.Helper()
 

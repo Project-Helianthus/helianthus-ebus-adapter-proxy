@@ -1406,7 +1406,7 @@ func (server *Server) clearPendingInfo(sessionID uint64) {
 }
 
 func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.Frame, uint64, uint64, bool) {
-	if symbol == ebusSyn || isInitiatorAddress(symbol) {
+	if symbol == ebusSyn {
 		return downstream.Frame{}, 0, 0, false
 	}
 
@@ -1422,6 +1422,9 @@ func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.
 	initiator := server.busOwnerInitiator
 	server.mutex.Unlock()
 	if owner == 0 || initiator == 0 {
+		return downstream.Frame{}, 0, 0, false
+	}
+	if symbol == initiator {
 		return downstream.Frame{}, 0, 0, false
 	}
 
