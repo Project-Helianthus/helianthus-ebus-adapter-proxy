@@ -73,13 +73,16 @@ type Server struct {
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
 
-	busToken                   chan struct{}
-	busOwner                   uint64
-	busOwnerInitiator          byte
-	busOwnerShorthandPending   bool
-	busOwnerShorthandFirstByte byte
-	busDirty                   bool
-	busOwned                   time.Time
+	busToken                     chan struct{}
+	busOwner                     uint64
+	busOwnerInitiator            byte
+	busOwnerShorthandPending     bool
+	busOwnerShorthandExpectedLen int
+	busOwnerShorthandExpected    [2]byte
+	busOwnerShorthandObservedLen int
+	busOwnerShorthandObserved    [2]byte
+	busDirty                     bool
+	busOwned                     time.Time
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -1077,8 +1080,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
-				prefixFrame, prefixSkipOwner, prefixSkipPending, injectPrefix :=
-					server.observerPrefixFrameForWireSymbol(frame.Payload[0])
+				atTelegramStart := server.isAtTelegramStart()
 				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
 				if server.cfg.Debug {
 					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
@@ -1098,13 +1100,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 					continue
 				}
 
-				if injectPrefix {
-					server.broadcastReceivedWithObserverPrefix(
-						prefixFrame,
-						prefixSkipOwner,
-						prefixSkipPending,
-						frame,
-					)
+				if server.handleObserverPrefixForReceived(frame, atTelegramStart) {
 					continue
 				}
 			}
@@ -1408,46 +1404,56 @@ func (server *Server) clearPendingInfo(sessionID uint64) {
 	server.pendingInfoMu.Unlock()
 }
 
-func (server *Server) observerPrefixFrameForWireSymbol(symbol byte) (downstream.Frame, uint64, uint64, bool) {
-	if symbol == ebusSyn {
-		return downstream.Frame{}, 0, 0, false
-	}
-
+func (server *Server) isAtTelegramStart() bool {
 	server.observedMu.Lock()
 	atTelegramStart := server.startOfTelegram
 	server.observedMu.Unlock()
-	if !atTelegramStart {
-		return downstream.Frame{}, 0, 0, false
+	return atTelegramStart
+}
+
+func (server *Server) handleObserverPrefixForReceived(frame downstream.Frame, atTelegramStart bool) bool {
+	if len(frame.Payload) != 1 {
+		return false
+	}
+	symbol := frame.Payload[0]
+	if symbol == ebusSyn {
+		server.clearOwnerShorthandState()
+		return false
 	}
 
-	server.mutex.Lock()
-	owner := server.busOwner
-	initiator := server.busOwnerInitiator
-	pending := server.busOwnerShorthandPending
-	expectedSymbol := server.busOwnerShorthandFirstByte
-	if pending {
-		server.busOwnerShorthandPending = false
-		server.busOwnerShorthandFirstByte = 0
+	owner, initiator, pending, expectedLen, observedLen := server.ownerShorthandState()
+	if owner == 0 || initiator == 0 || !pending || expectedLen < 2 {
+		return false
 	}
-	server.mutex.Unlock()
-	if owner == 0 || initiator == 0 {
-		return downstream.Frame{}, 0, 0, false
-	}
-	if !pending || symbol != expectedSymbol {
-		return downstream.Frame{}, 0, 0, false
+	if observedLen == 0 && !atTelegramStart {
+		return false
 	}
 
-	var pendingSessionID uint64
-	server.pendingStartMu.Lock()
-	if server.pendingStart != nil && server.pendingStart.mode == pendingStartModeUDPPlain {
-		pendingSessionID = server.pendingStart.sessionID
+	observerFrames, injectPrefix, holdOwnerOnly, matched := server.advanceOwnerShorthandProbe(symbol)
+	if !matched {
+		return false
 	}
-	server.pendingStartMu.Unlock()
 
-	return downstream.Frame{
-		Command: byte(southboundenh.ENHResReceived),
-		Payload: []byte{initiator},
-	}, owner, pendingSessionID, true
+	pendingSessionID := server.pendingUDPPlainStartSessionID()
+	server.broadcastReceivedToOwner(frame, owner)
+	if holdOwnerOnly {
+		return true
+	}
+	if injectPrefix {
+		server.broadcastReceivedFramesWithObserverPrefix(
+			downstream.Frame{
+				Command: byte(southboundenh.ENHResReceived),
+				Payload: []byte{initiator},
+			},
+			owner,
+			pendingSessionID,
+			observerFrames,
+		)
+		return true
+	}
+
+	server.broadcastReceivedFramesToObservers(observerFrames, owner, pendingSessionID)
+	return true
 }
 
 func (server *Server) broadcast(frame downstream.Frame) {
@@ -1482,6 +1488,73 @@ func (server *Server) broadcastReceivedWithObserverPrefix(
 		}
 		server.enqueueOrClose(sess, frame, "broadcast")
 	}
+}
+
+func (server *Server) broadcastReceivedFramesWithObserverPrefix(
+	prefix downstream.Frame,
+	skipOwnerID uint64,
+	skipPendingID uint64,
+	frames []downstream.Frame,
+) {
+	if len(frames) == 0 {
+		return
+	}
+
+	server.mutex.Lock()
+	sessions := make([]*session, 0, len(server.sessions))
+	for _, sess := range server.sessions {
+		sessions = append(sessions, sess)
+	}
+	server.mutex.Unlock()
+
+	for _, sess := range sessions {
+		if sess.id == skipOwnerID || sess.id == skipPendingID {
+			continue
+		}
+		server.enqueueOrClose(sess, prefix, "broadcast_observer_prefix")
+		for _, frame := range frames {
+			server.enqueueOrClose(sess, frame, "broadcast_observer_buffer")
+		}
+	}
+}
+
+func (server *Server) broadcastReceivedFramesToObservers(
+	frames []downstream.Frame,
+	skipOwnerID uint64,
+	skipPendingID uint64,
+) {
+	if len(frames) == 0 {
+		return
+	}
+
+	server.mutex.Lock()
+	sessions := make([]*session, 0, len(server.sessions))
+	for _, sess := range server.sessions {
+		sessions = append(sessions, sess)
+	}
+	server.mutex.Unlock()
+
+	for _, sess := range sessions {
+		if sess.id == skipOwnerID || sess.id == skipPendingID {
+			continue
+		}
+		for _, frame := range frames {
+			server.enqueueOrClose(sess, frame, "broadcast_observer_buffer")
+		}
+	}
+}
+
+func (server *Server) broadcastReceivedToOwner(frame downstream.Frame, ownerID uint64) {
+	if ownerID == 0 {
+		return
+	}
+	server.mutex.Lock()
+	sess := server.sessions[ownerID]
+	server.mutex.Unlock()
+	if sess == nil {
+		return
+	}
+	server.enqueueOrClose(sess, frame, "broadcast_owner_only")
 }
 
 func (server *Server) broadcastUDPPlainByte(value byte) {
@@ -1597,7 +1670,10 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	server.busOwner = 0
 	server.busOwnerInitiator = 0
 	server.busOwnerShorthandPending = false
-	server.busOwnerShorthandFirstByte = 0
+	server.busOwnerShorthandExpectedLen = 0
+	server.busOwnerShorthandExpected = [2]byte{}
+	server.busOwnerShorthandObservedLen = 0
+	server.busOwnerShorthandObserved = [2]byte{}
 	server.busDirty = false
 	server.busOwned = time.Time{}
 	server.mutex.Unlock()
@@ -1610,7 +1686,10 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.busOwner = sessionID
 	server.busOwnerInitiator = initiator
 	server.busOwnerShorthandPending = false
-	server.busOwnerShorthandFirstByte = 0
+	server.busOwnerShorthandExpectedLen = 0
+	server.busOwnerShorthandExpected = [2]byte{}
+	server.busOwnerShorthandObservedLen = 0
+	server.busOwnerShorthandObserved = [2]byte{}
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
 	server.mutex.Unlock()
@@ -1626,11 +1705,98 @@ func (server *Server) noteOwnerShorthandSend(sessionID uint64, firstByte byte) {
 
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
-	if server.busOwner != sessionID || server.busOwnerShorthandPending {
+	if server.busOwner != sessionID {
+		return
+	}
+	if server.busOwnerShorthandExpectedLen >= len(server.busOwnerShorthandExpected) {
 		return
 	}
 	server.busOwnerShorthandPending = true
-	server.busOwnerShorthandFirstByte = firstByte
+	server.busOwnerShorthandExpected[server.busOwnerShorthandExpectedLen] = firstByte
+	server.busOwnerShorthandExpectedLen++
+}
+
+func (server *Server) clearOwnerShorthandState() {
+	server.mutex.Lock()
+	server.busOwnerShorthandPending = false
+	server.busOwnerShorthandExpectedLen = 0
+	server.busOwnerShorthandExpected = [2]byte{}
+	server.busOwnerShorthandObservedLen = 0
+	server.busOwnerShorthandObserved = [2]byte{}
+	server.mutex.Unlock()
+}
+
+func (server *Server) ownerShorthandState() (uint64, byte, bool, int, int) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	return server.busOwner, server.busOwnerInitiator, server.busOwnerShorthandPending, server.busOwnerShorthandExpectedLen, server.busOwnerShorthandObservedLen
+}
+
+func (server *Server) pendingUDPPlainStartSessionID() uint64 {
+	server.pendingStartMu.Lock()
+	defer server.pendingStartMu.Unlock()
+	if server.pendingStart != nil && server.pendingStart.mode == pendingStartModeUDPPlain {
+		return server.pendingStart.sessionID
+	}
+	return 0
+}
+
+func (server *Server) advanceOwnerShorthandProbe(symbol byte) ([]downstream.Frame, bool, bool, bool) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	if !server.busOwnerShorthandPending || server.busOwnerShorthandExpectedLen < 2 {
+		return nil, false, false, false
+	}
+	if server.busOwnerShorthandObservedLen >= len(server.busOwnerShorthandObserved) {
+		server.busOwnerShorthandPending = false
+		server.busOwnerShorthandExpectedLen = 0
+		server.busOwnerShorthandExpected = [2]byte{}
+		server.busOwnerShorthandObservedLen = 0
+		server.busOwnerShorthandObserved = [2]byte{}
+		return nil, false, false, false
+	}
+
+	index := server.busOwnerShorthandObservedLen
+	server.busOwnerShorthandObserved[index] = symbol
+	server.busOwnerShorthandObservedLen++
+
+	if symbol != server.busOwnerShorthandExpected[index] {
+		observedLen := server.busOwnerShorthandObservedLen
+		observedFrames := shorthandObservedFrames(server.busOwnerShorthandObserved[:observedLen])
+		server.busOwnerShorthandPending = false
+		server.busOwnerShorthandExpectedLen = 0
+		server.busOwnerShorthandExpected = [2]byte{}
+		server.busOwnerShorthandObservedLen = 0
+		server.busOwnerShorthandObserved = [2]byte{}
+		if index == 0 {
+			return nil, false, false, false
+		}
+		return observedFrames, false, false, true
+	}
+
+	if server.busOwnerShorthandObservedLen < 2 {
+		return nil, false, true, true
+	}
+
+	frames := shorthandObservedFrames(server.busOwnerShorthandObserved[:server.busOwnerShorthandObservedLen])
+	server.busOwnerShorthandPending = false
+	server.busOwnerShorthandExpectedLen = 0
+	server.busOwnerShorthandExpected = [2]byte{}
+	server.busOwnerShorthandObservedLen = 0
+	server.busOwnerShorthandObserved = [2]byte{}
+	return frames, true, false, true
+}
+
+func shorthandObservedFrames(symbols []byte) []downstream.Frame {
+	frames := make([]downstream.Frame, 0, len(symbols))
+	for _, symbol := range symbols {
+		frames = append(frames, downstream.Frame{
+			Command: byte(southboundenh.ENHResReceived),
+			Payload: []byte{symbol},
+		})
+	}
+	return frames
 }
 
 func (server *Server) releaseBusIfIdleSyn() {
