@@ -1434,7 +1434,7 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 	var frames []downstream.Frame
 	if symbol == ebusSyn {
 		if len(server.ownerObserverSeen) > 0 {
-			frames = appendObserverReplayFrames(
+			frames = appendObserverRequestSegmentFrames(
 				frames,
 				server.busOwnerInitiator,
 				server.ownerObserverSeen,
@@ -1452,7 +1452,7 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 		if len(frames) == 0 {
 			return nil, 0, false
 		}
-		return frames, server.pendingUDPPlainStartSessionID(), false
+		return frames, server.pendingUDPPlainStartSessionID(), true
 	}
 	if len(server.ownerObserverExpected) > 0 {
 		if symbol == server.ownerObserverExpected[0] {
@@ -1470,7 +1470,7 @@ func (server *Server) takeObserverReplayForReceived(symbol byte) ([]downstream.F
 		server.ownerObserverAtStart = false
 	}
 	if len(server.ownerObserverSeen) > 0 {
-		frames = appendObserverReplayFrames(
+		frames = appendObserverRequestSegmentFrames(
 			frames,
 			server.busOwnerInitiator,
 			server.ownerObserverSeen,
@@ -1725,6 +1725,16 @@ func appendObserverReplayFrames(
 		})
 	}
 	return appendRawObserverFrames(dst, symbols)
+}
+
+func appendObserverRequestSegmentFrames(
+	dst []downstream.Frame,
+	initiator byte,
+	symbols []byte,
+	includeInitiator bool,
+) []downstream.Frame {
+	dst = appendObserverReplayFrames(dst, initiator, symbols, includeInitiator)
+	return appendRawObserverFrames(dst, []byte{ebusSyn})
 }
 
 func appendRawObserverFrames(dst []downstream.Frame, symbols []byte) []downstream.Frame {

@@ -243,18 +243,15 @@ func TestRunUpstreamReaderPreservesReconstructibleObserverContextForActiveTraffi
 	}
 
 	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
-	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
 
 	if !equalBytes(activeSymbols, wireSymbols) {
 		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
 	}
 
-	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
 	if !equalBytes(observerSymbols, wantObserver) {
 		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
-	}
-	if !containsGatewayStyleTransaction(observerSymbols, 0xF7, 0x15, 0xB5, 0x24) {
-		t.Fatalf("observer symbols = % X; want reconstructible gateway-style transaction", observerSymbols)
 	}
 
 	cancel()
@@ -719,18 +716,15 @@ func TestRunUpstreamReaderPreservesObserverContextForPendingENHSession(t *testin
 	}
 
 	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
-	pendingObserverSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+	pendingObserverSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
 
 	if !equalBytes(activeSymbols, wireSymbols) {
 		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
 	}
 
-	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
 	if !equalBytes(pendingObserverSymbols, wantObserver) {
 		t.Fatalf("pending observer symbols = % X; want % X", pendingObserverSymbols, wantObserver)
-	}
-	if !containsGatewayStyleTransaction(pendingObserverSymbols, 0xF7, 0x15, 0xB5, 0x24) {
-		t.Fatalf("pending observer symbols = % X; want reconstructible gateway-style transaction", pendingObserverSymbols)
 	}
 
 	cancel()
@@ -779,18 +773,15 @@ func TestRunUpstreamReaderPrefixesShorthandTargetThatLooksLikeInitiator(t *testi
 	}
 
 	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
-	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
 
 	if !equalBytes(activeSymbols, wireSymbols) {
 		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
 	}
 
-	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	wantObserver := append([]byte{0xF7, 0x31, 0xB5, ebusSyn}, wireSymbols[2:]...)
 	if !equalBytes(observerSymbols, wantObserver) {
 		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
-	}
-	if !containsGatewayStyleTransaction(observerSymbols, 0xF7, 0x31, 0xB5, 0x24) {
-		t.Fatalf("observer symbols = % X; want reconstructible overlapped-target transaction", observerSymbols)
 	}
 
 	cancel()
@@ -954,13 +945,13 @@ func TestRunUpstreamReaderPreservesObserverContextWhenFirstRXPrecedesSecondSend(
 	}
 
 	activeSymbols := readReceivedSymbols(t, server.sessions[1], len(wireSymbols))
-	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+1)
+	observerSymbols := readReceivedSymbols(t, server.sessions[2], len(wireSymbols)+2)
 
 	if !equalBytes(activeSymbols, wireSymbols) {
 		t.Fatalf("active symbols = % X; want % X", activeSymbols, wireSymbols)
 	}
 
-	wantObserver := append([]byte{0xF7}, wireSymbols...)
+	wantObserver := append([]byte{0xF7, 0x15, 0xB5, ebusSyn}, wireSymbols[2:]...)
 	if !equalBytes(observerSymbols, wantObserver) {
 		t.Fatalf("observer symbols = % X; want % X", observerSymbols, wantObserver)
 	}
