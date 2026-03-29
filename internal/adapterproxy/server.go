@@ -87,6 +87,7 @@ type Server struct {
 
 	pendingInfoMu sync.Mutex
 	pendingInfo   *pendingInfo
+	infoCache     *adapterInfoCache
 
 	leasesMu     sync.Mutex
 	leaseManager *sourcepolicy.LeaseManager
@@ -106,6 +107,8 @@ type pendingStart struct {
 type pendingInfo struct {
 	sessionID uint64
 	remaining int
+	infoID    byte
+	frames    []downstream.Frame // accumulated response frames for caching
 }
 
 type pendingStartMode uint8
@@ -155,6 +158,7 @@ func NewServer(cfg Config) *Server {
 		startOfTelegram:     true,
 		observedInitiatorAt: make(map[byte]time.Time),
 		collisionBySession:  make(map[uint64]byte),
+		infoCache:           newAdapterInfoCache(),
 	}
 	server.busToken <- struct{}{}
 
@@ -782,10 +786,19 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		return
 	}
 
+	// Serve identity IDs from cache if available.
+	if cached := server.infoCache.get(infoID); cached != nil {
+		for _, f := range cached {
+			server.reply(sessionID, f)
+		}
+		return
+	}
+
 	server.pendingInfoMu.Lock()
 	server.pendingInfo = &pendingInfo{
 		sessionID: sessionID,
 		remaining: -1,
+		infoID:    infoID,
 	}
 	server.pendingInfoMu.Unlock()
 
@@ -1084,6 +1097,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		case southboundenh.ENHResReceived, southboundenh.ENHResResetted:
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResResetted && len(frame.Payload) == 1 {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
+				server.infoCache.invalidateAll()
 			}
 			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
 				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
@@ -1379,6 +1393,11 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 		return true
 	}
 
+	// Collect frames for identity caching.
+	if isIdentityID(server.pendingInfo.infoID) {
+		server.pendingInfo.frames = append(server.pendingInfo.frames, frame)
+	}
+
 	if len(frame.Payload) != 1 {
 		return true
 	}
@@ -1386,6 +1405,10 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	if server.pendingInfo.remaining < 0 {
 		server.pendingInfo.remaining = int(frame.Payload[0])
 		if server.pendingInfo.remaining <= 0 {
+			// Cache completed identity response.
+			if isIdentityID(server.pendingInfo.infoID) {
+				server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
+			}
 			server.pendingInfo = nil
 		}
 		return true
@@ -1393,6 +1416,10 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 
 	server.pendingInfo.remaining--
 	if server.pendingInfo.remaining <= 0 {
+		// Cache completed identity response.
+		if isIdentityID(server.pendingInfo.infoID) {
+			server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
+		}
 		server.pendingInfo = nil
 	}
 	return true
