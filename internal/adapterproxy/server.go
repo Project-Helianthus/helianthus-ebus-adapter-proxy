@@ -96,6 +96,12 @@ type Server struct {
 	busWirePhase          busWirePhase
 	requestBytesSeen      int
 	requestDataLength     int
+	requestSrc            byte
+	requestDst            byte
+	requestPB             byte
+	requestSB             byte
+	requestLEN            byte
+	requestHeaderCaptured bool
 	responseBytesRemain   int
 	startArbSeq           uint64
 	startArbGrantSession  uint64
@@ -2096,6 +2102,12 @@ func (server *Server) resetBusWirePhaseLocked(phase busWirePhase) {
 	server.busWirePhase = phase
 	server.requestBytesSeen = 0
 	server.requestDataLength = -1
+	server.requestSrc = 0
+	server.requestDst = 0
+	server.requestPB = 0
+	server.requestSB = 0
+	server.requestLEN = 0
+	server.requestHeaderCaptured = false
 	server.responseBytesRemain = 0
 }
 
@@ -2105,7 +2117,18 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 		return
 	case busWirePhaseCollectRequest:
 		server.requestBytesSeen++
-		if server.requestBytesSeen == 5 {
+		switch server.requestBytesSeen {
+		case 1:
+			server.requestSrc = symbol
+		case 2:
+			server.requestDst = symbol
+		case 3:
+			server.requestPB = symbol
+		case 4:
+			server.requestSB = symbol
+		case 5:
+			server.requestLEN = symbol
+			server.requestHeaderCaptured = true
 			server.requestDataLength = int(symbol)
 			return
 		}

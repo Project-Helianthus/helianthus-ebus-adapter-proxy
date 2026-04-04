@@ -315,6 +315,120 @@ func TestNoteBusWireSymbolReleasesOnSynWhileWaitingResponseAck(t *testing.T) {
 	}
 }
 
+func TestDirectModePhaseTrackerCapturesRequestHeaderAndLength(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.setBusOwner(13, 0x31)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	// request: SRC DST PB SB LEN D D CRC
+	request := []byte{0x31, 0x15, 0xB5, 0x09, 0x02, 0x44, 0x55, 0x6C}
+	for _, symbol := range request {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	server.mutex.Lock()
+	phase := server.busWirePhase
+	bytesSeen := server.requestBytesSeen
+	dataLen := server.requestDataLength
+	src := server.requestSrc
+	dst := server.requestDst
+	pb := server.requestPB
+	sb := server.requestSB
+	length := server.requestLEN
+	headerCaptured := server.requestHeaderCaptured
+	server.mutex.Unlock()
+
+	if phase != busWirePhaseWaitCmdAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitCmdAck)
+	}
+	if bytesSeen != len(request) {
+		t.Fatalf("requestBytesSeen = %d; want %d", bytesSeen, len(request))
+	}
+	if dataLen != 2 {
+		t.Fatalf("requestDataLength = %d; want 2", dataLen)
+	}
+	if src != 0x31 || dst != 0x15 || pb != 0xB5 || sb != 0x09 || length != 0x02 {
+		t.Fatalf("captured header = src=0x%02X dst=0x%02X pb=0x%02X sb=0x%02X len=0x%02X; want 31 15 B5 09 02", src, dst, pb, sb, length)
+	}
+	if !headerCaptured {
+		t.Fatal("requestHeaderCaptured = false; want true")
+	}
+}
+
+func TestDirectModePhaseTrackerTransitionsRequestResponsePath(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.setBusOwner(14, 0x31)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	// request with zero request data bytes: SRC DST PB SB LEN CRC
+	for _, symbol := range []byte{0x31, 0x15, 0xB5, 0x00, 0x00, 0x42} {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	server.mutex.Lock()
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitCmdAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitCmdAck)
+	}
+
+	server.noteBusWireSymbol(ebusACK)
+	server.mutex.Lock()
+	phase = server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitResponseLen {
+		t.Fatalf("busWirePhase after command ACK = %s; want %s", phase, busWirePhaseWaitResponseLen)
+	}
+
+	server.noteBusWireSymbol(0x02) // response length
+	server.mutex.Lock()
+	phase = server.busWirePhase
+	remain := server.responseBytesRemain
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitResponseBody {
+		t.Fatalf("busWirePhase after response LEN = %s; want %s", phase, busWirePhaseWaitResponseBody)
+	}
+	if remain != 3 {
+		t.Fatalf("responseBytesRemain = %d; want 3", remain)
+	}
+
+	server.noteBusWireSymbol(0x77) // response data #1
+	server.noteBusWireSymbol(0x88) // response data #2
+	server.noteBusWireSymbol(0x99) // response CRC
+	server.mutex.Lock()
+	phase = server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitResponseAck {
+		t.Fatalf("busWirePhase after response payload+CRC = %s; want %s", phase, busWirePhaseWaitResponseAck)
+	}
+
+	server.noteBusWireSymbol(ebusACK) // initiator confirms response
+	server.mutex.Lock()
+	phase = server.busWirePhase
+	bytesSeen := server.requestBytesSeen
+	headerCaptured := server.requestHeaderCaptured
+	server.mutex.Unlock()
+	if phase != busWirePhaseIdle {
+		t.Fatalf("busWirePhase after response ACK = %s; want %s", phase, busWirePhaseIdle)
+	}
+	if bytesSeen != 0 {
+		t.Fatalf("requestBytesSeen after reset = %d; want 0", bytesSeen)
+	}
+	if headerCaptured {
+		t.Fatal("requestHeaderCaptured = true after reset; want false")
+	}
+}
+
 func TestHandleSendDoesNotRefreshBusOwnershipTimestamp(t *testing.T) {
 	t.Parallel()
 
