@@ -277,7 +277,91 @@ func TestHandleStartReleasesOwnerOnTerminalUpstreamError(t *testing.T) {
 	}
 }
 
-func TestDeliverPendingStartENHStartedMismatchBecomesFailed(t *testing.T) {
+func TestDeliverPendingStartENHStartedMismatchAbsorbedWhenMatchingArrivesBounded(t *testing.T) {
+	t.Parallel()
+
+	respCh := make(chan downstream.Frame, 1)
+	server := &Server{
+		cfg: Config{UpstreamTransport: UpstreamENH},
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+		},
+		pendingStart: &pendingStart{
+			sessionID: 1,
+			respCh:    respCh,
+			mode:      pendingStartModeENH,
+			initiator: 0xF0,
+		},
+	}
+
+	handled := server.deliverPendingStart(downstream.Frame{
+		Command: byte(southboundenh.ENHResStarted),
+		Payload: []byte{0x31},
+	})
+	if !handled {
+		t.Fatal("deliverPendingStart = false; want true")
+	}
+
+	select {
+	case frame := <-respCh:
+		t.Fatalf("unexpected pending response before matching STARTED: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
+	default:
+	}
+
+	select {
+	case frame := <-server.sessions[1].sendCh:
+		t.Fatalf("unexpected session response before matching STARTED: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
+	default:
+	}
+
+	if !server.isStartPending() {
+		t.Fatal("pending start was cleared after stale mismatch; want pending to remain active")
+	}
+
+	handled = server.deliverPendingStart(downstream.Frame{
+		Command: byte(southboundenh.ENHResStarted),
+		Payload: []byte{0xF0},
+	})
+	if !handled {
+		t.Fatal("deliverPendingStart (matching STARTED) = false; want true")
+	}
+
+	select {
+	case frame := <-respCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
+			t.Fatalf("respCh command = 0x%02X; want ENHResStarted", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0xF0 {
+			t.Fatalf("respCh payload = %x; want [f0]", frame.Payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("pending start response not delivered")
+	}
+
+	select {
+	case frame := <-server.sessions[1].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResStarted {
+			t.Fatalf("session command = 0x%02X; want ENHResStarted", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0xF0 {
+			t.Fatalf("session payload = %x; want [f0]", frame.Payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("session response not delivered")
+	}
+
+	if server.isStartPending() {
+		t.Fatal("pending start remains set after delivery; want cleared")
+	}
+	if got := server.staleStartAbsorbed.Load(); got != 1 {
+		t.Fatalf("staleStartAbsorbed = %d; want 1", got)
+	}
+	if got := server.staleStartExpired.Load(); got != 0 {
+		t.Fatalf("staleStartExpired = %d; want 0", got)
+	}
+}
+
+func TestDeliverPendingStartENHStartedMismatchExpiresBounded(t *testing.T) {
 	t.Parallel()
 
 	respCh := make(chan downstream.Frame, 1)
@@ -310,8 +394,8 @@ func TestDeliverPendingStartENHStartedMismatchBecomesFailed(t *testing.T) {
 		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
 			t.Fatalf("respCh payload = %x; want [31]", frame.Payload)
 		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("pending start response not delivered")
+	case <-time.After(startStaleAbsorbWindow + 300*time.Millisecond):
+		t.Fatal("bounded stale expiry response not delivered")
 	}
 
 	select {
@@ -327,7 +411,13 @@ func TestDeliverPendingStartENHStartedMismatchBecomesFailed(t *testing.T) {
 	}
 
 	if server.isStartPending() {
-		t.Fatal("pending start remains set after delivery; want cleared")
+		t.Fatal("pending start remains set after bounded expiry; want cleared")
+	}
+	if got := server.staleStartAbsorbed.Load(); got != 0 {
+		t.Fatalf("staleStartAbsorbed = %d; want 0", got)
+	}
+	if got := server.staleStartExpired.Load(); got != 1 {
+		t.Fatalf("staleStartExpired = %d; want 1", got)
 	}
 }
 

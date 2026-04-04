@@ -29,6 +29,7 @@ const (
 	ebusSyn                  = byte(0xAA)
 	udpBridgeOwnerID         = ^uint64(0)
 	busIdleReleaseGrace      = 50 * time.Millisecond
+	startStaleAbsorbWindow   = 50 * time.Millisecond
 	maxOwnershipDuration     = 2 * time.Second
 	udpPlainSynWait          = 5 * time.Second
 	udpPlainBootstrapWait    = 250 * time.Millisecond
@@ -64,6 +65,8 @@ type Server struct {
 
 	backpressureDrops  atomic.Uint64
 	backpressureCloses atomic.Uint64
+	staleStartAbsorbed atomic.Uint64
+	staleStartExpired  atomic.Uint64
 
 	randomFloat64 func() float64
 
@@ -104,11 +107,14 @@ type Server struct {
 }
 
 type pendingStart struct {
-	sessionID uint64
-	respCh    chan downstream.Frame
-	mode      pendingStartMode
-	initiator byte
-	delivered bool
+	sessionID     uint64
+	respCh        chan downstream.Frame
+	mode          pendingStartMode
+	initiator     byte
+	delivered     bool
+	staleObserved bool
+	staleWinner   byte
+	staleDeadline time.Time
 }
 
 type pendingInfo struct {
@@ -1260,15 +1266,80 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		server.pendingStartMu.Unlock()
 		return false
 	}
-	// Clear pending immediately once a START result frame is consumed so that
-	// subsequent wire bytes are not dropped by the "start pending" fast-path.
-	server.pendingStart = nil
-	server.pendingStartMu.Unlock()
 
 	frameData := byte(0x00)
 	if len(frame.Payload) > 0 {
 		frameData = frame.Payload[0]
 	}
+	command := southboundenh.ENHCommand(frame.Command)
+	now := time.Now()
+
+	if pending.mode == pendingStartModeENH &&
+		command == southboundenh.ENHResStarted &&
+		frameData != pending.initiator {
+		if !pending.staleObserved {
+			pending.staleObserved = true
+			pending.staleWinner = frameData
+			pending.staleDeadline = now.Add(startStaleAbsorbWindow)
+			server.pendingStartMu.Unlock()
+			log.Printf(
+				"session=%d start_stale_absorb_wait requested=0x%02X adapter_won=0x%02X window=%s",
+				pending.sessionID,
+				pending.initiator,
+				frameData,
+				startStaleAbsorbWindow,
+			)
+			server.schedulePendingStartStaleExpiry(pending)
+			return true
+		}
+
+		pending.staleWinner = frameData
+		if now.Before(pending.staleDeadline) {
+			remaining := time.Until(pending.staleDeadline)
+			server.pendingStartMu.Unlock()
+			log.Printf(
+				"session=%d start_stale_absorb_wait requested=0x%02X adapter_won=0x%02X remaining=%s",
+				pending.sessionID,
+				pending.initiator,
+				frameData,
+				remaining,
+			)
+			return true
+		}
+
+		server.pendingStart = nil
+		server.pendingStartMu.Unlock()
+		log.Printf(
+			"session=%d start_stale_absorb_expired requested=0x%02X adapter_won=0x%02X window=%s -> converting STARTED to FAILED",
+			pending.sessionID,
+			pending.initiator,
+			frameData,
+			startStaleAbsorbWindow,
+		)
+		server.staleStartExpired.Add(1)
+
+		forwarded := downstream.Frame{
+			Command: byte(southboundenh.ENHResFailed),
+			Payload: []byte{frameData},
+		}
+		select {
+		case pending.respCh <- cloneFrame(forwarded):
+		default:
+		}
+		server.reply(pending.sessionID, forwarded)
+		return true
+	}
+
+	// Clear pending once a terminal START result frame is consumed so that
+	// subsequent wire bytes are not dropped by the "start pending" fast-path.
+	server.pendingStart = nil
+	hadStaleAbsorb := pending.mode == pendingStartModeENH &&
+		pending.staleObserved &&
+		command == southboundenh.ENHResStarted &&
+		frameData == pending.initiator
+	staleWinner := pending.staleWinner
+	server.pendingStartMu.Unlock()
+
 	log.Printf(
 		"session=%d upstream_start_result cmd=0x%02X data=0x%02X initiator=0x%02X",
 		pending.sessionID,
@@ -1277,20 +1348,17 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		pending.initiator,
 	)
 
-	forwarded := cloneFrame(frame)
-	if pending.mode == pendingStartModeENH &&
-		southboundenh.ENHCommand(forwarded.Command) == southboundenh.ENHResStarted &&
-		frameData != pending.initiator {
+	if hadStaleAbsorb {
+		server.staleStartAbsorbed.Add(1)
 		log.Printf(
-			"session=%d address_mismatch requested=0x%02X adapter_won=0x%02X -> converting STARTED to FAILED",
+			"session=%d start_stale_absorbed requested=0x%02X adapter_won=0x%02X",
 			pending.sessionID,
 			pending.initiator,
-			frameData,
+			staleWinner,
 		)
-		forwarded.Command = byte(southboundenh.ENHResFailed)
-		forwarded.Payload = []byte{frameData}
 	}
 
+	forwarded := cloneFrame(frame)
 	select {
 	case pending.respCh <- cloneFrame(forwarded):
 	default:
@@ -1306,6 +1374,53 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	server.reply(pending.sessionID, forwarded)
 
 	return true
+}
+
+func (server *Server) schedulePendingStartStaleExpiry(pending *pendingStart) {
+	time.AfterFunc(startStaleAbsorbWindow, func() {
+		server.expirePendingStartStale(pending)
+	})
+}
+
+func (server *Server) expirePendingStartStale(expected *pendingStart) {
+	server.pendingStartMu.Lock()
+	pending := server.pendingStart
+	if pending == nil || pending != expected || !pending.staleObserved {
+		server.pendingStartMu.Unlock()
+		return
+	}
+	if time.Now().Before(pending.staleDeadline) {
+		server.pendingStartMu.Unlock()
+		return
+	}
+
+	server.pendingStart = nil
+	winner := pending.staleWinner
+	server.pendingStartMu.Unlock()
+
+	log.Printf(
+		"session=%d start_stale_absorb_expired requested=0x%02X adapter_won=0x%02X window=%s -> converting STARTED to FAILED",
+		pending.sessionID,
+		pending.initiator,
+		winner,
+		startStaleAbsorbWindow,
+	)
+	server.staleStartExpired.Add(1)
+
+	failed := downstream.Frame{
+		Command: byte(southboundenh.ENHResFailed),
+		Payload: []byte{winner},
+	}
+	select {
+	case pending.respCh <- cloneFrame(failed):
+	default:
+	}
+
+	if pending.mode == pendingStartModeUDPPlain {
+		return
+	}
+
+	server.reply(pending.sessionID, failed)
 }
 
 func (server *Server) isStartPending() bool {
