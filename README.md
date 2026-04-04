@@ -126,6 +126,11 @@ Use when `../helianthus-ha-integration` is available for coexistence checks:
 - `profiles/gateway-direct-proxy/agent-local.enh.md`
 - `profiles/gateway-direct-proxy/agent-local.ens.md`
 
+### D) Proxy semantics matrix adjunct (issue #91)
+
+- `profiles/proxy-wire-semantics/px-cases.md`
+- `profiles/proxy-wire-semantics/proxy-semantics-matrix-example.json`
+
 ## Validation Commands
 
 | Area | Command |
@@ -134,6 +139,7 @@ Use when `../helianthus-ha-integration` is available for coexistence checks:
 | tests | `GOWORK=off go test ./...` |
 | vet | `GOWORK=off go vet ./...` |
 | terminology gate | `./scripts/terminology-gate.sh` |
+| transport + proxy semantics matrix gate | `TRANSPORT_MATRIX_REPORT=<transport-index.json> PROXY_SEMANTICS_MATRIX_REPORT=<proxy-semantics-index.json> ./scripts/transport_gate.sh` |
 | operations runbook gate | `./scripts/verify_issue21_runbook.sh` |
 | compatibility harness | `go run ./cmd/ebusd-compat-harness --timeout 10s` |
 | gateway smoke CLI help | `./scripts/run-gateway-direct-proxy-smoke.sh --help` |

@@ -49,7 +49,9 @@ Goal: keep the legacy `ebusd` path stable while onboarding Helianthus traffic th
    - Start/upgrade proxy with intended profile endpoint(s) and unchanged `ebusd` direct endpoint.
 4. **Run operator smoke procedures**
    - Execute commands in [Operator smoke procedures](#operator-smoke-procedures).
-5. **Promote only on PASS markers**
+5. **Run matrix proof gates (transport + proxy semantics adjunct)**
+   - Execute command in [Matrix proof procedures](#matrix-proof-procedures).
+6. **Promote only on PASS markers**
    - Promote rollout only if expected PASS markers are present.
 
 ## Fail-closed behavior
@@ -154,6 +156,33 @@ Expected readiness markers:
 PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh|ens>://127.0.0.1:<port>
 PASS: ha integration dual-topology smoke completed for proxy profile <enh|ens>
 ```
+
+## Matrix proof procedures
+
+Run matrix gate validation using both inventories. `T01..T88` remains the primary transport gate. `PX01..PX12` is a required adjunct for proxy wire-semantics behavior.
+
+```bash
+TRANSPORT_MATRIX_REPORT=artifacts/transport-matrix-index.json \
+PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics-matrix-index.json \
+./scripts/transport_gate.sh
+```
+
+Expected markers:
+
+```text
+transport gate: PASS (pass=..., xfail=..., xpass=..., blocked=..., total=88).
+proxy semantics gate: PASS (pass=..., xfail=..., xpass=0, blocked=..., total=12).
+```
+
+Evidence requirements:
+- `proxy-semantics-matrix-index.json` must contain exactly `PX01..PX12`.
+- `xpass` is not allowed in the proxy semantics inventory.
+- Unexpected `fail` or `planned` outcomes fail the gate.
+- Case definitions are documented in `profiles/proxy-wire-semantics/px-cases.md`.
+
+Deferred hardware proof:
+- This runbook does not claim hardware-backed ESERA passive validation for M5 merges.
+- Hardware validation remains deferred under issue `Project-Helianthus/helianthus-docs-ebus#241`.
 
 ## Rollback quick steps
 

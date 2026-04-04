@@ -16,6 +16,7 @@ required_patterns=(
 	"## Fail-closed behavior"
 	"## Recovery steps"
 	"## Operator smoke procedures"
+	"## Matrix proof procedures"
 	"RESULT: PASS \\(config-only migration verified; no ebusd patch required\\)"
 	"PASS: gateway path readiness profile=<enh\\|ens> endpoint=<enh\\|ens>://127.0.0.1:<port>"
 	"FAIL: gateway path readiness profile=<enh\\|ens> endpoint=<enh\\|ens>://\\.\\.\\."
@@ -24,6 +25,11 @@ required_patterns=(
 	"PASS: gateway readiness dual-topology path ebusd_endpoint=tcp://127.0.0.1:8888 proxy_endpoint=<enh\\|ens>://127.0.0.1:<port>"
 	"FAIL: gateway readiness dual-topology path \\.\\.\\."
 	"PASS: ha integration dual-topology smoke completed for proxy profile <enh\\|ens>"
+	"TRANSPORT_MATRIX_REPORT=artifacts/transport-matrix-index.json"
+	"PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics-matrix-index.json"
+	"transport gate: PASS \\(pass=\\.\\.\\., xfail=\\.\\.\\., xpass=\\.\\.\\., blocked=\\.\\.\\., total=88\\)\\."
+	"proxy semantics gate: PASS \\(pass=\\.\\.\\., xfail=\\.\\.\\., xpass=0, blocked=\\.\\.\\., total=12\\)\\."
+	"Project-Helianthus/helianthus-docs-ebus#241"
 )
 
 if command -v rg >/dev/null 2>&1; then
@@ -46,4 +52,3 @@ for pattern in "${required_patterns[@]}"; do
 done
 
 echo "PASS: operations runbook markers verified"
-

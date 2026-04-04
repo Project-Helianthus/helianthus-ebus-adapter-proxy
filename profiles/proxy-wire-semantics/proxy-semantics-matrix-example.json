@@ -1,0 +1,19 @@
+{
+  "suite": "proxy-wire-semantics",
+  "version": "v1",
+  "deferred_hardware_followup": "Project-Helianthus/helianthus-docs-ebus#241",
+  "cases": [
+    { "case_id": "PX01", "outcome": "pass" },
+    { "case_id": "PX02", "outcome": "pass" },
+    { "case_id": "PX03", "outcome": "pass" },
+    { "case_id": "PX04", "outcome": "pass" },
+    { "case_id": "PX05", "outcome": "pass" },
+    { "case_id": "PX06", "outcome": "pass" },
+    { "case_id": "PX07", "outcome": "pass" },
+    { "case_id": "PX08", "outcome": "pass" },
+    { "case_id": "PX09", "outcome": "pass" },
+    { "case_id": "PX10", "outcome": "pass" },
+    { "case_id": "PX11", "outcome": "pass" },
+    { "case_id": "PX12", "outcome": "pass" }
+  ]
+}
