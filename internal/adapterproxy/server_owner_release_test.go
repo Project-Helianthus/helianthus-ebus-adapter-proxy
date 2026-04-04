@@ -429,6 +429,178 @@ func TestDirectModePhaseTrackerTransitionsRequestResponsePath(t *testing.T) {
 	}
 }
 
+func TestTargetResponderWindowOpensFromEchoedRequestAndAllowsResponderSend(t *testing.T) {
+	t.Parallel()
+
+	upstream := &recordingUpstream{}
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+	}
+	server.setBusOwner(2, 0x10) // built-in/local responder pairing -> target 0x15
+	server.setBusOwner(1, 0x71)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	// Local target responder must not be accepted before echoed request bytes open the window.
+	server.handleSend(2, ebusACK)
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResErrorHost {
+			t.Fatalf("pre-window responder command = 0x%02X; want ENHResErrorHost", frame.Command)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected pre-window responder rejection")
+	}
+	if got := server.lateResponderReject.Load(); got != 1 {
+		t.Fatalf("lateResponderReject = %d; want 1", got)
+	}
+
+	// Echoed request: SRC DST PB SB LEN CRC
+	for _, symbol := range []byte{0x71, 0x15, 0xB5, 0x00, 0x00, 0x42} {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	server.mutex.Lock()
+	window := server.targetResponderWindow
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if !window.open {
+		t.Fatal("target responder window closed; want open after echoed request completion")
+	}
+	if window.targetAddress != 0x15 {
+		t.Fatalf("window target = 0x%02X; want 0x15", window.targetAddress)
+	}
+	if window.ownerSessionID != 1 || window.responderSessionID != 2 {
+		t.Fatalf("window owner/responder = %d/%d; want 1/2", window.ownerSessionID, window.responderSessionID)
+	}
+	if phase != busWirePhaseWaitCmdAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitCmdAck)
+	}
+
+	server.handleSend(2, ebusACK)
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		t.Fatalf("unexpected responder error after window open: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
+	default:
+	}
+
+	if got := upstream.snapshot(); len(got) != 1 || got[0] != ebusACK {
+		t.Fatalf("upstream writes = % X; want [00]", got)
+	}
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 1 {
+		t.Fatalf("busOwner = %d; want 1 (responder does not take ownership)", owner)
+	}
+}
+
+func TestTargetResponderWindowRejectsLateResponderBytesAndCounts(t *testing.T) {
+	t.Parallel()
+
+	upstream := &recordingUpstream{}
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+	}
+	server.setBusOwner(2, 0x10) // built-in/local responder pairing -> target 0x15
+	server.setBusOwner(1, 0x71)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	for _, symbol := range []byte{0x71, 0x15, 0xB5, 0x00, 0x00, 0x42} {
+		server.noteBusWireSymbol(symbol)
+	}
+	server.noteBusWireSymbol(ebusACK) // command ACK
+	server.noteBusWireSymbol(0x00)    // response LEN (0 payload)
+	server.noteBusWireSymbol(0x99)    // response CRC -> wait_response_ack, window closes
+
+	server.mutex.Lock()
+	windowOpen := server.targetResponderWindow.open
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if windowOpen {
+		t.Fatal("target responder window still open; want closed before response ACK phase")
+	}
+	if phase != busWirePhaseWaitResponseAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitResponseAck)
+	}
+
+	server.handleSend(2, 0x11)
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResErrorHost {
+			t.Fatalf("late responder command = 0x%02X; want ENHResErrorHost", frame.Command)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected late responder rejection")
+	}
+	if got := server.lateResponderReject.Load(); got != 1 {
+		t.Fatalf("lateResponderReject = %d; want 1", got)
+	}
+	if got := upstream.snapshot(); len(got) != 0 {
+		t.Fatalf("upstream writes = % X; want none for late responder", got)
+	}
+}
+
+func TestTargetResponderExperimentalChildModeDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	upstream := &recordingUpstream{}
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+	}
+	server.setBusOwner(2, 0x31) // generic companion association -> target 0x36 (experimental)
+	server.setBusOwner(1, 0x71)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+	for _, symbol := range []byte{0x71, 0x36, 0xB5, 0x00, 0x00, 0x42} {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	server.mutex.Lock()
+	windowOpen := server.targetResponderWindow.open
+	server.mutex.Unlock()
+	if windowOpen {
+		t.Fatal("target responder window opened for experimental child mode while disabled")
+	}
+
+	server.handleSend(2, ebusACK)
+
+	select {
+	case frame := <-server.sessions[2].sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResErrorHost {
+			t.Fatalf("experimental responder command = 0x%02X; want ENHResErrorHost", frame.Command)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected experimental child responder rejection")
+	}
+	if got := server.lateResponderReject.Load(); got != 1 {
+		t.Fatalf("lateResponderReject = %d; want 1", got)
+	}
+	if got := upstream.snapshot(); len(got) != 0 {
+		t.Fatalf("upstream writes = % X; want none when experimental child mode is disabled", got)
+	}
+}
+
 func TestHandleSendDoesNotRefreshBusOwnershipTimestamp(t *testing.T) {
 	t.Parallel()
 

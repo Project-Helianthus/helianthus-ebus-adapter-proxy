@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/domain/downstream"
+	emutargets "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/emulation/targets"
 	"github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/sourcepolicy"
 	southboundenh "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/southbound/enh"
 )
@@ -66,12 +67,13 @@ type Server struct {
 	upstreamFeatures atomic.Uint32
 	lastWireRXAtNano atomic.Int64
 
-	backpressureDrops  atomic.Uint64
-	backpressureCloses atomic.Uint64
-	staleStartAbsorbed atomic.Uint64
-	staleStartExpired  atomic.Uint64
-	synWaitCmdAckTO    atomic.Uint64
-	synWaitResponseTO  atomic.Uint64
+	backpressureDrops   atomic.Uint64
+	backpressureCloses  atomic.Uint64
+	staleStartAbsorbed  atomic.Uint64
+	staleStartExpired   atomic.Uint64
+	synWaitCmdAckTO     atomic.Uint64
+	synWaitResponseTO   atomic.Uint64
+	lateResponderReject atomic.Uint64
 
 	randomFloat64 func() float64
 
@@ -82,10 +84,11 @@ type Server struct {
 	autoJoinInitiator byte
 	startOfTelegram   bool
 
-	observedMu          sync.Mutex
-	observedInitiatorAt map[byte]time.Time
-	collisionBySession  map[uint64]byte
-	learnedBySession    map[uint64]sessionInitiatorLearning
+	observedMu              sync.Mutex
+	observedInitiatorAt     map[byte]time.Time
+	collisionBySession      map[uint64]byte
+	learnedBySession        map[uint64]sessionInitiatorLearning
+	localRespondersByTarget map[byte]targetResponderAssociation
 
 	busToken              chan struct{}
 	busOwner              uint64
@@ -105,6 +108,7 @@ type Server struct {
 	requestLEN            byte
 	requestHeaderCaptured bool
 	responseBytesRemain   int
+	targetResponderWindow targetResponderWindow
 	startArbSeq           uint64
 	startArbGrantSession  uint64
 	startArbContenders    map[uint64]*startArbContender
@@ -183,6 +187,37 @@ const (
 	busWirePhaseWaitResponseAck
 )
 
+type targetResponderMode uint8
+
+const (
+	targetResponderModeLocal targetResponderMode = iota
+	targetResponderModeChildExperimental
+)
+
+func (mode targetResponderMode) String() string {
+	switch mode {
+	case targetResponderModeChildExperimental:
+		return "child_experimental"
+	default:
+		return "local"
+	}
+}
+
+type targetResponderAssociation struct {
+	targetAddress byte
+	sessionID     uint64
+	mode          targetResponderMode
+}
+
+type targetResponderWindow struct {
+	open               bool
+	targetAddress      byte
+	ownerSessionID     uint64
+	responderSessionID uint64
+	mode               targetResponderMode
+	openedAt           time.Time
+}
+
 func (phase busWirePhase) String() string {
 	switch phase {
 	case busWirePhaseCollectRequest:
@@ -238,21 +273,22 @@ func NewServer(cfg Config) *Server {
 	}
 
 	server := &Server{
-		cfg:                 cfg,
-		sessions:            make(map[uint64]*session),
-		busToken:            make(chan struct{}, 1),
-		leasedBySess:        make(map[uint64]sourcepolicy.Lease),
-		synCh:               make(chan struct{}, 1),
-		udpClients:          make(map[string]*net.UDPAddr),
-		udpQueue:            make(chan udpDatagram, udpNorthboundQueueCap),
-		randomFloat64:       rand.Float64,
-		startOfTelegram:     true,
-		observedInitiatorAt: make(map[byte]time.Time),
-		collisionBySession:  make(map[uint64]byte),
-		learnedBySession:    make(map[uint64]sessionInitiatorLearning),
-		startArbContenders:  make(map[uint64]*startArbContender),
-		infoCache:           newAdapterInfoCache(),
-		upstreamLost:        make(chan struct{}),
+		cfg:                     cfg,
+		sessions:                make(map[uint64]*session),
+		busToken:                make(chan struct{}, 1),
+		leasedBySess:            make(map[uint64]sourcepolicy.Lease),
+		synCh:                   make(chan struct{}, 1),
+		udpClients:              make(map[string]*net.UDPAddr),
+		udpQueue:                make(chan udpDatagram, udpNorthboundQueueCap),
+		randomFloat64:           rand.Float64,
+		startOfTelegram:         true,
+		observedInitiatorAt:     make(map[byte]time.Time),
+		collisionBySession:      make(map[uint64]byte),
+		learnedBySession:        make(map[uint64]sessionInitiatorLearning),
+		localRespondersByTarget: make(map[byte]targetResponderAssociation),
+		startArbContenders:      make(map[uint64]*startArbContender),
+		infoCache:               newAdapterInfoCache(),
+		upstreamLost:            make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
 
@@ -426,6 +462,10 @@ func (server *Server) unregisterSession(sessionID uint64) {
 	server.mutex.Lock()
 	delete(server.sessions, sessionID)
 	delete(server.learnedBySession, sessionID)
+	server.clearLocalResponderAssociationsForSessionLocked(sessionID)
+	if server.targetResponderWindow.open && server.targetResponderWindow.responderSessionID == sessionID {
+		server.targetResponderWindow = targetResponderWindow{}
+	}
 	server.mutex.Unlock()
 
 	server.releaseBusIfOwner(sessionID)
@@ -947,9 +987,19 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 func (server *Server) handleSend(sessionID uint64, data byte) {
 	server.mutex.Lock()
 	owner := server.busOwner
+	allowResponderSend, lateResponderSend, lateTarget, lateReason := server.evaluateTargetResponderSendLocked(sessionID)
 	server.mutex.Unlock()
 
-	if owner != sessionID {
+	if owner != sessionID && !allowResponderSend {
+		if lateResponderSend {
+			server.lateResponderReject.Add(1)
+			log.Printf(
+				"session=%d target_responder_late_reject target=0x%02X reason=%s",
+				sessionID,
+				lateTarget,
+				lateReason,
+			)
+		}
 		if server.cfg.Debug {
 			log.Printf("session=%d send_rejected owner=%d symbol=0x%02X", sessionID, owner, data)
 		}
@@ -967,7 +1017,10 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		return
 	}
 
-	queuedObserverFrames := server.queueOwnerObserverReplay(sessionID, data)
+	queuedObserverFrames := false
+	if owner == sessionID {
+		queuedObserverFrames = server.queueOwnerObserverReplay(sessionID, data)
+	}
 
 	server.mutex.Lock()
 	server.busDirty = true
@@ -994,6 +1047,12 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 		})
 		server.releaseBusIfOwner(sessionID)
 		return
+	}
+
+	if allowResponderSend {
+		if server.cfg.Debug {
+			log.Printf("session=%d target_responder_send_accepted target=0x%02X symbol=0x%02X", sessionID, lateTarget, data)
+		}
 	}
 
 }
@@ -1937,6 +1996,7 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	server.ownerObserverSeen = nil
 	server.busDirty = false
 	server.busOwned = time.Time{}
+	server.targetResponderWindow = targetResponderWindow{}
 	server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	server.mutex.Unlock()
 
@@ -1964,8 +2024,10 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.ownerObserverSeen = nil
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
+	server.targetResponderWindow = targetResponderWindow{}
 	server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	server.learnSessionInitiatorLocked(sessionID, initiator, "start")
+	server.maybeAssociateTargetResponderLocked(sessionID, initiator)
 	server.mutex.Unlock()
 }
 
@@ -2134,6 +2196,9 @@ func (server *Server) resetBusWirePhaseLocked(phase busWirePhase) {
 	server.requestLEN = 0
 	server.requestHeaderCaptured = false
 	server.responseBytesRemain = 0
+	if phase == busWirePhaseIdle {
+		server.targetResponderWindow = targetResponderWindow{}
+	}
 }
 
 func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
@@ -2163,6 +2228,7 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 		if server.requestBytesSeen >= 6+server.requestDataLength {
 			server.learnSessionInitiatorLocked(server.busOwner, server.requestSrc, "request")
 			server.busWirePhase = busWirePhaseWaitCmdAck
+			server.maybeOpenTargetResponderWindowLocked(server.requestDst)
 		}
 	case busWirePhaseWaitCmdAck:
 		switch symbol {
@@ -2181,6 +2247,7 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 		}
 		if server.responseBytesRemain <= 0 {
 			server.busWirePhase = busWirePhaseWaitResponseAck
+			server.targetResponderWindow = targetResponderWindow{}
 		}
 	case busWirePhaseWaitResponseAck:
 		// Any non-SYN symbol here is the initiator response ACK/NACK.
@@ -2505,6 +2572,178 @@ func (server *Server) SessionInitiatorMappings() []SessionInitiatorMapping {
 		return mappings[i].SessionID < mappings[j].SessionID
 	})
 	return mappings
+}
+
+func (server *Server) registerLocalTargetResponder(targetAddress byte, sessionID uint64) {
+	server.mutex.Lock()
+	if server.localRespondersByTarget == nil {
+		server.localRespondersByTarget = make(map[byte]targetResponderAssociation)
+	}
+	server.localRespondersByTarget[targetAddress] = targetResponderAssociation{
+		targetAddress: targetAddress,
+		sessionID:     sessionID,
+		mode:          targetResponderModeLocal,
+	}
+	server.mutex.Unlock()
+}
+
+func (server *Server) registerExperimentalChildTargetResponder(targetAddress byte, sessionID uint64) {
+	server.mutex.Lock()
+	if server.localRespondersByTarget == nil {
+		server.localRespondersByTarget = make(map[byte]targetResponderAssociation)
+	}
+	server.localRespondersByTarget[targetAddress] = targetResponderAssociation{
+		targetAddress: targetAddress,
+		sessionID:     sessionID,
+		mode:          targetResponderModeChildExperimental,
+	}
+	server.mutex.Unlock()
+}
+
+func (server *Server) clearLocalResponderAssociationsForSessionLocked(sessionID uint64) {
+	for targetAddress, association := range server.localRespondersByTarget {
+		if association.sessionID == sessionID {
+			delete(server.localRespondersByTarget, targetAddress)
+		}
+	}
+}
+
+func (server *Server) maybeOpenTargetResponderWindowLocked(targetAddress byte) {
+	association, ok := server.localRespondersByTarget[targetAddress]
+	if !ok {
+		return
+	}
+	if association.mode == targetResponderModeChildExperimental && !server.cfg.EnableExperimentalChildTargetResponder {
+		return
+	}
+	if association.sessionID == 0 || association.sessionID == server.busOwner {
+		return
+	}
+	if _, ok := server.sessions[association.sessionID]; !ok {
+		return
+	}
+
+	server.targetResponderWindow = targetResponderWindow{
+		open:               true,
+		targetAddress:      targetAddress,
+		ownerSessionID:     server.busOwner,
+		responderSessionID: association.sessionID,
+		mode:               association.mode,
+		openedAt:           time.Now().UTC(),
+	}
+
+	if server.cfg.Debug {
+		log.Printf(
+			"session=%d target_responder_window_open target=0x%02X responder=%d mode=%s",
+			server.busOwner,
+			targetAddress,
+			association.sessionID,
+			association.mode,
+		)
+	}
+}
+
+func (server *Server) maybeAssociateTargetResponderLocked(sessionID uint64, initiator byte) {
+	if sessionID == 0 || sessionID == udpBridgeOwnerID {
+		return
+	}
+	if _, ok := server.sessions[sessionID]; !ok {
+		return
+	}
+
+	if targetAddress, ok := builtInLocalTargetForInitiator(initiator); ok {
+		server.localRespondersByTarget[targetAddress] = targetResponderAssociation{
+			targetAddress: targetAddress,
+			sessionID:     sessionID,
+			mode:          targetResponderModeLocal,
+		}
+		return
+	}
+
+	targetAddress, ok := companionTargetAddress(initiator)
+	if !ok {
+		return
+	}
+	server.localRespondersByTarget[targetAddress] = targetResponderAssociation{
+		targetAddress: targetAddress,
+		sessionID:     sessionID,
+		mode:          targetResponderModeChildExperimental,
+	}
+}
+
+func (server *Server) targetResponderWindowAllowsPhaseLocked() bool {
+	switch server.busWirePhase {
+	case busWirePhaseWaitCmdAck, busWirePhaseWaitResponseLen, busWirePhaseWaitResponseBody:
+		return true
+	default:
+		return false
+	}
+}
+
+func (server *Server) lookupTargetResponderBySessionLocked(sessionID uint64) (targetResponderAssociation, bool) {
+	for _, association := range server.localRespondersByTarget {
+		if association.sessionID == sessionID {
+			return association, true
+		}
+	}
+	return targetResponderAssociation{}, false
+}
+
+func (server *Server) evaluateTargetResponderSendLocked(sessionID uint64) (allow bool, late bool, targetAddress byte, reason string) {
+	if sessionID == 0 {
+		return false, false, 0, ""
+	}
+	if server.targetResponderWindow.open &&
+		server.targetResponderWindow.responderSessionID == sessionID &&
+		server.targetResponderWindow.ownerSessionID == server.busOwner &&
+		server.targetResponderWindowAllowsPhaseLocked() {
+		return true, false, server.targetResponderWindow.targetAddress, ""
+	}
+
+	association, ok := server.lookupTargetResponderBySessionLocked(sessionID)
+	if !ok {
+		return false, false, 0, ""
+	}
+	if association.mode == targetResponderModeChildExperimental && !server.cfg.EnableExperimentalChildTargetResponder {
+		return false, true, association.targetAddress, "experimental_child_disabled"
+	}
+	if !server.targetResponderWindow.open {
+		return false, true, association.targetAddress, "window_not_open"
+	}
+	if server.targetResponderWindow.responderSessionID != sessionID {
+		return false, true, association.targetAddress, "not_assigned_for_active_target"
+	}
+	if server.targetResponderWindow.ownerSessionID != server.busOwner {
+		return false, true, association.targetAddress, "owner_mismatch"
+	}
+	if !server.targetResponderWindowAllowsPhaseLocked() {
+		return false, true, association.targetAddress, "outside_responder_phase"
+	}
+
+	return false, true, association.targetAddress, "unknown"
+}
+
+func builtInLocalTargetForInitiator(initiator byte) (byte, bool) {
+	// Built-in local emulation profile support starts with VR90-like pairings.
+	// For this issue, we keep a single deterministic pairing.
+	if initiator == 0x10 {
+		return emutargets.BuiltInProfileVR90TargetAddress, true
+	}
+	return 0, false
+}
+
+func companionTargetAddress(initiator byte) (byte, bool) {
+	if !isInitiatorAddress(initiator) {
+		return 0, false
+	}
+	target := uint16(initiator) + 0x05
+	if target > 0xFE {
+		return 0, false
+	}
+	if target == 0x00 || target == 0xFF {
+		return 0, false
+	}
+	return byte(target), true
 }
 
 func isInitiatorAddress(address byte) bool {
