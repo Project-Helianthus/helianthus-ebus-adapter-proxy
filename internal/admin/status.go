@@ -12,9 +12,12 @@ type Status struct {
 }
 
 type SessionStatus struct {
-	ID     string `json:"id"`
-	Client string `json:"client"`
-	State  string `json:"state"`
+	ID                 string `json:"id"`
+	Client             string `json:"client"`
+	State              string `json:"state"`
+	Initiator          *uint8 `json:"initiator,omitempty"`
+	InitiatorSource    string `json:"initiator_source,omitempty"`
+	InitiatorLearnedAt string `json:"initiator_learned_at,omitempty"`
 }
 
 type SchedulerStatus struct {

@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,6 +85,7 @@ type Server struct {
 	observedMu          sync.Mutex
 	observedInitiatorAt map[byte]time.Time
 	collisionBySession  map[uint64]byte
+	learnedBySession    map[uint64]sessionInitiatorLearning
 
 	busToken              chan struct{}
 	busOwner              uint64
@@ -146,6 +148,21 @@ type startArbContender struct {
 	initiator byte
 	seq       uint64
 	grantCh   chan struct{}
+}
+
+type sessionInitiatorLearning struct {
+	Initiator byte
+	LearnedAt time.Time
+	Source    string
+}
+
+// SessionInitiatorMapping provides an admin/status snapshot entry for learned
+// initiator identity per connected session.
+type SessionInitiatorMapping struct {
+	SessionID uint64
+	Initiator byte
+	LearnedAt time.Time
+	Source    string
 }
 
 type pendingStartMode uint8
@@ -232,6 +249,7 @@ func NewServer(cfg Config) *Server {
 		startOfTelegram:     true,
 		observedInitiatorAt: make(map[byte]time.Time),
 		collisionBySession:  make(map[uint64]byte),
+		learnedBySession:    make(map[uint64]sessionInitiatorLearning),
 		startArbContenders:  make(map[uint64]*startArbContender),
 		infoCache:           newAdapterInfoCache(),
 		upstreamLost:        make(chan struct{}),
@@ -407,6 +425,7 @@ func (server *Server) registerSession(connection net.Conn) *session {
 func (server *Server) unregisterSession(sessionID uint64) {
 	server.mutex.Lock()
 	delete(server.sessions, sessionID)
+	delete(server.learnedBySession, sessionID)
 	server.mutex.Unlock()
 
 	server.releaseBusIfOwner(sessionID)
@@ -505,7 +524,12 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 
 	if initiator == 0x00 {
-		if leasedAddress, ok := server.sessionLeaseAddress(sessionID); ok {
+		if learnedAddress, ok := server.sessionLearnedInitiator(sessionID); ok {
+			initiator = learnedAddress
+			if server.cfg.Debug {
+				log.Printf("session=%d auto_join_reuse_learned=0x%02X", sessionID, learnedAddress)
+			}
+		} else if leasedAddress, ok := server.sessionLeaseAddress(sessionID); ok {
 			initiator = leasedAddress
 			if server.cfg.Debug {
 				log.Printf("session=%d auto_join_reuse_lease=0x%02X", sessionID, leasedAddress)
@@ -1941,6 +1965,7 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
 	server.resetBusWirePhaseLocked(busWirePhaseIdle)
+	server.learnSessionInitiatorLocked(sessionID, initiator, "start")
 	server.mutex.Unlock()
 }
 
@@ -2136,6 +2161,7 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 			return
 		}
 		if server.requestBytesSeen >= 6+server.requestDataLength {
+			server.learnSessionInitiatorLocked(server.busOwner, server.requestSrc, "request")
 			server.busWirePhase = busWirePhaseWaitCmdAck
 		}
 	case busWirePhaseWaitCmdAck:
@@ -2420,6 +2446,65 @@ func (server *Server) takeSessionCollision(sessionID uint64) (byte, bool) {
 	}
 	delete(server.collisionBySession, sessionID)
 	return winner, true
+}
+
+func (server *Server) learnSessionInitiator(sessionID uint64, initiator byte, source string) {
+	server.mutex.Lock()
+	server.learnSessionInitiatorLocked(sessionID, initiator, source)
+	server.mutex.Unlock()
+}
+
+func (server *Server) learnSessionInitiatorLocked(sessionID uint64, initiator byte, source string) {
+	if sessionID == 0 || sessionID == udpBridgeOwnerID {
+		return
+	}
+	if !isInitiatorAddress(initiator) {
+		return
+	}
+	if _, ok := server.sessions[sessionID]; !ok {
+		return
+	}
+	if source == "" {
+		source = "unknown"
+	}
+
+	server.learnedBySession[sessionID] = sessionInitiatorLearning{
+		Initiator: initiator,
+		LearnedAt: time.Now().UTC(),
+		Source:    source,
+	}
+}
+
+func (server *Server) sessionLearnedInitiator(sessionID uint64) (byte, bool) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	learning, ok := server.learnedBySession[sessionID]
+	if !ok {
+		return 0, false
+	}
+	return learning.Initiator, true
+}
+
+// SessionInitiatorMappings exposes learned session->initiator identity for
+// status/admin surfaces.
+func (server *Server) SessionInitiatorMappings() []SessionInitiatorMapping {
+	server.mutex.Lock()
+	mappings := make([]SessionInitiatorMapping, 0, len(server.learnedBySession))
+	for sessionID, learning := range server.learnedBySession {
+		mappings = append(mappings, SessionInitiatorMapping{
+			SessionID: sessionID,
+			Initiator: learning.Initiator,
+			LearnedAt: learning.LearnedAt,
+			Source:    learning.Source,
+		})
+	}
+	server.mutex.Unlock()
+
+	sort.Slice(mappings, func(i, j int) bool {
+		return mappings[i].SessionID < mappings[j].SessionID
+	})
+	return mappings
 }
 
 func isInitiatorAddress(address byte) bool {
