@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -53,7 +54,7 @@ func main() {
 	log.Printf("Listen: %s", normalizedListen)
 	log.Printf("Upstream: (configured)")
 
-	server := adapterproxy.NewServer(adapterproxy.Config{
+	cfg := adapterproxy.Config{
 		ListenAddr:                   normalizedListen,
 		UDPPlainListenAddr:           normalizedUDPPlainListen,
 		UpstreamTransport:            upstreamTransport,
@@ -68,9 +69,24 @@ func main() {
 		DisableUDPPlainStartFallback: *udpDisableStartFallback,
 		WireLogPath:                  strings.TrimSpace(*wireLogPath),
 		Debug:                        *debug,
-	})
+	}
 
-	if err := server.Serve(ctx); err != nil {
+	const upstreamReconnectDelay = 5 * time.Second
+	for {
+		server := adapterproxy.NewServer(cfg)
+		err := server.Serve(ctx)
+		if ctx.Err() != nil {
+			break
+		}
+		if errors.Is(err, adapterproxy.ErrUpstreamLost) {
+			log.Printf("upstream_reconnect delay=%s", upstreamReconnectDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(upstreamReconnectDelay):
+			}
+			continue
+		}
 		log.Fatalf("proxy exited: %v", err)
 	}
 }

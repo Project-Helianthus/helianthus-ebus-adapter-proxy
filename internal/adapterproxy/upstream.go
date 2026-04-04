@@ -73,7 +73,7 @@ func (client *upstreamClient) ReadFrame() (downstream.Frame, error) {
 	}
 
 	frame, err := client.parser.Parse(client.reader)
-	if isTimeoutError(err) {
+	if err != nil {
 		client.parser.Reset()
 	}
 
