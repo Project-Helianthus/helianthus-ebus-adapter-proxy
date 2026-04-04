@@ -150,6 +150,170 @@ func TestNoteBusWireSymbolMarksDirtyForOwnedTraffic(t *testing.T) {
 	}
 }
 
+func TestNoteBusWireSymbolReleasesOnSynWhileWaitingCommandAck(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.setBusOwner(7, 0x31)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	request := []byte{0x31, 0x15, 0xB5, 0x00, 0x00, 0x42}
+	for _, symbol := range request {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	server.mutex.Lock()
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitCmdAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitCmdAck)
+	}
+
+	server.noteBusWireSymbol(ebusSyn)
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	dirty := server.busDirty
+	server.mutex.Unlock()
+	if owner != 0 {
+		t.Fatalf("busOwner = %d; want 0", owner)
+	}
+	if dirty {
+		t.Fatalf("busDirty = true; want false")
+	}
+	if got := server.synWaitCmdAckTO.Load(); got != 1 {
+		t.Fatalf("synWaitCmdAckTO = %d; want 1", got)
+	}
+	if got := server.synWaitResponseTO.Load(); got != 0 {
+		t.Fatalf("synWaitResponseTO = %d; want 0", got)
+	}
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected released bus token after SYN while waiting for command ACK")
+	}
+}
+
+func TestNoteBusWireSymbolReleasesOnSynWhileWaitingResponseBytes(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.setBusOwner(9, 0x31)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	// request: QQ ZZ PB SB NN D CRC
+	request := []byte{0x31, 0x15, 0xB5, 0x09, 0x01, 0x22, 0x6C}
+	for _, symbol := range request {
+		server.noteBusWireSymbol(symbol)
+	}
+	server.noteBusWireSymbol(ebusACK) // command ACK
+	server.noteBusWireSymbol(0x02)    // response length
+	server.noteBusWireSymbol(0x44)    // first response byte
+
+	server.mutex.Lock()
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitResponseBody {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitResponseBody)
+	}
+
+	server.noteBusWireSymbol(ebusSyn)
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 0 {
+		t.Fatalf("busOwner = %d; want 0", owner)
+	}
+	if got := server.synWaitCmdAckTO.Load(); got != 0 {
+		t.Fatalf("synWaitCmdAckTO = %d; want 0", got)
+	}
+	if got := server.synWaitResponseTO.Load(); got != 1 {
+		t.Fatalf("synWaitResponseTO = %d; want 1", got)
+	}
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected released bus token after SYN while waiting for response bytes")
+	}
+}
+
+func TestNoteBusWireSymbolReleasesOnSynWhileWaitingResponseAck(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.setBusOwner(11, 0x31)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	// request: QQ ZZ PB SB NN D CRC
+	request := []byte{0x31, 0x15, 0xB5, 0x09, 0x01, 0x22, 0x6C}
+	for _, symbol := range request {
+		server.noteBusWireSymbol(symbol)
+	}
+	server.noteBusWireSymbol(ebusACK) // command ACK
+	server.noteBusWireSymbol(0x02)    // response length
+	server.noteBusWireSymbol(0x44)    // response data #1
+	server.noteBusWireSymbol(0x55)    // response data #2
+	server.noteBusWireSymbol(0x99)    // response CRC
+
+	server.mutex.Lock()
+	phase := server.busWirePhase
+	server.mutex.Unlock()
+	if phase != busWirePhaseWaitResponseAck {
+		t.Fatalf("busWirePhase = %s; want %s", phase, busWirePhaseWaitResponseAck)
+	}
+
+	server.noteBusWireSymbol(ebusSyn)
+
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 0 {
+		t.Fatalf("busOwner = %d; want 0", owner)
+	}
+	if got := server.synWaitCmdAckTO.Load(); got != 0 {
+		t.Fatalf("synWaitCmdAckTO = %d; want 0", got)
+	}
+	if got := server.synWaitResponseTO.Load(); got != 1 {
+		t.Fatalf("synWaitResponseTO = %d; want 1", got)
+	}
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected released bus token after SYN while waiting for response ACK")
+	}
+}
+
 func TestHandleSendDoesNotRefreshBusOwnershipTimestamp(t *testing.T) {
 	t.Parallel()
 

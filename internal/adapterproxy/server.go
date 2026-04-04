@@ -27,6 +27,8 @@ var ErrUpstreamLost = errors.New("upstream connection lost")
 const (
 	defaultLeaseDuration     = 30 * time.Minute
 	ebusSyn                  = byte(0xAA)
+	ebusACK                  = byte(0x00)
+	ebusNACK                 = byte(0xFF)
 	udpBridgeOwnerID         = ^uint64(0)
 	busIdleReleaseGrace      = 50 * time.Millisecond
 	startStaleAbsorbWindow   = 50 * time.Millisecond
@@ -67,6 +69,8 @@ type Server struct {
 	backpressureCloses atomic.Uint64
 	staleStartAbsorbed atomic.Uint64
 	staleStartExpired  atomic.Uint64
+	synWaitCmdAckTO    atomic.Uint64
+	synWaitResponseTO  atomic.Uint64
 
 	randomFloat64 func() float64
 
@@ -89,6 +93,10 @@ type Server struct {
 	ownerObserverSeen     []byte
 	busDirty              bool
 	busOwned              time.Time
+	busWirePhase          busWirePhase
+	requestBytesSeen      int
+	requestDataLength     int
+	responseBytesRemain   int
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -130,6 +138,43 @@ const (
 	pendingStartModeENH pendingStartMode = iota
 	pendingStartModeUDPPlain
 )
+
+type busWirePhase uint8
+
+const (
+	busWirePhaseIdle busWirePhase = iota
+	busWirePhaseCollectRequest
+	busWirePhaseWaitCmdAck
+	busWirePhaseWaitResponseLen
+	busWirePhaseWaitResponseBody
+	busWirePhaseWaitResponseAck
+)
+
+func (phase busWirePhase) String() string {
+	switch phase {
+	case busWirePhaseCollectRequest:
+		return "collect_request"
+	case busWirePhaseWaitCmdAck:
+		return "wait_cmd_ack"
+	case busWirePhaseWaitResponseLen:
+		return "wait_response_len"
+	case busWirePhaseWaitResponseBody:
+		return "wait_response_body"
+	case busWirePhaseWaitResponseAck:
+		return "wait_response_ack"
+	default:
+		return "idle"
+	}
+}
+
+func (phase busWirePhase) isSynTimeoutBoundary() bool {
+	switch phase {
+	case busWirePhaseWaitCmdAck, busWirePhaseWaitResponseBody, busWirePhaseWaitResponseAck:
+		return true
+	default:
+		return false
+	}
+}
 
 var preferredInitiatorAddresses = []byte{
 	0xF7, 0xF3, 0xF1, 0xF0,
@@ -1855,6 +1900,7 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	server.ownerObserverSeen = nil
 	server.busDirty = false
 	server.busOwned = time.Time{}
+	server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	server.mutex.Unlock()
 
 	if len(observerFrames) > 0 {
@@ -1881,6 +1927,7 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.ownerObserverSeen = nil
 	server.busDirty = true
 	server.busOwned = time.Now().UTC()
+	server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	server.mutex.Unlock()
 }
 
@@ -1889,6 +1936,9 @@ func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool
 	defer server.mutex.Unlock()
 	if server.busOwner != sessionID {
 		return false
+	}
+	if server.busWirePhase == busWirePhaseIdle {
+		server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
 	}
 	server.ownerObserverExpected = append(server.ownerObserverExpected, data)
 	return true
@@ -1999,6 +2049,9 @@ func (server *Server) releaseBusIfIdleSyn() {
 
 func (server *Server) noteBusWireSymbol(symbol byte) {
 	if symbol == ebusSyn {
+		if server.releaseBusIfSynWhileWaiting() {
+			return
+		}
 		server.releaseBusIfIdleSyn()
 		return
 	}
@@ -2006,8 +2059,77 @@ func (server *Server) noteBusWireSymbol(symbol byte) {
 	server.mutex.Lock()
 	if server.busOwner != 0 {
 		server.busDirty = true
+		server.advanceBusWirePhaseLocked(symbol)
 	}
 	server.mutex.Unlock()
+}
+
+func (server *Server) releaseBusIfSynWhileWaiting() bool {
+	server.mutex.Lock()
+	owner := server.busOwner
+	phase := server.busWirePhase
+	if owner == 0 || !phase.isSynTimeoutBoundary() {
+		server.mutex.Unlock()
+		return false
+	}
+	server.resetBusWirePhaseLocked(busWirePhaseIdle)
+	server.mutex.Unlock()
+
+	if phase == busWirePhaseWaitCmdAck {
+		server.synWaitCmdAckTO.Add(1)
+	} else {
+		server.synWaitResponseTO.Add(1)
+	}
+	log.Printf("session=%d syn_while_waiting_timeout phase=%s -> release_owner=true", owner, phase)
+	server.releaseBusIfOwner(owner)
+	return true
+}
+
+func (server *Server) resetBusWirePhaseLocked(phase busWirePhase) {
+	server.busWirePhase = phase
+	server.requestBytesSeen = 0
+	server.requestDataLength = -1
+	server.responseBytesRemain = 0
+}
+
+func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
+	switch server.busWirePhase {
+	case busWirePhaseIdle:
+		return
+	case busWirePhaseCollectRequest:
+		server.requestBytesSeen++
+		if server.requestBytesSeen == 5 {
+			server.requestDataLength = int(symbol)
+			return
+		}
+		if server.requestDataLength < 0 {
+			return
+		}
+		if server.requestBytesSeen >= 6+server.requestDataLength {
+			server.busWirePhase = busWirePhaseWaitCmdAck
+		}
+	case busWirePhaseWaitCmdAck:
+		switch symbol {
+		case ebusACK:
+			server.busWirePhase = busWirePhaseWaitResponseLen
+		case ebusNACK:
+			// NACK closes the exchange path without target response bytes.
+			server.resetBusWirePhaseLocked(busWirePhaseIdle)
+		}
+	case busWirePhaseWaitResponseLen:
+		server.responseBytesRemain = int(symbol) + 1 // response bytes + CRC
+		server.busWirePhase = busWirePhaseWaitResponseBody
+	case busWirePhaseWaitResponseBody:
+		if server.responseBytesRemain > 0 {
+			server.responseBytesRemain--
+		}
+		if server.responseBytesRemain <= 0 {
+			server.busWirePhase = busWirePhaseWaitResponseAck
+		}
+	case busWirePhaseWaitResponseAck:
+		// Any non-SYN symbol here is the initiator response ACK/NACK.
+		server.resetBusWirePhaseLocked(busWirePhaseIdle)
+	}
 }
 
 func (server *Server) releaseBusToken() {
