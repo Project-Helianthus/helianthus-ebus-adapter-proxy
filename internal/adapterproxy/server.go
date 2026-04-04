@@ -97,6 +97,9 @@ type Server struct {
 	requestBytesSeen      int
 	requestDataLength     int
 	responseBytesRemain   int
+	startArbSeq           uint64
+	startArbGrantSession  uint64
+	startArbContenders    map[uint64]*startArbContender
 
 	pendingStartMu sync.Mutex
 	pendingStart   *pendingStart
@@ -130,6 +133,13 @@ type pendingInfo struct {
 	remaining int
 	infoID    byte
 	frames    []downstream.Frame // accumulated response frames for caching
+}
+
+type startArbContender struct {
+	sessionID uint64
+	initiator byte
+	seq       uint64
+	grantCh   chan struct{}
 }
 
 type pendingStartMode uint8
@@ -216,6 +226,7 @@ func NewServer(cfg Config) *Server {
 		startOfTelegram:     true,
 		observedInitiatorAt: make(map[byte]time.Time),
 		collisionBySession:  make(map[uint64]byte),
+		startArbContenders:  make(map[uint64]*startArbContender),
 		infoCache:           newAdapterInfoCache(),
 		upstreamLost:        make(chan struct{}),
 	}
@@ -562,11 +573,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		server.releaseBusIfOwner(sessionID)
 
 		waitStart := time.Now()
-		select {
-		case <-server.busToken:
-		case <-ctx.Done():
-			return
-		case <-sess.done:
+		if !server.waitForStartArbitration(ctx, sess, sessionID, initiator) {
 			return
 		}
 
@@ -2137,6 +2144,100 @@ func (server *Server) releaseBusToken() {
 	case server.busToken <- struct{}{}:
 	default:
 	}
+	server.mutex.Lock()
+	server.maybeGrantStartArbLocked()
+	server.mutex.Unlock()
+}
+
+func (server *Server) waitForStartArbitration(
+	ctx context.Context,
+	sess *session,
+	sessionID uint64,
+	initiator byte,
+) bool {
+	server.mutex.Lock()
+	grantCh := server.registerStartArbContenderLocked(sessionID, initiator)
+	server.mutex.Unlock()
+
+	defer func() {
+		server.mutex.Lock()
+		server.unregisterStartArbContenderLocked(sessionID)
+		server.mutex.Unlock()
+	}()
+
+	select {
+	case <-grantCh:
+	case <-ctx.Done():
+		return false
+	case <-sess.done:
+		return false
+	}
+
+	select {
+	case <-server.busToken:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-sess.done:
+		return false
+	}
+}
+
+func (server *Server) registerStartArbContenderLocked(sessionID uint64, initiator byte) chan struct{} {
+	server.startArbSeq++
+	contender := &startArbContender{
+		sessionID: sessionID,
+		initiator: initiator,
+		seq:       server.startArbSeq,
+		grantCh:   make(chan struct{}),
+	}
+	server.startArbContenders[sessionID] = contender
+	server.maybeGrantStartArbLocked()
+	return contender.grantCh
+}
+
+func (server *Server) unregisterStartArbContenderLocked(sessionID uint64) {
+	delete(server.startArbContenders, sessionID)
+	if server.startArbGrantSession == sessionID {
+		server.startArbGrantSession = 0
+	}
+	server.maybeGrantStartArbLocked()
+}
+
+func (server *Server) maybeGrantStartArbLocked() {
+	if server.startArbGrantSession != 0 {
+		return
+	}
+	if server.busOwner != 0 {
+		return
+	}
+	if len(server.busToken) == 0 {
+		return
+	}
+	winner := server.pickStartArbWinnerLocked()
+	if winner == nil {
+		return
+	}
+	server.startArbGrantSession = winner.sessionID
+	close(winner.grantCh)
+}
+
+func (server *Server) pickStartArbWinnerLocked() *startArbContender {
+	var winner *startArbContender
+	for _, contender := range server.startArbContenders {
+		if winner == nil {
+			winner = contender
+			continue
+		}
+		if contender.initiator < winner.initiator {
+			winner = contender
+			continue
+		}
+		if contender.initiator == winner.initiator && contender.seq < winner.seq {
+			winner = contender
+		}
+	}
+	return winner
 }
 
 func (server *Server) acquireLease(sessionID uint64, initiator byte) (byte, error) {

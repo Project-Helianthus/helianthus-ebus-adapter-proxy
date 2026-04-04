@@ -2,6 +2,7 @@ package adapterproxy
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -583,6 +584,315 @@ func TestDeliverPendingStartENHStartedMismatchExpiresBounded(t *testing.T) {
 	if got := server.staleStartExpired.Load(); got != 1 {
 		t.Fatalf("staleStartExpired = %d; want 1", got)
 	}
+}
+
+type deterministicStartUpstream struct {
+	readCh  chan downstream.Frame
+	writeCh chan downstream.Frame
+}
+
+func newDeterministicStartUpstream() *deterministicStartUpstream {
+	return &deterministicStartUpstream{
+		readCh:  make(chan downstream.Frame, 32),
+		writeCh: make(chan downstream.Frame, 32),
+	}
+}
+
+func (upstream *deterministicStartUpstream) Close() error {
+	close(upstream.readCh)
+	return nil
+}
+
+func (upstream *deterministicStartUpstream) ReadFrame() (downstream.Frame, error) {
+	frame, ok := <-upstream.readCh
+	if !ok {
+		return downstream.Frame{}, io.EOF
+	}
+	return frame, nil
+}
+
+func (upstream *deterministicStartUpstream) WriteFrame(frame downstream.Frame) error {
+	upstream.writeCh <- frame
+	if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHReqStart && len(frame.Payload) == 1 {
+		upstream.readCh <- downstream.Frame{
+			Command: byte(southboundenh.ENHResStarted),
+			Payload: []byte{frame.Payload[0]},
+		}
+	}
+	return nil
+}
+
+func (upstream *deterministicStartUpstream) SendInit(features byte) error {
+	return nil
+}
+
+func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
+	t.Parallel()
+
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+	server.setBusOwner(99, 0x10)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	highDone := make(chan struct{})
+	lowDone := make(chan struct{})
+
+	go func() {
+		defer close(highDone)
+		server.handleStart(ctx, 1, 0x71)
+	}()
+	go func() {
+		defer close(lowDone)
+		server.handleStart(ctx, 2, 0x31)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 2
+	}) {
+		t.Fatalf("expected two arbitration contenders before boundary release")
+	}
+
+	server.releaseBusIfOwner(99)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 {
+			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
+		}
+		if frame.Payload[0] != 0x31 {
+			t.Fatalf("first START initiator = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected first START write after boundary release")
+	}
+
+	select {
+	case <-lowDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("lower-initiator START did not complete")
+	}
+
+	cancel()
+	select {
+	case <-highDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("higher-initiator START did not exit after cancellation")
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestHandleStartArbitrationRequeueAfterTimeoutStillPrefersLowerInitiator(t *testing.T) {
+	t.Parallel()
+
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+	server.setBusOwner(99, 0x10)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	highDone := make(chan struct{})
+	go func() {
+		defer close(highDone)
+		server.handleStart(ctx, 1, 0x71)
+	}()
+
+	ctxLow1, cancelLow1 := context.WithCancel(ctx)
+	low1Done := make(chan struct{})
+	go func() {
+		defer close(low1Done)
+		server.handleStart(ctxLow1, 2, 0x31)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 2
+	}) {
+		t.Fatalf("expected first low contender to join before cancellation")
+	}
+
+	cancelLow1()
+	select {
+	case <-low1Done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("first low contender did not exit after cancellation")
+	}
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 1
+	}) {
+		t.Fatalf("expected contender set to shrink after first low cancellation")
+	}
+
+	low2Done := make(chan struct{})
+	go func() {
+		defer close(low2Done)
+		server.handleStart(ctx, 2, 0x31)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 2
+	}) {
+		t.Fatalf("expected requeued low contender before boundary release")
+	}
+
+	server.releaseBusIfOwner(99)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 {
+			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
+		}
+		if frame.Payload[0] != 0x31 {
+			t.Fatalf("first START initiator after requeue = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected first START write after boundary release")
+	}
+
+	select {
+	case <-low2Done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("requeued low contender START did not complete")
+	}
+
+	cancel()
+	select {
+	case <-highDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("higher-initiator START did not exit after cancellation")
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestHandleStartArbitrationEqualInitiatorKeepsFIFO(t *testing.T) {
+	t.Parallel()
+
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+	server.setBusOwner(99, 0x10)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	firstDone := make(chan struct{})
+	secondDone := make(chan struct{})
+
+	go func() {
+		defer close(firstDone)
+		server.handleStart(ctx, 1, 0x31)
+	}()
+	go func() {
+		defer close(secondDone)
+		server.handleStart(ctx, 2, 0x31)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 2
+	}) {
+		t.Fatalf("expected two equal-initiator contenders before boundary release")
+	}
+
+	server.releaseBusIfOwner(99)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 {
+			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
+		}
+		if frame.Payload[0] != 0x31 {
+			t.Fatalf("first START initiator = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected first START write after boundary release")
+	}
+
+	select {
+	case <-firstDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("first contender START did not complete")
+	}
+	select {
+	case <-secondDone:
+		t.Fatalf("second contender completed before cancellation; want FIFO winner to be session 1")
+	default:
+	}
+
+	cancel()
+	select {
+	case <-secondDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("second contender START did not exit after cancellation")
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
 }
 
 func waitUntil(timeout time.Duration, condition func() bool) bool {
