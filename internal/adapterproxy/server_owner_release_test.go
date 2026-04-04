@@ -957,6 +957,14 @@ func TestHandleStartArbitrationEqualInitiatorKeepsFIFO(t *testing.T) {
 		defer close(firstDone)
 		server.handleStart(ctx, 1, 0x31)
 	}()
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		_, hasFirst := server.startArbContenders[1]
+		return len(server.startArbContenders) == 1 && hasFirst
+	}) {
+		t.Fatalf("expected first equal-initiator contender before second joins")
+	}
 	go func() {
 		defer close(secondDone)
 		server.handleStart(ctx, 2, 0x31)
@@ -1007,6 +1015,216 @@ func TestHandleStartArbitrationEqualInitiatorKeepsFIFO(t *testing.T) {
 
 	_ = upstream.Close()
 	server.waitGroup.Wait()
+}
+
+func TestHandleStartAutoJoinReusesLearnedInitiator(t *testing.T) {
+	t.Parallel()
+
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		server.handleStart(ctx, 1, 0x31)
+	}()
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("first START payload = %x; want [31]", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first START write not observed")
+	}
+
+	select {
+	case <-firstDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first START did not complete")
+	}
+
+	server.releaseBusIfOwner(1)
+
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		server.handleStart(ctx, 1, 0x00)
+	}()
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("second upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("second START payload = %x; want learned [31]", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second START write not observed")
+	}
+
+	select {
+	case <-secondDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second START did not complete")
+	}
+
+	mappings := server.SessionInitiatorMappings()
+	if len(mappings) != 1 {
+		t.Fatalf("learned mappings len = %d; want 1", len(mappings))
+	}
+	if mappings[0].SessionID != 1 || mappings[0].Initiator != 0x31 {
+		t.Fatalf(
+			"mapping[0] = session=%d initiator=0x%02X; want session=1 initiator=0x31",
+			mappings[0].SessionID,
+			mappings[0].Initiator,
+		)
+	}
+	if mappings[0].Source != "start" {
+		t.Fatalf("mapping[0] source = %q; want start", mappings[0].Source)
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestHandleStartArbitrationUsesLearnedInitiatorIdentity(t *testing.T) {
+	t.Parallel()
+
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+	server.setBusOwner(99, 0x10)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	server.learnSessionInitiator(1, 0x71, "start")
+	server.learnSessionInitiator(2, 0x31, "start")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	highDone := make(chan struct{})
+	lowDone := make(chan struct{})
+	go func() {
+		defer close(highDone)
+		server.handleStart(ctx, 1, 0x00)
+	}()
+	go func() {
+		defer close(lowDone)
+		server.handleStart(ctx, 2, 0x00)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		return len(server.startArbContenders) == 2
+	}) {
+		t.Fatalf("expected two auto-join contenders before boundary release")
+	}
+
+	server.releaseBusIfOwner(99)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("first START payload = %x; want learned lower [31]", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected first START write after boundary release")
+	}
+
+	select {
+	case <-lowDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("lower learned-initiator START did not complete")
+	}
+
+	cancel()
+	select {
+	case <-highDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("higher learned-initiator START did not exit after cancellation")
+	}
+
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestSessionInitiatorMappingsReflectRequestLearningAndUnregister(t *testing.T) {
+	t.Parallel()
+
+	server := NewServer(Config{})
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+		2: {id: 2, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+	}
+
+	server.learnSessionInitiator(2, 0x71, "start")
+	server.setBusOwner(1, 0x00)
+
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+	for _, symbol := range []byte{0x31, 0x15, 0xB5, 0x00, 0x00, 0x42} {
+		server.noteBusWireSymbol(symbol)
+	}
+
+	mappings := server.SessionInitiatorMappings()
+	if len(mappings) != 2 {
+		t.Fatalf("learned mappings len = %d; want 2", len(mappings))
+	}
+	if mappings[0].SessionID != 1 || mappings[0].Initiator != 0x31 || mappings[0].Source != "request" {
+		t.Fatalf(
+			"mapping[0] = session=%d initiator=0x%02X source=%q; want session=1 initiator=0x31 source=request",
+			mappings[0].SessionID,
+			mappings[0].Initiator,
+			mappings[0].Source,
+		)
+	}
+	if mappings[1].SessionID != 2 || mappings[1].Initiator != 0x71 || mappings[1].Source != "start" {
+		t.Fatalf(
+			"mapping[1] = session=%d initiator=0x%02X source=%q; want session=2 initiator=0x71 source=start",
+			mappings[1].SessionID,
+			mappings[1].Initiator,
+			mappings[1].Source,
+		)
+	}
+
+	server.unregisterSession(1)
+	server.unregisterSession(2)
+	if got := len(server.SessionInitiatorMappings()); got != 0 {
+		t.Fatalf("learned mappings after unregister len = %d; want 0", got)
+	}
 }
 
 func waitUntil(timeout time.Duration, condition func() bool) bool {

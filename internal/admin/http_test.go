@@ -16,8 +16,22 @@ func TestReadOnlyEndpointsReturnStableSchemas(t *testing.T) {
 	statusProvider := stubStatusProvider{
 		status: Status{
 			Sessions: []SessionStatus{
-				{ID: "s-2", Client: "client-b", State: "idle"},
-				{ID: "s-1", Client: "client-a", State: "active"},
+				{
+					ID:                 "s-2",
+					Client:             "client-b",
+					State:              "idle",
+					Initiator:          uint8ptr(0x71),
+					InitiatorSource:    "start",
+					InitiatorLearnedAt: "2026-04-04T19:00:00Z",
+				},
+				{
+					ID:                 "s-1",
+					Client:             "client-a",
+					State:              "active",
+					Initiator:          uint8ptr(0x31),
+					InitiatorSource:    "request",
+					InitiatorLearnedAt: "2026-04-04T19:05:00Z",
+				},
 			},
 			Scheduler: SchedulerStatus{
 				Running:      true,
@@ -68,8 +82,22 @@ func TestReadOnlyEndpointsReturnStableSchemas(t *testing.T) {
 				}
 
 				expectedSessions := []SessionStatus{
-					{ID: "s-1", Client: "client-a", State: "active"},
-					{ID: "s-2", Client: "client-b", State: "idle"},
+					{
+						ID:                 "s-1",
+						Client:             "client-a",
+						State:              "active",
+						Initiator:          uint8ptr(0x31),
+						InitiatorSource:    "request",
+						InitiatorLearnedAt: "2026-04-04T19:05:00Z",
+					},
+					{
+						ID:                 "s-2",
+						Client:             "client-b",
+						State:              "idle",
+						Initiator:          uint8ptr(0x71),
+						InitiatorSource:    "start",
+						InitiatorLearnedAt: "2026-04-04T19:00:00Z",
+					},
 				}
 				if !reflect.DeepEqual(response.Sessions, expectedSessions) {
 					t.Fatalf("expected sorted sessions %#v, got %#v", expectedSessions, response.Sessions)
@@ -81,7 +109,14 @@ func TestReadOnlyEndpointsReturnStableSchemas(t *testing.T) {
 					"sessions",
 					0,
 				)
-				assertObjectKeys(t, firstSessionObject, []string{"id", "client", "state"})
+				assertObjectKeys(t, firstSessionObject, []string{
+					"id",
+					"client",
+					"state",
+					"initiator",
+					"initiator_source",
+					"initiator_learned_at",
+				})
 			},
 		},
 		{
@@ -350,4 +385,8 @@ func assertObjectKeys(t *testing.T, object map[string]interface{}, expectedKeys 
 	if !reflect.DeepEqual(actualKeys, sortedExpectedKeys) {
 		t.Fatalf("expected keys %v, got %v", sortedExpectedKeys, actualKeys)
 	}
+}
+
+func uint8ptr(value uint8) *uint8 {
+	return &value
 }
