@@ -1,8 +1,11 @@
 package adapterproxy
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -367,3 +370,75 @@ func TestTCPPlainUpstreamReadFrameOnClosedConnection(t *testing.T) {
 		t.Fatalf("ReadFrame error = nil; want non-nil")
 	}
 }
+
+func TestENHUpstreamReadFrameResetsParserAfterNonTimeoutError(t *testing.T) {
+	t.Parallel()
+
+	readErr := errors.New("scripted read failure")
+	conn := &scriptedConn{
+		steps: []scriptedReadStep{
+			{data: []byte{0xC4}},
+			{err: readErr},
+			{data: []byte{0x31}},
+		},
+	}
+
+	client := &upstreamClient{
+		conn:         conn,
+		reader:       bufio.NewReader(conn),
+		readTimeout:  time.Second,
+		writeTimeout: time.Second,
+	}
+
+	_, err := client.ReadFrame()
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ReadFrame error = %v; want %v", err, readErr)
+	}
+
+	frame, err := client.ReadFrame()
+	if err != nil {
+		t.Fatalf("second ReadFrame error = %v", err)
+	}
+	if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResReceived {
+		t.Fatalf("second ReadFrame command = 0x%02X; want ENHResReceived", frame.Command)
+	}
+	if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+		t.Fatalf("second ReadFrame payload = %x; want [31]", frame.Payload)
+	}
+}
+
+type scriptedReadStep struct {
+	data []byte
+	err  error
+}
+
+type scriptedConn struct {
+	steps []scriptedReadStep
+	index int
+}
+
+func (conn *scriptedConn) Read(buffer []byte) (int, error) {
+	if conn.index >= len(conn.steps) {
+		return 0, io.EOF
+	}
+	step := conn.steps[conn.index]
+	conn.index++
+	if len(step.data) > 0 {
+		n := copy(buffer, step.data)
+		return n, step.err
+	}
+	return 0, step.err
+}
+
+func (*scriptedConn) Write([]byte) (int, error)        { return 0, io.ErrClosedPipe }
+func (*scriptedConn) Close() error                     { return nil }
+func (*scriptedConn) LocalAddr() net.Addr              { return scriptedAddr("local") }
+func (*scriptedConn) RemoteAddr() net.Addr             { return scriptedAddr("remote") }
+func (*scriptedConn) SetDeadline(time.Time) error      { return nil }
+func (*scriptedConn) SetReadDeadline(time.Time) error  { return nil }
+func (*scriptedConn) SetWriteDeadline(time.Time) error { return nil }
+
+type scriptedAddr string
+
+func (addr scriptedAddr) Network() string { return "scripted" }
+func (addr scriptedAddr) String() string  { return string(addr) }

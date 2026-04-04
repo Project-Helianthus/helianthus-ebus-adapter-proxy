@@ -150,7 +150,7 @@ func TestNoteBusWireSymbolMarksDirtyForOwnedTraffic(t *testing.T) {
 	}
 }
 
-func TestHandleSendRefreshesBusOwnershipTimestamp(t *testing.T) {
+func TestHandleSendDoesNotRefreshBusOwnershipTimestamp(t *testing.T) {
 	t.Parallel()
 
 	upstream := newFakeUpstream()
@@ -177,11 +177,11 @@ func TestHandleSendRefreshesBusOwnershipTimestamp(t *testing.T) {
 	if !dirty {
 		t.Fatalf("busDirty = false; want true")
 	}
-	if ownedAt.IsZero() {
-		t.Fatalf("busOwned is zero; want refreshed timestamp")
-	}
-	if elapsed := time.Since(ownedAt); elapsed > 2*time.Second {
-		t.Fatalf("busOwned too old: elapsed=%s", elapsed)
+	// busOwned must NOT be refreshed by handleSend — it stays as set by
+	// setBusOwner so that maxOwnershipDuration and busIdleReleaseGrace
+	// measure from initial ownership, preventing indefinite chaining.
+	if !ownedAt.IsZero() {
+		t.Fatalf("busOwned = %v; want zero (not refreshed by SEND)", ownedAt)
 	}
 }
 

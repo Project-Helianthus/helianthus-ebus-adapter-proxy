@@ -20,11 +20,16 @@ import (
 	southboundenh "github.com/Project-Helianthus/helianthus-ebus-adapter-proxy/internal/southbound/enh"
 )
 
+// ErrUpstreamLost is returned by Serve when the upstream adapter connection
+// drops unexpectedly. Callers should reconnect by creating a new Server.
+var ErrUpstreamLost = errors.New("upstream connection lost")
+
 const (
 	defaultLeaseDuration     = 30 * time.Minute
 	ebusSyn                  = byte(0xAA)
 	udpBridgeOwnerID         = ^uint64(0)
-	busIdleReleaseGrace      = 400 * time.Millisecond
+	busIdleReleaseGrace      = 50 * time.Millisecond
+	maxOwnershipDuration     = 2 * time.Second
 	udpPlainSynWait          = 5 * time.Second
 	udpPlainBootstrapWait    = 250 * time.Millisecond
 	udpPlainStartWaitDefault = 5 * time.Second
@@ -93,6 +98,8 @@ type Server struct {
 	leaseManager *sourcepolicy.LeaseManager
 	leasedBySess map[uint64]sourcepolicy.Lease
 
+	upstreamLost chan struct{}
+
 	waitGroup sync.WaitGroup
 }
 
@@ -159,6 +166,7 @@ func NewServer(cfg Config) *Server {
 		observedInitiatorAt: make(map[byte]time.Time),
 		collisionBySession:  make(map[uint64]byte),
 		infoCache:           newAdapterInfoCache(),
+		upstreamLost:        make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
 
@@ -255,13 +263,29 @@ func (server *Server) Serve(ctx context.Context) error {
 		}
 	}
 
+	// Monitor upstream loss: close listener to unblock Accept.
+	go func() {
+		select {
+		case <-server.upstreamLost:
+			_ = listener.Close()
+		case <-ctx.Done():
+		}
+	}()
+
+	upstreamDied := false
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				break
 			}
-			if isClosedNetworkError(err) {
+			// Check if upstream died (triggered listener close).
+			select {
+			case <-server.upstreamLost:
+				upstreamDied = true
+			default:
+			}
+			if upstreamDied || isClosedNetworkError(err) {
 				break
 			}
 			continue
@@ -296,6 +320,9 @@ func (server *Server) Serve(ctx context.Context) error {
 		_ = server.wireLog.Close()
 	}
 
+	if upstreamDied {
+		return ErrUpstreamLost
+	}
 	return nil
 }
 
@@ -348,9 +375,14 @@ func (server *Server) closeSessions() {
 func (server *Server) handleFrame(ctx context.Context, sessionID uint64, frame downstream.Frame) {
 	command := southboundenh.ENHCommand(frame.Command)
 	if len(frame.Payload) != 1 {
+		log.Printf("session=%d frame_dropped cmd=0x%02X payload_len=%d", sessionID, frame.Command, len(frame.Payload))
 		return
 	}
 	data := frame.Payload[0]
+
+	if sessionID != 2 { // Log non-gateway frames
+		log.Printf("session=%d frame cmd=0x%02X data=0x%02X", sessionID, frame.Command, data)
+	}
 
 	switch command {
 	case southboundenh.ENHReqInit:
@@ -389,9 +421,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 
-	if server.cfg.Debug {
-		log.Printf("session=%d start initiator=0x%02X", sessionID, initiator)
-	}
+	log.Printf("session=%d handle_start initiator=0x%02X", sessionID, initiator)
 
 	if initiator == ebusSyn {
 		server.handleStartCancel(sessionID)
@@ -465,10 +495,21 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	ownedBySession := func() bool {
 		server.mutex.Lock()
 		defer server.mutex.Unlock()
-		return server.busOwner == sessionID
+		if server.busOwner != sessionID {
+			return false
+		}
+		// Prevent indefinite ownership chaining: force token re-acquisition
+		// after maxOwnershipDuration so other sessions get a fair chance.
+		if !server.busOwned.IsZero() && time.Since(server.busOwned) > maxOwnershipDuration {
+			return false
+		}
+		return true
 	}()
 
 	if !ownedBySession {
+		// If we were the owner but exceeded maxOwnershipDuration, release first.
+		server.releaseBusIfOwner(sessionID)
+
 		waitStart := time.Now()
 		select {
 		case <-server.busToken:
@@ -485,7 +526,6 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		server.mutex.Lock()
 		if server.busOwner == sessionID {
 			server.busDirty = true
-			server.busOwned = time.Now().UTC()
 		}
 		server.mutex.Unlock()
 		if server.cfg.Debug {
@@ -843,7 +883,9 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 
 	server.mutex.Lock()
 	server.busDirty = true
-	server.busOwned = time.Now().UTC()
+	// busOwned is only set in setBusOwner — not reset per SEND byte.
+	// This ensures maxOwnershipDuration and busIdleReleaseGrace measure
+	// from initial ownership, preventing indefinite chaining.
 	server.mutex.Unlock()
 
 	sendFrame := downstream.Frame{
@@ -1084,9 +1126,14 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				continue
 			}
 			if errors.Is(err, io.EOF) || isClosedNetworkError(err) {
+				log.Printf("upstream_connection_lost error=%q", err)
 				observerFrames, skipPendingID := server.takeObserverReplayForAbort()
 				if len(observerFrames) > 0 {
 					server.broadcastObserverFrames(observerFrames, skipPendingID)
+				}
+				select {
+				case server.upstreamLost <- struct{}{}:
+				default:
 				}
 				return
 			}
@@ -1222,19 +1269,24 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 	if len(frame.Payload) > 0 {
 		frameData = frame.Payload[0]
 	}
-	if server.cfg.Debug {
-		log.Printf(
-			"session=%d upstream_start_result cmd=0x%02X data=0x%02X",
-			pending.sessionID,
-			frame.Command,
-			frameData,
-		)
-	}
+	log.Printf(
+		"session=%d upstream_start_result cmd=0x%02X data=0x%02X initiator=0x%02X",
+		pending.sessionID,
+		frame.Command,
+		frameData,
+		pending.initiator,
+	)
 
 	forwarded := cloneFrame(frame)
 	if pending.mode == pendingStartModeENH &&
 		southboundenh.ENHCommand(forwarded.Command) == southboundenh.ENHResStarted &&
 		frameData != pending.initiator {
+		log.Printf(
+			"session=%d address_mismatch requested=0x%02X adapter_won=0x%02X -> converting STARTED to FAILED",
+			pending.sessionID,
+			pending.initiator,
+			frameData,
+		)
 		forwarded.Command = byte(southboundenh.ENHResFailed)
 		forwarded.Payload = []byte{frameData}
 	}
