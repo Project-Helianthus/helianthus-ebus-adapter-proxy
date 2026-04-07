@@ -1387,9 +1387,9 @@ func TestRunUpstreamReaderConsecutiveResettedsBothReInit(t *testing.T) {
 		t.Fatal("first SendInit not called")
 	}
 
-	// Wait for initResponseWindow (500ms) to expire so second RESETTED
+	// Wait for initResponseWindow (2s) to expire so second RESETTED
 	// is NOT misclassified as an INIT response.
-	time.Sleep(600 * time.Millisecond)
+	time.Sleep(2100 * time.Millisecond)
 
 	// Second spontaneous RESETTED → should also trigger re-INIT.
 	upstream.readCh <- downstream.Frame{
