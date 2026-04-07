@@ -688,6 +688,10 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	select {
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
+		select {
+		case <-respCh:
+		default:
+		}
 		if !ownedBySession {
 			server.releaseLease(sessionID)
 		}
@@ -697,6 +701,10 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	case <-sess.done:
 		server.clearPendingStart(sessionID)
+		select {
+		case <-respCh:
+		default:
+		}
 		if !ownedBySession {
 			server.releaseLease(sessionID)
 		}
@@ -869,6 +877,19 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		}
 		if server.cfg.Debug && waitedForSyn {
 			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
+		}
+
+		// Re-validate pendingStart after SYN wait — RESETTED during the wait
+		// may have aborted it. If so, drain respCh and retry.
+		server.pendingStartMu.Lock()
+		pendingValid := server.pendingStart != nil && server.pendingStart.sessionID == sessionID
+		server.pendingStartMu.Unlock()
+		if !pendingValid {
+			select {
+			case <-respCh:
+			default:
+			}
+			continue
 		}
 
 		server.logWireTX(initiator)
@@ -1363,11 +1384,11 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				case server.reinitGuard <- struct{}{}:
 					go func() {
 						defer func() { <-server.reinitGuard }()
-						server.initSentAtNano.Store(time.Now().UnixNano())
 						if err := server.upstream.SendInit(0x01); err != nil {
-							server.initSentAtNano.Store(0)
 							log.Printf("resetted_reinit_failed error=%q", err)
+							return
 						}
+						server.initSentAtNano.Store(time.Now().UnixNano())
 					}()
 				default:
 					log.Printf("resetted_reinit_skipped already_in_flight=true")
