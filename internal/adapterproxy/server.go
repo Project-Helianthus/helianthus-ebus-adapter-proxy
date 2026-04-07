@@ -44,7 +44,7 @@ const (
 	defaultRetryJitter       = 0.2
 	defaultAutoJoinWarmup    = 5 * time.Second
 	udpNorthboundQueueCap    = 1024
-	initResponseWindow       = 5 * time.Second
+	initResponseWindow       = 500 * time.Millisecond
 )
 
 type udpDatagram struct {
