@@ -64,9 +64,10 @@ type Server struct {
 	udpClients   map[string]*net.UDPAddr
 	udpQueue     chan udpDatagram
 
-	upstreamFeatures atomic.Uint32
-	reinitGuard      chan struct{} // buffered(1), limits re-INIT to one in-flight
-	lastWireRXAtNano atomic.Int64
+	upstreamFeatures    atomic.Uint32
+	reinitGuard         chan struct{} // buffered(1), limits re-INIT to one in-flight
+	expectingInitResp   atomic.Bool  // true when we sent INIT and expect RESETTED response
+	lastWireRXAtNano    atomic.Int64
 
 	backpressureDrops   atomic.Uint64
 	backpressureCloses  atomic.Uint64
@@ -333,7 +334,9 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 	// Request additional infos up-front so downstream clients can query INFO without
 	// being sensitive to proxy initialization ordering.
+	server.expectingInitResp.Store(true)
 	if err := server.upstream.SendInit(0x01); err != nil {
+		server.expectingInitResp.Store(false)
 		// Best-effort: some adapters respond with RESETTED, others start streaming immediately.
 	}
 
@@ -1340,17 +1343,24 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			}
 
 			// Re-INIT upstream — adapter needs fresh handshake after reset.
-			// Guard ensures at most one re-INIT goroutine is in-flight.
-			select {
-			case server.reinitGuard <- struct{}{}:
-				go func() {
-					defer func() { <-server.reinitGuard }()
-					if err := server.upstream.SendInit(0x01); err != nil {
-						log.Printf("resetted_reinit_failed error=%q", err)
-					}
-				}()
-			default:
-				log.Printf("resetted_reinit_skipped already_in_flight=true")
+			// Skip if this RESETTED is itself a response to our INIT (avoids
+			// INIT→RESETTED→INIT feedback loop). Guard limits concurrency.
+			if server.expectingInitResp.CompareAndSwap(true, false) {
+				log.Printf("resetted_is_init_response reinit_skipped=true")
+			} else {
+				select {
+				case server.reinitGuard <- struct{}{}:
+					server.expectingInitResp.Store(true)
+					go func() {
+						defer func() { <-server.reinitGuard }()
+						if err := server.upstream.SendInit(0x01); err != nil {
+							server.expectingInitResp.Store(false)
+							log.Printf("resetted_reinit_failed error=%q", err)
+						}
+					}()
+				default:
+					log.Printf("resetted_reinit_skipped already_in_flight=true")
+				}
 			}
 
 			server.broadcast(frame)

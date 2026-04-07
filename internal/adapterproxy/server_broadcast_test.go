@@ -1209,3 +1209,46 @@ func TestRunUpstreamReaderResettedSendsReInit(t *testing.T) {
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+func TestRunUpstreamReaderResettedAfterInitDoesNotReInit(t *testing.T) {
+	t.Parallel()
+
+	upstream := newInitRecordingUpstream()
+	server := &Server{
+		cfg:      Config{UpstreamTransport: UpstreamENH},
+		upstream: upstream,
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		},
+		synCh:       make(chan struct{}, 1),
+		busToken:    make(chan struct{}, 1),
+		reinitGuard: make(chan struct{}, 1),
+		infoCache:   newAdapterInfoCache(),
+	}
+	// Simulate that we just sent INIT and are expecting the RESETTED response.
+	server.expectingInitResp.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	// This RESETTED is the response to our INIT — should NOT trigger re-INIT.
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	// Verify no SendInit was called.
+	select {
+	case <-upstream.initCalls:
+		t.Fatal("SendInit called after INIT-response RESETTED — feedback loop not prevented")
+	case <-time.After(200 * time.Millisecond):
+		// Good — no re-INIT sent.
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
