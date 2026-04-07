@@ -1226,7 +1226,7 @@ func TestRunUpstreamReaderResettedAfterInitDoesNotReInit(t *testing.T) {
 		infoCache:   newAdapterInfoCache(),
 	}
 	// Simulate that we just sent INIT and are expecting the RESETTED response.
-	server.expectingInitResp.Store(true)
+	server.initSentAtNano.Store(time.Now().UnixNano())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

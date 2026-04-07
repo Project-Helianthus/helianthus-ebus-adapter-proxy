@@ -44,6 +44,7 @@ const (
 	defaultRetryJitter       = 0.2
 	defaultAutoJoinWarmup    = 5 * time.Second
 	udpNorthboundQueueCap    = 1024
+	initResponseWindow       = 5 * time.Second
 )
 
 type udpDatagram struct {
@@ -65,8 +66,8 @@ type Server struct {
 	udpQueue     chan udpDatagram
 
 	upstreamFeatures    atomic.Uint32
-	reinitGuard         chan struct{} // buffered(1), limits re-INIT to one in-flight
-	expectingInitResp   atomic.Bool  // true when we sent INIT and expect RESETTED response
+	reinitGuard         chan struct{}  // buffered(1), limits re-INIT to one in-flight
+	initSentAtNano      atomic.Int64  // UnixNano of last SendInit; 0 = no pending INIT
 	lastWireRXAtNano    atomic.Int64
 
 	backpressureDrops   atomic.Uint64
@@ -334,9 +335,9 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 	// Request additional infos up-front so downstream clients can query INFO without
 	// being sensitive to proxy initialization ordering.
-	server.expectingInitResp.Store(true)
+	server.initSentAtNano.Store(time.Now().UnixNano())
 	if err := server.upstream.SendInit(0x01); err != nil {
-		server.expectingInitResp.Store(false)
+		server.initSentAtNano.Store(0)
 		// Best-effort: some adapters respond with RESETTED, others start streaming immediately.
 	}
 
@@ -1343,18 +1344,19 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			}
 
 			// Re-INIT upstream — adapter needs fresh handshake after reset.
-			// Skip if this RESETTED is itself a response to our INIT (avoids
-			// INIT→RESETTED→INIT feedback loop). Guard limits concurrency.
-			if server.expectingInitResp.CompareAndSwap(true, false) {
-				log.Printf("resetted_is_init_response reinit_skipped=true")
+			// Skip if this RESETTED is itself a response to our recent INIT
+			// (avoids INIT→RESETTED→INIT feedback loop). The timestamp auto-
+			// expires so adapters that ignore INIT don't block future recovery.
+			if sentAt := server.initSentAtNano.Swap(0); sentAt > 0 && time.Since(time.Unix(0, sentAt)) < initResponseWindow {
+				log.Printf("resetted_is_init_response reinit_skipped=true age=%s", time.Since(time.Unix(0, sentAt)))
 			} else {
 				select {
 				case server.reinitGuard <- struct{}{}:
-					server.expectingInitResp.Store(true)
 					go func() {
 						defer func() { <-server.reinitGuard }()
+						server.initSentAtNano.Store(time.Now().UnixNano())
 						if err := server.upstream.SendInit(0x01); err != nil {
-							server.expectingInitResp.Store(false)
+							server.initSentAtNano.Store(0)
 							log.Printf("resetted_reinit_failed error=%q", err)
 						}
 					}()
