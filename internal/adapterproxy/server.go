@@ -671,26 +671,10 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	// or an error/disconnect. If we are reusing an existing ownership, do not touch
 	// the token here.
 
-	select {
-	case <-ctx.Done():
-		if !ownedBySession {
-			server.releaseLease(sessionID)
-		}
-		if !ownedBySession {
-			server.releaseBusToken()
-		}
-		return
-	case <-sess.done:
-		if !ownedBySession {
-			server.releaseLease(sessionID)
-		}
-		if !ownedBySession {
-			server.releaseBusToken()
-		}
-		return
-	default:
-	}
-
+	// Register pendingStart immediately after busToken acquire so the RESETTED
+	// handler can always see and abort it. Without this, a RESETTED arriving in
+	// the gap between busToken acquire and pendingStart set would go unnoticed,
+	// causing a hang bounded only by the 5s respCh timeout.
 	respCh := make(chan downstream.Frame, 1)
 	server.pendingStartMu.Lock()
 	server.pendingStart = &pendingStart{
@@ -700,6 +684,28 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		initiator: initiator,
 	}
 	server.pendingStartMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		return
+	case <-sess.done:
+		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		return
+	default:
+	}
 
 	startFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqStart),
@@ -842,16 +848,8 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	}()
 
 	for attempt := 0; attempt < udpPlainMaxAttempts; attempt++ {
-		server.clearSynSignal()
-
-		waitedForSyn, ok := server.waitForUDPPlainIdleSyn(ctx, sess, sessionID, attempt+1)
-		if !ok {
-			return
-		}
-		if server.cfg.Debug && waitedForSyn {
-			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
-		}
-
+		// Register pendingStart before SYN wait so RESETTED handler can
+		// abort it at any point (same rationale as ENH path).
 		respCh := make(chan downstream.Frame, 1)
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
@@ -861,6 +859,17 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			initiator: initiator,
 		}
 		server.pendingStartMu.Unlock()
+
+		server.clearSynSignal()
+
+		waitedForSyn, ok := server.waitForUDPPlainIdleSyn(ctx, sess, sessionID, attempt+1)
+		if !ok {
+			server.clearPendingStart(sessionID)
+			return
+		}
+		if server.cfg.Debug && waitedForSyn {
+			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
+		}
 
 		server.logWireTX(initiator)
 		if err := server.upstream.WriteFrame(downstream.Frame{
