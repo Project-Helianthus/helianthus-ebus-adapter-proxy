@@ -1289,11 +1289,13 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 
 		switch southboundenh.ENHCommand(frame.Command) {
 		case southboundenh.ENHResResetted:
+			features := byte(0x00)
 			if len(frame.Payload) == 1 {
-				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
+				features = frame.Payload[0]
+				server.upstreamFeatures.Store(uint32(features))
 			}
 			server.infoCache.invalidateAll()
-			log.Printf("upstream_resetted features=0x%02X", frame.Payload[0])
+			log.Printf("upstream_resetted features=0x%02X", features)
 
 			// Abort pending START — adapter reset means arbitration is void.
 			server.pendingStartMu.Lock()
@@ -1309,6 +1311,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				case ps.respCh <- cloneFrame(failedFrame):
 				default:
 				}
+				server.reply(ps.sessionID, failedFrame)
 			} else {
 				server.pendingStartMu.Unlock()
 			}
