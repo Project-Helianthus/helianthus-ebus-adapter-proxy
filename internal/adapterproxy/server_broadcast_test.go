@@ -1252,3 +1252,159 @@ func TestRunUpstreamReaderResettedAfterInitDoesNotReInit(t *testing.T) {
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+func TestRunUpstreamReaderResettedReleasesBusOwner(t *testing.T) {
+	t.Parallel()
+
+	upstream := newInitRecordingUpstream()
+	server := &Server{
+		cfg:      Config{UpstreamTransport: UpstreamENH},
+		upstream: upstream,
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		},
+		synCh:                  make(chan struct{}, 1),
+		busToken:               make(chan struct{}, 1),
+		reinitGuard:            make(chan struct{}, 1),
+		infoCache:              newAdapterInfoCache(),
+		observedInitiatorAt:    make(map[byte]time.Time),
+		collisionBySession:     make(map[uint64]byte),
+		learnedBySession:       make(map[uint64]sessionInitiatorLearning),
+		localRespondersByTarget: make(map[byte]targetResponderAssociation),
+		startArbContenders:     make(map[uint64]*startArbContender),
+	}
+	// Session 1 owns the bus.
+	server.setBusOwner(1, 0x10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	// Allow handler to run.
+	time.Sleep(50 * time.Millisecond)
+
+	if owner := server.currentBusOwner(); owner != 0 {
+		t.Fatalf("busOwner = %d after RESETTED; want 0", owner)
+	}
+
+	// busToken should be released back.
+	select {
+	case <-server.busToken:
+		// Good — token available.
+	default:
+		t.Fatal("busToken not released after RESETTED")
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderResettedBroadcastsToAllSessions(t *testing.T) {
+	t.Parallel()
+
+	upstream := newInitRecordingUpstream()
+	server := &Server{
+		cfg:      Config{UpstreamTransport: UpstreamENH},
+		upstream: upstream,
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+			2: {id: 2, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
+		},
+		synCh:       make(chan struct{}, 1),
+		busToken:    make(chan struct{}, 1),
+		reinitGuard: make(chan struct{}, 1),
+		infoCache:   newAdapterInfoCache(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	for _, sid := range []uint64{1, 2} {
+		sess := server.sessions[sid]
+		select {
+		case frame := <-sess.sendCh:
+			if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResResetted {
+				t.Fatalf("session=%d command=0x%02X; want ENHResResetted", sid, frame.Command)
+			}
+		case <-time.After(500 * time.Millisecond):
+			t.Fatalf("session=%d did not receive RESETTED broadcast", sid)
+		}
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestRunUpstreamReaderConsecutiveResettedsBothReInit(t *testing.T) {
+	t.Parallel()
+
+	upstream := newInitRecordingUpstream()
+	server := &Server{
+		cfg:      Config{UpstreamTransport: UpstreamENH},
+		upstream: upstream,
+		sessions: map[uint64]*session{
+			1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+		},
+		synCh:       make(chan struct{}, 1),
+		busToken:    make(chan struct{}, 1),
+		reinitGuard: make(chan struct{}, 1),
+		infoCache:   newAdapterInfoCache(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	// First spontaneous RESETTED → triggers re-INIT.
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	select {
+	case <-upstream.initCalls:
+		// Good — first re-INIT sent.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("first SendInit not called")
+	}
+
+	// Wait for initResponseWindow (500ms) to expire so second RESETTED
+	// is NOT misclassified as an INIT response.
+	time.Sleep(600 * time.Millisecond)
+
+	// Second spontaneous RESETTED → should also trigger re-INIT.
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	select {
+	case <-upstream.initCalls:
+		// Good — second re-INIT sent.
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second SendInit not called after window expiry")
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
