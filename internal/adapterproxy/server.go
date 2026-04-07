@@ -1288,12 +1288,61 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		}
 
 		switch southboundenh.ENHCommand(frame.Command) {
-		case southboundenh.ENHResReceived, southboundenh.ENHResResetted:
-			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResResetted && len(frame.Payload) == 1 {
+		case southboundenh.ENHResResetted:
+			if len(frame.Payload) == 1 {
 				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
-				server.infoCache.invalidateAll()
 			}
-			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
+			server.infoCache.invalidateAll()
+			log.Printf("upstream_resetted features=0x%02X", frame.Payload[0])
+
+			// Abort pending START — adapter reset means arbitration is void.
+			server.pendingStartMu.Lock()
+			if ps := server.pendingStart; ps != nil {
+				server.pendingStart = nil
+				server.pendingStartMu.Unlock()
+				log.Printf("session=%d resetted_abort_pending_start initiator=0x%02X", ps.sessionID, ps.initiator)
+				failedFrame := downstream.Frame{
+					Command: byte(southboundenh.ENHResFailed),
+					Payload: []byte{ps.initiator},
+				}
+				select {
+				case ps.respCh <- cloneFrame(failedFrame):
+				default:
+				}
+			} else {
+				server.pendingStartMu.Unlock()
+			}
+
+			// Abort pending INFO — adapter reset invalidates in-flight info.
+			server.pendingInfoMu.Lock()
+			if pi := server.pendingInfo; pi != nil {
+				server.pendingInfo = nil
+				server.pendingInfoMu.Unlock()
+				log.Printf("session=%d resetted_abort_pending_info infoID=0x%02X", pi.sessionID, pi.infoID)
+				server.reply(pi.sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				})
+			} else {
+				server.pendingInfoMu.Unlock()
+			}
+
+			// Release bus if owned — adapter reset invalidates bus ownership.
+			if owner := server.currentBusOwner(); owner != 0 {
+				log.Printf("session=%d resetted_release_bus_owner", owner)
+				server.releaseBusIfOwner(owner)
+			}
+
+			// Re-INIT upstream — adapter needs fresh handshake after reset.
+			go func() {
+				if err := server.upstream.SendInit(0x01); err != nil {
+					log.Printf("resetted_reinit_failed error=%q", err)
+				}
+			}()
+
+			server.broadcast(frame)
+		case southboundenh.ENHResReceived:
+			if len(frame.Payload) == 1 {
 				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
 				if server.cfg.Debug {
 					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
