@@ -65,6 +65,7 @@ type Server struct {
 	udpQueue     chan udpDatagram
 
 	upstreamFeatures atomic.Uint32
+	reinitGuard      chan struct{} // buffered(1), limits re-INIT to one in-flight
 	lastWireRXAtNano atomic.Int64
 
 	backpressureDrops   atomic.Uint64
@@ -288,6 +289,7 @@ func NewServer(cfg Config) *Server {
 		localRespondersByTarget: make(map[byte]targetResponderAssociation),
 		startArbContenders:      make(map[uint64]*startArbContender),
 		infoCache:               newAdapterInfoCache(),
+		reinitGuard:             make(chan struct{}, 1),
 		upstreamLost:            make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
@@ -1298,20 +1300,21 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			log.Printf("upstream_resetted features=0x%02X", features)
 
 			// Abort pending START — adapter reset means arbitration is void.
+			// Use ErrorHost (not FAILED) to avoid false collision marking in handleStart.
 			server.pendingStartMu.Lock()
 			if ps := server.pendingStart; ps != nil {
 				server.pendingStart = nil
 				server.pendingStartMu.Unlock()
 				log.Printf("session=%d resetted_abort_pending_start initiator=0x%02X", ps.sessionID, ps.initiator)
-				failedFrame := downstream.Frame{
-					Command: byte(southboundenh.ENHResFailed),
-					Payload: []byte{ps.initiator},
+				abortFrame := downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
 				}
 				select {
-				case ps.respCh <- cloneFrame(failedFrame):
+				case ps.respCh <- cloneFrame(abortFrame):
 				default:
 				}
-				server.reply(ps.sessionID, failedFrame)
+				server.reply(ps.sessionID, abortFrame)
 			} else {
 				server.pendingStartMu.Unlock()
 			}
@@ -1337,11 +1340,18 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			}
 
 			// Re-INIT upstream — adapter needs fresh handshake after reset.
-			go func() {
-				if err := server.upstream.SendInit(0x01); err != nil {
-					log.Printf("resetted_reinit_failed error=%q", err)
-				}
-			}()
+			// Guard ensures at most one re-INIT goroutine is in-flight.
+			select {
+			case server.reinitGuard <- struct{}{}:
+				go func() {
+					defer func() { <-server.reinitGuard }()
+					if err := server.upstream.SendInit(0x01); err != nil {
+						log.Printf("resetted_reinit_failed error=%q", err)
+					}
+				}()
+			default:
+				log.Printf("resetted_reinit_skipped already_in_flight=true")
+			}
 
 			server.broadcast(frame)
 		case southboundenh.ENHResReceived:
