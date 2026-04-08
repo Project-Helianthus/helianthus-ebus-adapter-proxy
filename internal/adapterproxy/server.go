@@ -45,6 +45,19 @@ const (
 	defaultAutoJoinWarmup    = 5 * time.Second
 	udpNorthboundQueueCap    = 1024
 	initResponseWindow       = 2 * time.Second
+
+	// enhCollisionBackoff is the minimum delay between an ENH arbitration
+	// FAILED and releasing the bus token. The PIC16F firmware has a race in
+	// protocol_state_dispatch where rapid START floods bypass the 60-tick
+	// scan deadline and cause transient eBUS signal loss. 50ms lets the
+	// firmware flush its FAILED response, apply the deadline, and reset the
+	// UART state before the next START.
+	enhCollisionBackoff = 50 * time.Millisecond
+
+	// resettedStabilizationDelay is the delay before re-INITing the adapter
+	// after a RESETTED event. Gives the adapter's eBUS transceiver time to
+	// re-initialize before accepting new commands.
+	resettedStabilizationDelay = 200 * time.Millisecond
 )
 
 type udpDatagram struct {
@@ -766,6 +779,12 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorHost {
 				server.releaseBusIfOwner(sessionID)
 			}
+			// 50ms collision backoff for PIC16F firmware race: hold the
+			// bus token briefly so no session can re-START immediately.
+			select {
+			case <-time.After(enhCollisionBackoff):
+			case <-ctx.Done():
+			}
 			if !ownedBySession {
 				server.releaseBusToken()
 			}
@@ -1371,11 +1390,18 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				case server.reinitGuard <- struct{}{}:
 					go func() {
 						defer func() { <-server.reinitGuard }()
+						// Stabilization delay: give the adapter's eBUS
+						// transceiver time to re-initialize before we
+						// send the INIT handshake.
+						time.Sleep(resettedStabilizationDelay)
+						// Store timestamp BEFORE SendInit so a fast
+						// RESETTED response is correctly classified as
+						// an INIT response, not a spontaneous reset.
+						server.initSentAtNano.Store(time.Now().UnixNano())
 						if err := server.upstream.SendInit(0x01); err != nil {
 							log.Printf("resetted_reinit_failed error=%q", err)
 							return
 						}
-						server.initSentAtNano.Store(time.Now().UnixNano())
 					}()
 				default:
 					log.Printf("resetted_reinit_skipped already_in_flight=true")
