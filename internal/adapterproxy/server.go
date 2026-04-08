@@ -1399,6 +1399,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 						// an INIT response, not a spontaneous reset.
 						server.initSentAtNano.Store(time.Now().UnixNano())
 						if err := server.upstream.SendInit(0x01); err != nil {
+							server.initSentAtNano.Store(0) // clear stale marker on failure
 							log.Printf("resetted_reinit_failed error=%q", err)
 							return
 						}
