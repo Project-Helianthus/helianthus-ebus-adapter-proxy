@@ -856,8 +856,19 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	}()
 
 	for attempt := 0; attempt < udpPlainMaxAttempts; attempt++ {
-		// Register pendingStart before SYN wait so RESETTED handler can
-		// abort it at any point (same rationale as ENH path).
+		server.clearSynSignal()
+
+		waitedForSyn, ok := server.waitForUDPPlainIdleSyn(ctx, sess, sessionID, attempt+1)
+		if !ok {
+			return
+		}
+		if server.cfg.Debug && waitedForSyn {
+			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
+		}
+
+		// Register pendingStart AFTER SYN wait — registering before would
+		// cause deliverPendingStartFromArbByte to consume unrelated bus
+		// bytes as arbitration results before we've sent our initiator.
 		respCh := make(chan downstream.Frame, 1)
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
@@ -867,36 +878,6 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			initiator: initiator,
 		}
 		server.pendingStartMu.Unlock()
-
-		server.clearSynSignal()
-
-		waitedForSyn, ok := server.waitForUDPPlainIdleSyn(ctx, sess, sessionID, attempt+1)
-		if !ok {
-			server.clearPendingStart(sessionID)
-			return
-		}
-		if server.cfg.Debug && waitedForSyn {
-			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
-		}
-
-		// Check if RESETTED aborted pendingStart during SYN wait.
-		// If so, respCh has an ErrorHost frame — drain it and exit.
-		select {
-		case abort := <-respCh:
-			if southboundenh.ENHCommand(abort.Command) == southboundenh.ENHResErrorHost {
-				// RESETTED abort — adapter just reset, no point retrying.
-				// RESETTED handler already called reply() to session;
-				// do not send a second ErrorHost.
-				return
-			}
-			// Normal delivery (e.g., wire arb STARTED) — but we haven't
-			// sent our byte yet. This shouldn't happen in normal flow;
-			// treat as unexpected and re-deliver to session.
-			server.reply(sessionID, abort)
-			return
-		default:
-			// No abort — pendingStart is still ours, proceed normally.
-		}
 
 		server.logWireTX(initiator)
 		if err := server.upstream.WriteFrame(downstream.Frame{
