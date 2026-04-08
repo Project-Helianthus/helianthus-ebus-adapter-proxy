@@ -879,17 +879,23 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
 		}
 
-		// Re-validate pendingStart after SYN wait — RESETTED during the wait
-		// may have aborted it. If so, drain respCh and retry.
-		server.pendingStartMu.Lock()
-		pendingValid := server.pendingStart != nil && server.pendingStart.sessionID == sessionID
-		server.pendingStartMu.Unlock()
-		if !pendingValid {
-			select {
-			case <-respCh:
-			default:
+		// Check if RESETTED aborted pendingStart during SYN wait.
+		// If so, respCh has an ErrorHost frame — drain it and exit.
+		select {
+		case abort := <-respCh:
+			if southboundenh.ENHCommand(abort.Command) == southboundenh.ENHResErrorHost {
+				// RESETTED abort — adapter just reset, no point retrying.
+				// RESETTED handler already called reply() to session;
+				// do not send a second ErrorHost.
+				return
 			}
-			continue
+			// Normal delivery (e.g., wire arb STARTED) — but we haven't
+			// sent our byte yet. This shouldn't happen in normal flow;
+			// treat as unexpected and re-deliver to session.
+			server.reply(sessionID, abort)
+			return
+		default:
+			// No abort — pendingStart is still ours, proceed normally.
 		}
 
 		server.logWireTX(initiator)

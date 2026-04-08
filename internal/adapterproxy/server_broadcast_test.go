@@ -1042,14 +1042,16 @@ func containsGatewayStyleTransaction(symbols []byte, initiator byte, target byte
 // --- RESETTED recovery tests ---
 
 type initRecordingUpstream struct {
-	readCh    chan downstream.Frame
-	initCalls chan byte
+	readCh     chan downstream.Frame
+	initCalls  chan byte
+	writeCalls chan downstream.Frame
 }
 
 func newInitRecordingUpstream() *initRecordingUpstream {
 	return &initRecordingUpstream{
-		readCh:    make(chan downstream.Frame, 8),
-		initCalls: make(chan byte, 4),
+		readCh:     make(chan downstream.Frame, 8),
+		initCalls:  make(chan byte, 4),
+		writeCalls: make(chan downstream.Frame, 8),
 	}
 }
 
@@ -1067,6 +1069,7 @@ func (u *initRecordingUpstream) ReadFrame() (downstream.Frame, error) {
 }
 
 func (u *initRecordingUpstream) WriteFrame(frame downstream.Frame) error {
+	u.writeCalls <- frame
 	return nil
 }
 
@@ -1402,6 +1405,69 @@ func TestRunUpstreamReaderConsecutiveResettedsBothReInit(t *testing.T) {
 		// Good — second re-INIT sent.
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("second SendInit not called after window expiry")
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
+func TestHandleStartUDPPlainResettedDuringSynWaitSkipsSTART(t *testing.T) {
+	t.Parallel()
+
+	upstream := newInitRecordingUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamUDPPlain})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start the upstream reader so RESETTED is processed.
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	// Run handleStartUDPPlain in a goroutine — it will block on SYN wait.
+	startDone := make(chan struct{})
+	go func() {
+		defer close(startDone)
+		server.handleStartUDPPlain(ctx, 1, 0x10)
+	}()
+
+	// Give handleStart time to acquire busToken and enter SYN wait.
+	time.Sleep(50 * time.Millisecond)
+
+	// Inject RESETTED — this aborts pendingStart during SYN wait.
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResResetted),
+		Payload: []byte{0x01},
+	}
+
+	// Now deliver SYN so SYN wait completes.
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case server.synCh <- struct{}{}:
+	default:
+	}
+
+	// Wait for handleStart to finish.
+	select {
+	case <-startDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("handleStartUDPPlain did not return after RESETTED + SYN")
+	}
+
+	// Verify NO ENHReqSend (START byte) was written to upstream.
+	select {
+	case frame := <-upstream.writeCalls:
+		if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHReqSend {
+			t.Fatalf("START sent to adapter after RESETTED aborted pendingStart: cmd=0x%02X", frame.Command)
+		}
+	case <-time.After(100 * time.Millisecond):
+		// Good — no START sent.
 	}
 
 	cancel()
