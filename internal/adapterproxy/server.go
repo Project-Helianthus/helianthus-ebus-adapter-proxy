@@ -44,6 +44,20 @@ const (
 	defaultRetryJitter       = 0.2
 	defaultAutoJoinWarmup    = 5 * time.Second
 	udpNorthboundQueueCap    = 1024
+	initResponseWindow       = 2 * time.Second
+
+	// enhCollisionBackoff is the minimum delay between an ENH arbitration
+	// FAILED and releasing the bus token. The PIC16F firmware has a race in
+	// protocol_state_dispatch where rapid START floods bypass the 60-tick
+	// scan deadline and cause transient eBUS signal loss. 50ms lets the
+	// firmware flush its FAILED response, apply the deadline, and reset the
+	// UART state before the next START.
+	enhCollisionBackoff = 50 * time.Millisecond
+
+	// resettedStabilizationDelay is the delay before re-INITing the adapter
+	// after a RESETTED event. Gives the adapter's eBUS transceiver time to
+	// re-initialize before accepting new commands.
+	resettedStabilizationDelay = 200 * time.Millisecond
 )
 
 type udpDatagram struct {
@@ -64,8 +78,10 @@ type Server struct {
 	udpClients   map[string]*net.UDPAddr
 	udpQueue     chan udpDatagram
 
-	upstreamFeatures atomic.Uint32
-	lastWireRXAtNano atomic.Int64
+	upstreamFeatures    atomic.Uint32
+	reinitGuard         chan struct{}  // buffered(1), limits re-INIT to one in-flight
+	initSentAtNano      atomic.Int64  // UnixNano of last SendInit; 0 = no pending INIT
+	lastWireRXAtNano    atomic.Int64
 
 	backpressureDrops   atomic.Uint64
 	backpressureCloses  atomic.Uint64
@@ -288,6 +304,7 @@ func NewServer(cfg Config) *Server {
 		localRespondersByTarget: make(map[byte]targetResponderAssociation),
 		startArbContenders:      make(map[uint64]*startArbContender),
 		infoCache:               newAdapterInfoCache(),
+		reinitGuard:             make(chan struct{}, 1),
 		upstreamLost:            make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
@@ -331,7 +348,9 @@ func (server *Server) Serve(ctx context.Context) error {
 	}
 	// Request additional infos up-front so downstream clients can query INFO without
 	// being sensitive to proxy initialization ordering.
+	server.initSentAtNano.Store(time.Now().UnixNano())
 	if err := server.upstream.SendInit(0x01); err != nil {
+		server.initSentAtNano.Store(0)
 		// Best-effort: some adapters respond with RESETTED, others start streaming immediately.
 	}
 
@@ -665,26 +684,10 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	// or an error/disconnect. If we are reusing an existing ownership, do not touch
 	// the token here.
 
-	select {
-	case <-ctx.Done():
-		if !ownedBySession {
-			server.releaseLease(sessionID)
-		}
-		if !ownedBySession {
-			server.releaseBusToken()
-		}
-		return
-	case <-sess.done:
-		if !ownedBySession {
-			server.releaseLease(sessionID)
-		}
-		if !ownedBySession {
-			server.releaseBusToken()
-		}
-		return
-	default:
-	}
-
+	// Register pendingStart immediately after busToken acquire so the RESETTED
+	// handler can always see and abort it. Without this, a RESETTED arriving in
+	// the gap between busToken acquire and pendingStart set would go unnoticed,
+	// causing a hang bounded only by the 5s respCh timeout.
 	respCh := make(chan downstream.Frame, 1)
 	server.pendingStartMu.Lock()
 	server.pendingStart = &pendingStart{
@@ -694,6 +697,36 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		initiator: initiator,
 	}
 	server.pendingStartMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		server.clearPendingStart(sessionID)
+		select {
+		case <-respCh:
+		default:
+		}
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		return
+	case <-sess.done:
+		server.clearPendingStart(sessionID)
+		select {
+		case <-respCh:
+		default:
+		}
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		return
+	default:
+	}
 
 	startFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqStart),
@@ -745,6 +778,12 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorEBUS ||
 				southboundenh.ENHCommand(response.Command) == southboundenh.ENHResErrorHost {
 				server.releaseBusIfOwner(sessionID)
+			}
+			// 50ms collision backoff for PIC16F firmware race: hold the
+			// bus token briefly so no session can re-START immediately.
+			select {
+			case <-time.After(enhCollisionBackoff):
+			case <-ctx.Done():
 			}
 			if !ownedBySession {
 				server.releaseBusToken()
@@ -846,6 +885,9 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			log.Printf("session=%d attempt=%d udp_plain_syn_acquired=true", sessionID, attempt+1)
 		}
 
+		// Register pendingStart AFTER SYN wait — registering before would
+		// cause deliverPendingStartFromArbByte to consume unrelated bus
+		// bytes as arbitration results before we've sent our initiator.
 		respCh := make(chan downstream.Frame, 1)
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
@@ -1288,12 +1330,88 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		}
 
 		switch southboundenh.ENHCommand(frame.Command) {
-		case southboundenh.ENHResReceived, southboundenh.ENHResResetted:
-			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResResetted && len(frame.Payload) == 1 {
-				server.upstreamFeatures.Store(uint32(frame.Payload[0]))
-				server.infoCache.invalidateAll()
+		case southboundenh.ENHResResetted:
+			features := byte(0x00)
+			if len(frame.Payload) == 1 {
+				features = frame.Payload[0]
+				server.upstreamFeatures.Store(uint32(features))
 			}
-			if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHResReceived && len(frame.Payload) == 1 {
+			server.infoCache.invalidateAll()
+			log.Printf("upstream_resetted features=0x%02X", features)
+
+			// Abort pending START — adapter reset means arbitration is void.
+			// Use ErrorHost (not FAILED) to avoid false collision marking in handleStart.
+			server.pendingStartMu.Lock()
+			if ps := server.pendingStart; ps != nil {
+				server.pendingStart = nil
+				server.pendingStartMu.Unlock()
+				log.Printf("session=%d resetted_abort_pending_start initiator=0x%02X", ps.sessionID, ps.initiator)
+				abortFrame := downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				}
+				select {
+				case ps.respCh <- cloneFrame(abortFrame):
+				default:
+				}
+				server.reply(ps.sessionID, abortFrame)
+			} else {
+				server.pendingStartMu.Unlock()
+			}
+
+			// Abort pending INFO — adapter reset invalidates in-flight info.
+			server.pendingInfoMu.Lock()
+			if pi := server.pendingInfo; pi != nil {
+				server.pendingInfo = nil
+				server.pendingInfoMu.Unlock()
+				log.Printf("session=%d resetted_abort_pending_info infoID=0x%02X", pi.sessionID, pi.infoID)
+				server.reply(pi.sessionID, downstream.Frame{
+					Command: byte(southboundenh.ENHResErrorHost),
+					Payload: []byte{0x00},
+				})
+			} else {
+				server.pendingInfoMu.Unlock()
+			}
+
+			// Release bus if owned — adapter reset invalidates bus ownership.
+			if owner := server.currentBusOwner(); owner != 0 {
+				log.Printf("session=%d resetted_release_bus_owner", owner)
+				server.releaseBusIfOwner(owner)
+			}
+
+			// Re-INIT upstream — adapter needs fresh handshake after reset.
+			// Skip if this RESETTED is itself a response to our recent INIT
+			// (avoids INIT→RESETTED→INIT feedback loop). The timestamp auto-
+			// expires so adapters that ignore INIT don't block future recovery.
+			if sentAt := server.initSentAtNano.Swap(0); sentAt > 0 && time.Since(time.Unix(0, sentAt)) < initResponseWindow {
+				log.Printf("resetted_is_init_response reinit_skipped=true age=%s", time.Since(time.Unix(0, sentAt)))
+			} else {
+				select {
+				case server.reinitGuard <- struct{}{}:
+					go func() {
+						defer func() { <-server.reinitGuard }()
+						// Stabilization delay: give the adapter's eBUS
+						// transceiver time to re-initialize before we
+						// send the INIT handshake.
+						time.Sleep(resettedStabilizationDelay)
+						// Store timestamp BEFORE SendInit so a fast
+						// RESETTED response is correctly classified as
+						// an INIT response, not a spontaneous reset.
+						server.initSentAtNano.Store(time.Now().UnixNano())
+						if err := server.upstream.SendInit(0x01); err != nil {
+							server.initSentAtNano.Store(0) // clear stale marker on failure
+							log.Printf("resetted_reinit_failed error=%q", err)
+							return
+						}
+					}()
+				default:
+					log.Printf("resetted_reinit_skipped already_in_flight=true")
+				}
+			}
+
+			server.broadcast(frame)
+		case southboundenh.ENHResReceived:
+			if len(frame.Payload) == 1 {
 				server.lastWireRXAtNano.Store(time.Now().UTC().UnixNano())
 				if server.cfg.Debug {
 					log.Printf("wire_rx symbol=0x%02X", frame.Payload[0])
