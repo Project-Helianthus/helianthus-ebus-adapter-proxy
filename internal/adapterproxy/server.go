@@ -365,11 +365,18 @@ func (server *Server) Serve(ctx context.Context) error {
 			_ = upstream.Close()
 			return fmt.Errorf("open wire log: %w", err)
 		}
+		// CR-P2b: Seed written counter from existing file size so rotation
+		// is enforced across process restarts.
+		var existingSize int64
+		if stat, statErr := logFile.Stat(); statErr == nil {
+			existingSize = stat.Size()
+		}
 		server.wireLog = &wireLogger{
 			file:    logFile,
 			writer:  bufio.NewWriterSize(logFile, 16*1024),
 			path:    server.cfg.WireLogPath,
 			maxSize: server.cfg.WireLogMaxSize,
+			written: existingSize,
 		}
 	}
 	// Request additional infos up-front so downstream clients can query INFO without
@@ -1283,14 +1290,17 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		)
 	}
 
-	// PX27: Acquire token through arbitration system to prevent stealing
-	// tokens that were granted to TCP contenders via maybeGrantStartArbLocked.
-	// Check if there are pending TCP contenders and yield if so.
+	// PX27/CR-P1b: Yield to TCP contenders if any are pending, but use a
+	// short timeout so the datagram is retried rather than dropped.
 	server.mutex.Lock()
 	hasTCPContenders := len(server.startArbContenders) > 0
 	server.mutex.Unlock()
 	if hasTCPContenders {
-		return fmt.Errorf("udp forward deferred: TCP contenders have priority")
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	select {

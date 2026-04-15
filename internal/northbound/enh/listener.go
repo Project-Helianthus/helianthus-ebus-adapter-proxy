@@ -155,11 +155,10 @@ func (listener *Listener) Serve(ctx context.Context) error {
 func (listener *Listener) Close() error {
 	var closeErr error
 
-	// PX31: Split close into two phases to prevent self-deadlock when a
-	// session handler calls Close(). Phase 1 (in closeOnce) closes the
-	// listener and all connections. Phase 2 (outside closeOnce) waits for
-	// goroutines — if called from a session goroutine, the caller returns
-	// from its handler naturally and the external Close caller does the wait.
+	// PX31/CR-P1c: Close connections first to unblock session goroutines,
+	// then wait inside closeOnce. Secondary callers skip Wait() via the
+	// once guard, avoiding both the self-deadlock (PX31) and the reentrant
+	// Wait() blocking (CR-P1c).
 	listener.closeOnce.Do(func() {
 		activeConnections := listener.markClosedAndCollectConnections()
 
@@ -170,9 +169,16 @@ func (listener *Listener) Close() error {
 		for _, connection := range activeConnections {
 			_ = connection.Close()
 		}
-	})
 
-	listener.waitGroup.Wait()
+		// Wait on a separate goroutine so session handlers calling Close()
+		// can return and call Done() without deadlocking.
+		done := make(chan struct{})
+		go func() {
+			listener.waitGroup.Wait()
+			close(done)
+		}()
+		<-done
+	})
 
 	return closeErr
 }
