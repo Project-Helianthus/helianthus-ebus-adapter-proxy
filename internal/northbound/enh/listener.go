@@ -121,11 +121,18 @@ func (listener *Listener) Serve(ctx context.Context) error {
 		connection, err := listener.listener.Accept()
 		if err != nil {
 			if listener.isClosedError(err) || ctx.Err() != nil || listener.isClosed() {
-				return nil
+				break
 			}
 
 			listener.recordError(SessionInfo{}, err)
 			continue
+		}
+
+		// CR3-P1b: Check closed state BEFORE rate-limit sleep to prevent
+		// dispatching connections after Close() has returned.
+		if listener.isClosed() {
+			_ = connection.Close()
+			break
 		}
 
 		// PX47: Enforce max concurrent sessions.
@@ -139,9 +146,18 @@ func (listener *Listener) Serve(ctx context.Context) error {
 			}
 		}
 
-		// PX53: Rate-limit accepts.
+		// PX53: Rate-limit accepts with context cancellation support.
 		if listener.options.AcceptRateLimit > 0 {
-			time.Sleep(listener.options.AcceptRateLimit)
+			select {
+			case <-time.After(listener.options.AcceptRateLimit):
+			case <-ctx.Done():
+				_ = connection.Close()
+				break
+			}
+			if listener.isClosed() {
+				_ = connection.Close()
+				break
+			}
 		}
 
 		sessionInfo := listener.registerSession(connection)
@@ -150,15 +166,20 @@ func (listener *Listener) Serve(ctx context.Context) error {
 		listener.waitGroup.Add(1)
 		go listener.serveSession(ctx, sessionInfo, connection, parser)
 	}
+
+	// PX31: Wait for session goroutines here (not in Close) to avoid
+	// deadlock when a session handler calls Close().
+	listener.waitGroup.Wait()
+	return nil
 }
 
 func (listener *Listener) Close() error {
 	var closeErr error
 
-	// PX31/CR-P1c: Close connections first to unblock session goroutines,
-	// then wait inside closeOnce. Secondary callers skip Wait() via the
-	// once guard, avoiding both the self-deadlock (PX31) and the reentrant
-	// Wait() blocking (CR-P1c).
+	// PX31/CR-P1c/CR3-P1: Close the listener and all active connections.
+	// Do NOT call waitGroup.Wait() here — a session handler goroutine calling
+	// Close() would deadlock waiting for its own Done(). Instead, Serve()
+	// calls waitGroup.Wait() after the Accept loop exits.
 	listener.closeOnce.Do(func() {
 		activeConnections := listener.markClosedAndCollectConnections()
 
@@ -169,15 +190,6 @@ func (listener *Listener) Close() error {
 		for _, connection := range activeConnections {
 			_ = connection.Close()
 		}
-
-		// Wait on a separate goroutine so session handlers calling Close()
-		// can return and call Done() without deadlocking.
-		done := make(chan struct{})
-		go func() {
-			listener.waitGroup.Wait()
-			close(done)
-		}()
-		<-done
 	})
 
 	return closeErr
