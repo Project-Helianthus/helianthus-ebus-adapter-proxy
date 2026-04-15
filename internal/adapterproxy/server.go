@@ -78,7 +78,10 @@ type Server struct {
 	listener net.Listener
 	upstream upstream
 
-	wireLog *wireLogger
+	// PX42: wireWriteMu serializes logWireTX + upstream.WriteFrame so TX
+	// entries in the wirelog match actual wire ordering across concurrent sessions.
+	wireWriteMu sync.Mutex
+	wireLog     *wireLogger
 	synCh   chan struct{}
 
 	udpListener    *net.UDPConn
@@ -978,8 +981,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		}
 		server.pendingStartMu.Unlock()
 
-		server.logWireTX(initiator)
-		if err := server.upstream.WriteFrame(downstream.Frame{
+		if err := server.writeUpstreamSerialized(downstream.Frame{
 			Command: byte(southboundenh.ENHReqSend),
 			Payload: []byte{initiator},
 		}); err != nil {
@@ -1173,8 +1175,7 @@ func (server *Server) handleSend(sessionID uint64, data byte) {
 	if server.cfg.Debug {
 		log.Printf("session=%d send symbol=0x%02X", sessionID, data)
 	}
-	server.logWireTX(data)
-	if err := server.upstream.WriteFrame(sendFrame); err != nil {
+	if err := server.writeUpstreamSerialized(sendFrame); err != nil {
 		if queuedObserverFrames {
 			server.rollbackOwnerObserverReplay(sessionID)
 		}
@@ -1330,8 +1331,7 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	}
 
 	for _, symbol := range payload {
-		server.logWireTX(symbol)
-		if err := server.upstream.WriteFrame(downstream.Frame{
+		if err := server.writeUpstreamSerialized(downstream.Frame{
 			Command: byte(southboundenh.ENHReqSend),
 			Payload: []byte{symbol},
 		}); err != nil {
@@ -1900,6 +1900,18 @@ func (server *Server) logWireTX(value byte) {
 		return
 	}
 	server.wireLog.LogLine("TX %02X", value)
+}
+
+// PX42: writeUpstreamSerialized serializes logWireTX + WriteFrame under
+// wireWriteMu so concurrent sessions' TX bytes appear in wirelog in the
+// same order as the actual wire writes.
+func (server *Server) writeUpstreamSerialized(frame downstream.Frame) error {
+	server.wireWriteMu.Lock()
+	defer server.wireWriteMu.Unlock()
+	if len(frame.Payload) == 1 {
+		server.logWireTX(frame.Payload[0])
+	}
+	return server.upstream.WriteFrame(frame)
 }
 
 func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
