@@ -2541,10 +2541,10 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 			server.targetResponderWindow = targetResponderWindow{}
 		}
 	case busWirePhaseWaitResponseAck:
-		// PX2: Check for master-master (initiator-to-initiator) frames.
-		// If DST is an initiator address, this is a master-master exchange
-		// where the ACK is from the destination master, not a slave.
-		// Any non-SYN symbol here is the initiator response ACK/NACK.
+		// PX2: Check for initiator-to-initiator (i2i) frames.
+		// If DST is an initiator address, this is an i2i exchange where
+		// the ACK is from the destination initiator, not a responder.
+		// Any non-SYN symbol here is the response ACK/NACK.
 		server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	}
 }
