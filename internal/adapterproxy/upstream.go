@@ -80,6 +80,13 @@ func (client *upstreamClient) ReadFrame() (downstream.Frame, error) {
 	frame, err := client.parser.Parse(client.reader)
 	if err != nil {
 		client.parser.Reset()
+		// PX55: Also reset bufio.Reader to discard stale buffered bytes.
+		// If a timeout fires mid-ENH-byte-pair, the first byte remains in
+		// the buffer and would be misinterpreted as a command byte on the
+		// next ReadFrame call.
+		if isTimeoutError(err) {
+			client.reader.Reset(client.conn)
+		}
 		return frame, err
 	}
 

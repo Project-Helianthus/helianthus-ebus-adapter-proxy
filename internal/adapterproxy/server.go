@@ -140,8 +140,11 @@ type Server struct {
 	startArbGrantSession  uint64
 	startArbContenders    map[uint64]*startArbContender
 
-	pendingStartMu sync.Mutex
-	pendingStart   *pendingStart
+	pendingStartMu       sync.Mutex
+	pendingStart         *pendingStart
+	pendingStartSeq      uint64    // PX11: monotonic counter for pendingStart identity
+	pendingStartClearedSeq uint64  // PX11: seq of last cleared pendingStart
+	pendingStartClearedAt  time.Time // PX11: when last pendingStart was cleared
 
 	pendingInfoMu sync.Mutex
 	pendingInfo   *pendingInfo
@@ -159,6 +162,7 @@ type Server struct {
 
 type pendingStart struct {
 	sessionID     uint64
+	seq           uint64 // PX11: monotonic counter to reject stale STARTED
 	respCh        chan downstream.Frame
 	mode          pendingStartMode
 	initiator     byte
@@ -679,6 +683,18 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 	}
 
+	// PX24: Reject explicit initiator if recently observed on the bus from an
+	// external device. The lease system only tracks proxy-managed addresses;
+	// this check prevents bus collisions with third-party controllers.
+	if server.isObservedExternalInitiator(initiator) {
+		log.Printf("session=%d explicit_initiator_rejected_observed initiator=0x%02X", sessionID, initiator)
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResFailed),
+			Payload: []byte{initiator},
+		})
+		return
+	}
+
 	selectedInitiator, err := server.acquireLease(sessionID, initiator)
 	if err != nil {
 		log.Printf(
@@ -762,6 +778,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	server.pendingStartMu.Lock()
 	server.pendingStart = &pendingStart{
 		sessionID: sessionID,
+		seq:       server.nextPendingStartSeqLocked(),
 		respCh:    respCh,
 		mode:      pendingStartModeENH,
 		initiator: initiator,
@@ -975,6 +992,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
 			sessionID: sessionID,
+			seq:       server.nextPendingStartSeqLocked(),
 			respCh:    respCh,
 			mode:      pendingStartModeUDPPlain,
 			initiator: initiator,
@@ -1048,9 +1066,8 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 				})
 				return
 			}
-			if server.cfg.Debug {
-				log.Printf("session=%d start_timeout_fallback=true", sessionID)
-			}
+			// PX43: Unconditional log for unconfirmed ownership.
+			log.Printf("session=%d start_timeout_fallback=true ownership=unconfirmed", sessionID)
 			server.setBusOwner(sessionID, initiator)
 			server.clearSessionCollision(sessionID)
 			server.reply(sessionID, downstream.Frame{
@@ -1277,6 +1294,17 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	if len(payload) == 0 {
 		return nil
 	}
+	// PX9: When forwarding through ENH upstream, reject UDP datagrams containing
+	// protocol control bytes (SYN=0xAA, ESC=0xA9). The proxy's own state machine
+	// would misinterpret 0xAA as SYN-release and 0xA9 as ENS escape. On wire-plain
+	// upstream, these bytes go directly to the bus and are valid physical symbols.
+	if !server.isWirePlainUpstream() {
+		for _, b := range payload {
+			if b == ebusSyn || b == 0xA9 {
+				return fmt.Errorf("udp datagram contains protocol control byte 0x%02X via ENH upstream", b)
+			}
+		}
+	}
 	// PX28/PX46: Enforce maximum telegram length to prevent adapter FIFO
 	// truncation and unbounded forwarding under a single bus token.
 	if len(payload) > maxEBUSTelegramLen {
@@ -1383,6 +1411,7 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 	}
 	server.pendingStart = &pendingStart{
 		sessionID: 0,
+		seq:       server.nextPendingStartSeqLocked(),
 		respCh:    respCh,
 		mode:      startMode,
 		initiator: initiator,
@@ -1417,9 +1446,9 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 	case <-time.After(server.cfg.UDPPlainStartWait):
 		server.clearPendingStart(0)
 		if !server.cfg.DisableUDPPlainStartFallback {
-			if server.cfg.Debug {
-				log.Printf("udp_plain_bridge_start_timeout_fallback=true initiator=0x%02X", initiator)
-			}
+			// PX43: Unconditional log — unconfirmed bus ownership is an
+			// exceptional condition that operators must see in production.
+			log.Printf("udp_plain_bridge_start_timeout_fallback=true initiator=0x%02X ownership=unconfirmed", initiator)
 			return nil
 		}
 		return fmt.Errorf("upstream start timeout")
@@ -1659,6 +1688,23 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		return false
 	}
 
+	// PX11: Reject stale STARTED that was meant for a previous pendingStart.
+	// If the current pending was created within 200ms of the last clear AND
+	// its seq is the immediate successor, this STARTED likely belongs to the
+	// cleared (timed-out) pending, not the current one.
+	if pending.seq == server.pendingStartClearedSeq+1 &&
+		!server.pendingStartClearedAt.IsZero() &&
+		time.Since(server.pendingStartClearedAt) < 200*time.Millisecond {
+		command := southboundenh.ENHCommand(frame.Command)
+		if command == southboundenh.ENHResStarted || command == southboundenh.ENHResFailed {
+			log.Printf("session=%d reject_stale_start_result cmd=0x%02X pending_seq=%d cleared_seq=%d age=%s",
+				pending.sessionID, frame.Command, pending.seq, server.pendingStartClearedSeq,
+				time.Since(server.pendingStartClearedAt))
+			server.pendingStartMu.Unlock()
+			return true // consumed but not delivered
+		}
+	}
+
 	frameData := byte(0x00)
 	if len(frame.Payload) > 0 {
 		frameData = frame.Payload[0]
@@ -1813,6 +1859,13 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 	}
 
 	server.reply(pending.sessionID, failed)
+}
+
+// PX11: nextPendingStartSeqLocked returns a monotonic sequence number for
+// pendingStart identity. Must be called under pendingStartMu.
+func (server *Server) nextPendingStartSeqLocked() uint64 {
+	server.pendingStartSeq++
+	return server.pendingStartSeq
 }
 
 func (server *Server) isStartPending() bool {
@@ -2009,6 +2062,10 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 func (server *Server) clearPendingStart(sessionID uint64) {
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
+		// PX11: Record cleared seq+time so deliverPendingStart can reject
+		// stale STARTED frames that arrive after timeout for a re-created pending.
+		server.pendingStartClearedSeq = server.pendingStart.seq
+		server.pendingStartClearedAt = time.Now()
 		server.pendingStart = nil
 	}
 	server.pendingStartMu.Unlock()
@@ -2526,9 +2583,10 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 	case busWirePhaseWaitCmdAck:
 		switch symbol {
 		case ebusACK:
-			// PX5: Check for broadcast (DST=0xFE) — broadcasts have no response
-			// phase, so ACK means transaction is done.
-			if server.requestDst == 0xFE {
+			// PX5: Broadcast (DST=0xFE) has no response phase.
+			// PX2: Initiator-to-initiator (i2i) frames also have no response
+			// phase — the ACK is from the destination initiator directly.
+			if server.requestDst == 0xFE || isInitiatorAddress(server.requestDst) {
 				server.resetBusWirePhaseLocked(busWirePhaseIdle)
 			} else {
 				server.busWirePhase = busWirePhaseWaitResponseLen
@@ -2769,6 +2827,21 @@ func (server *Server) pruneObservedInitiatorsLocked(cutoff time.Time) {
 			delete(server.observedInitiatorAt, address)
 		}
 	}
+}
+
+// PX24: Check if an initiator address was recently observed on the bus from
+// an external (non-proxy-managed) device within the activity window.
+func (server *Server) isObservedExternalInitiator(initiator byte) bool {
+	if server.cfg.AutoJoinActivityWindow <= 0 {
+		return false
+	}
+	server.observedMu.Lock()
+	seenAt, found := server.observedInitiatorAt[initiator]
+	server.observedMu.Unlock()
+	if !found {
+		return false
+	}
+	return time.Since(seenAt) <= server.cfg.AutoJoinActivityWindow
 }
 
 func (server *Server) selectAutoInitiator() (byte, error) {
