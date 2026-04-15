@@ -148,7 +148,8 @@ type Server struct {
 	leaseManager *sourcepolicy.LeaseManager
 	leasedBySess map[uint64]sourcepolicy.Lease
 
-	upstreamLost chan struct{}
+	upstreamLost     chan struct{}
+	upstreamLostOnce sync.Once // CR-P1: guard against double-close
 
 	waitGroup sync.WaitGroup
 }
@@ -316,9 +317,9 @@ func NewServer(cfg Config) *Server {
 		startArbContenders:      make(map[uint64]*startArbContender),
 		infoCache:               newAdapterInfoCache(),
 		reinitGuard:             make(chan struct{}, 1),
-		// PX7/PX66: Buffer upstreamLost so the signal is not lost if
-		// the monitoring goroutine hasn't started yet (e.g. during warmup).
-		upstreamLost:            make(chan struct{}, 1),
+		// PX7/PX66/CR-P1: Use close-based broadcast so all goroutines
+		// that select on upstreamLost are notified (not just one receiver).
+		upstreamLost:            make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
 
@@ -1436,10 +1437,12 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 				if len(observerFrames) > 0 {
 					server.broadcastObserverFrames(observerFrames, skipPendingID)
 				}
-				select {
-				case server.upstreamLost <- struct{}{}:
-				default:
-				}
+				// CR-P1: Close-based broadcast so all goroutines are notified.
+				server.upstreamLostOnce.Do(func() {
+					if server.upstreamLost != nil {
+						close(server.upstreamLost)
+					}
+				})
 				return
 			}
 			continue

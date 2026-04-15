@@ -47,6 +47,11 @@ func (logger *wireLogger) LogLine(format string, args ...any) {
 		logger.rotateLocked()
 	}
 
+	// CR-P2: Guard against nil writer after failed rotation.
+	if logger.writer == nil {
+		return
+	}
+
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	n1, _ := fmt.Fprintf(logger.writer, "%s ", timestamp)
 	n2, _ := fmt.Fprintf(logger.writer, format, args...)
