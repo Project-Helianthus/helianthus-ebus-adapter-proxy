@@ -29,8 +29,10 @@ type Hooks struct {
 }
 
 type Options struct {
-	ReadTimeout   time.Duration
-	ParserFactory ParserFactory
+	ReadTimeout       time.Duration
+	ParserFactory     ParserFactory
+	MaxSessions       int           // PX47: max concurrent sessions (0 = unlimited)
+	AcceptRateLimit   time.Duration // PX53: minimum interval between accepts (0 = unlimited)
 }
 
 type SessionInfo struct {
@@ -126,6 +128,22 @@ func (listener *Listener) Serve(ctx context.Context) error {
 			continue
 		}
 
+		// PX47: Enforce max concurrent sessions.
+		if listener.options.MaxSessions > 0 {
+			listener.mutex.Lock()
+			active := listener.metrics.ActiveSessions
+			listener.mutex.Unlock()
+			if active >= listener.options.MaxSessions {
+				_ = connection.Close()
+				continue
+			}
+		}
+
+		// PX53: Rate-limit accepts.
+		if listener.options.AcceptRateLimit > 0 {
+			time.Sleep(listener.options.AcceptRateLimit)
+		}
+
 		sessionInfo := listener.registerSession(connection)
 		parser := listener.options.ParserFactory()
 
@@ -137,6 +155,11 @@ func (listener *Listener) Serve(ctx context.Context) error {
 func (listener *Listener) Close() error {
 	var closeErr error
 
+	// PX31: Split close into two phases to prevent self-deadlock when a
+	// session handler calls Close(). Phase 1 (in closeOnce) closes the
+	// listener and all connections. Phase 2 (outside closeOnce) waits for
+	// goroutines — if called from a session goroutine, the caller returns
+	// from its handler naturally and the external Close caller does the wait.
 	listener.closeOnce.Do(func() {
 		activeConnections := listener.markClosedAndCollectConnections()
 
@@ -147,9 +170,9 @@ func (listener *Listener) Close() error {
 		for _, connection := range activeConnections {
 			_ = connection.Close()
 		}
-
-		listener.waitGroup.Wait()
 	})
+
+	listener.waitGroup.Wait()
 
 	return closeErr
 }

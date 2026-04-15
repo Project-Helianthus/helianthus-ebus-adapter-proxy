@@ -179,7 +179,11 @@ func TestListenerMalformedFrameErrorAndRecovery(t *testing.T) {
 
 	waitForEventCount(t, connectEvents, 1)
 
-	_, err = client.Write([]byte{0xC2, 0xC0})
+	// Send a malformed ENH pair: first byte (0xC2) followed by an invalid
+	// second byte (0x40) that is NOT a valid first byte (enhByte1 mask).
+	// PX64: valid first bytes are now reabsorbed, so use 0x40 which triggers
+	// the ErrMalformedFrame path.
+	_, err = client.Write([]byte{0xC2, 0x40})
 	if err != nil {
 		t.Fatalf("expected malformed write success, got %v", err)
 	}

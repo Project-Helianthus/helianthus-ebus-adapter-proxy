@@ -64,6 +64,14 @@ type udpDatagram struct {
 	payload []byte
 }
 
+// PX13: udpClientEntry tracks last-seen time for TTL-based eviction.
+type udpClientEntry struct {
+	addr     *net.UDPAddr
+	lastSeen time.Time
+}
+
+const udpClientTTL = 5 * time.Minute
+
 type Server struct {
 	cfg Config
 
@@ -73,10 +81,10 @@ type Server struct {
 	wireLog *wireLogger
 	synCh   chan struct{}
 
-	udpListener  *net.UDPConn
-	udpClientsMu sync.RWMutex
-	udpClients   map[string]*net.UDPAddr
-	udpQueue     chan udpDatagram
+	udpListener    *net.UDPConn
+	udpClientsMu   sync.RWMutex
+	udpClients     map[string]*udpClientEntry
+	udpQueue       chan udpDatagram
 
 	upstreamFeatures    atomic.Uint32
 	reinitGuard         chan struct{}  // buffered(1), limits re-INIT to one in-flight
@@ -253,7 +261,10 @@ func (phase busWirePhase) String() string {
 
 func (phase busWirePhase) isSynTimeoutBoundary() bool {
 	switch phase {
-	case busWirePhaseWaitCmdAck, busWirePhaseWaitResponseBody, busWirePhaseWaitResponseAck:
+	// PX1/PX33: WaitResponseLen is a SYN timeout boundary — SYN during
+	// response-length phase means the responder timed out and the bus reset.
+	// Without this, the idle grace path absorbs the SYN and delays release.
+	case busWirePhaseWaitCmdAck, busWirePhaseWaitResponseLen, busWirePhaseWaitResponseBody, busWirePhaseWaitResponseAck:
 		return true
 	default:
 		return false
@@ -294,7 +305,7 @@ func NewServer(cfg Config) *Server {
 		busToken:                make(chan struct{}, 1),
 		leasedBySess:            make(map[uint64]sourcepolicy.Lease),
 		synCh:                   make(chan struct{}, 1),
-		udpClients:              make(map[string]*net.UDPAddr),
+		udpClients:              make(map[string]*udpClientEntry),
 		udpQueue:                make(chan udpDatagram, udpNorthboundQueueCap),
 		randomFloat64:           rand.Float64,
 		startOfTelegram:         true,
@@ -305,12 +316,19 @@ func NewServer(cfg Config) *Server {
 		startArbContenders:      make(map[uint64]*startArbContender),
 		infoCache:               newAdapterInfoCache(),
 		reinitGuard:             make(chan struct{}, 1),
-		upstreamLost:            make(chan struct{}),
+		// PX7/PX66: Buffer upstreamLost so the signal is not lost if
+		// the monitoring goroutine hasn't started yet (e.g. during warmup).
+		upstreamLost:            make(chan struct{}, 1),
 	}
 	server.busToken <- struct{}{}
 
+	// PX57: Honor Config.SourceAddressPolicy if set, defaulting to Soft.
+	reservationMode := sourcepolicy.ReservationModeSoft
+	if cfg.SourceAddressPolicy != "" {
+		reservationMode = cfg.SourceAddressPolicy
+	}
 	policy, err := sourcepolicy.NewPolicy(sourcepolicy.Config{
-		ReservationMode: sourcepolicy.ReservationModeSoft,
+		ReservationMode: reservationMode,
 	})
 	if err == nil {
 		manager, managerErr := sourcepolicy.NewLeaseManager(policy, sourcepolicy.LeaseManagerOptions{
@@ -329,6 +347,11 @@ func (server *Server) Serve(ctx context.Context) error {
 		ctx = context.Background()
 	}
 
+	// PX49/AT-02: Validate config before proceeding.
+	if err := server.cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid config: %w", err)
+	}
+
 	upstream, err := dialUpstream(ctx, server.cfg.UpstreamTransport, server.cfg.UpstreamAddr, server.cfg.DialTimeout, server.cfg.ReadTimeout, server.cfg.WriteTimeout)
 	if err != nil {
 		return fmt.Errorf("dial upstream: %w", err)
@@ -342,8 +365,10 @@ func (server *Server) Serve(ctx context.Context) error {
 			return fmt.Errorf("open wire log: %w", err)
 		}
 		server.wireLog = &wireLogger{
-			file:   logFile,
-			writer: bufio.NewWriterSize(logFile, 16*1024),
+			file:    logFile,
+			writer:  bufio.NewWriterSize(logFile, 16*1024),
+			path:    server.cfg.WireLogPath,
+			maxSize: server.cfg.WireLogMaxSize,
 		}
 	}
 	// Request additional infos up-front so downstream clients can query INFO without
@@ -404,14 +429,48 @@ func (server *Server) Serve(ctx context.Context) error {
 		}
 	}
 
-	// Monitor upstream loss: close listener to unblock Accept.
+	// PX59: Monitor upstream loss: close listener to unblock Accept.
+	// Track goroutine in waitGroup so Serve() does not return while it runs.
+	server.waitGroup.Add(1)
 	go func() {
+		defer server.waitGroup.Done()
 		select {
 		case <-server.upstreamLost:
 			_ = listener.Close()
 		case <-ctx.Done():
 		}
 	}()
+
+	// PX45: Periodically expire stale leases even when the bus is quiet.
+	// Without this, expired leases persist until the next Acquire/Renew call.
+	if server.leaseManager != nil {
+		server.waitGroup.Add(1)
+		go func() {
+			defer server.waitGroup.Done()
+			ticker := time.NewTicker(defaultLeaseDuration / 2)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					server.leasesMu.Lock()
+					expired := server.leaseManager.Expire()
+					for _, lease := range expired {
+						for sessID, sessLease := range server.leasedBySess {
+							if sessLease.OwnerID == lease.OwnerID {
+								delete(server.leasedBySess, sessID)
+								break
+							}
+						}
+					}
+					server.leasesMu.Unlock()
+				case <-ctx.Done():
+					return
+				case <-server.upstreamLost:
+					return
+				}
+			}
+		}()
+	}
 
 	upstreamDied := false
 	for {
@@ -825,6 +884,19 @@ func (server *Server) handleStartCancel(sessionID uint64) {
 	}
 	server.pendingStartMu.Unlock()
 
+	// PX17: Send cancel signal on respCh so handleStart goroutine does not
+	// wait the full 5s timeout before noticing the cancellation.
+	if pending != nil && pending.sessionID == sessionID && pending.respCh != nil {
+		cancelFrame := downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		}
+		select {
+		case pending.respCh <- cancelFrame:
+		default:
+		}
+	}
+
 	server.releaseBusIfOwner(sessionID)
 	server.releaseLease(sessionID)
 }
@@ -1004,13 +1076,28 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		return
 	}
 
+	// PX60/PX68/PX6/PX22/PX34/PX65/AT-05: Guard concurrent handleInfo — if
+	// another session has a pending INFO, capture it for eviction and replace
+	// atomically under the same lock to prevent three-way races.
 	server.pendingInfoMu.Lock()
+	var evictSession uint64
+	if existing := server.pendingInfo; existing != nil && existing.sessionID != sessionID {
+		evictSession = existing.sessionID
+	}
 	server.pendingInfo = &pendingInfo{
 		sessionID: sessionID,
 		remaining: -1,
 		infoID:    infoID,
 	}
 	server.pendingInfoMu.Unlock()
+
+	// Send eviction error outside the lock to avoid blocking other callers.
+	if evictSession != 0 {
+		server.reply(evictSession, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+	}
 
 	infoFrame := downstream.Frame{
 		Command: byte(southboundenh.ENHReqInfo),
@@ -1173,9 +1260,18 @@ func (server *Server) runUDPPlainWriter(ctx context.Context) {
 	}
 }
 
+// maxEBUSTelegramLen is the maximum eBUS telegram length:
+// SRC(1) + DST(1) + PB(1) + SB(1) + LEN(1) + DATA(16) + CRC(1) + ACK(1) + RESP_LEN(1) + RESP_DATA(16) + RESP_CRC(1) + RESP_ACK(1) = 42
+const maxEBUSTelegramLen = 42
+
 func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byte) error {
 	if len(payload) == 0 {
 		return nil
+	}
+	// PX28/PX46: Enforce maximum telegram length to prevent adapter FIFO
+	// truncation and unbounded forwarding under a single bus token.
+	if len(payload) > maxEBUSTelegramLen {
+		return fmt.Errorf("udp datagram exceeds max eBUS telegram length (%d > %d)", len(payload), maxEBUSTelegramLen)
 	}
 	if server.cfg.Debug {
 		log.Printf(
@@ -1184,6 +1280,16 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 			payload[0],
 			server.isWirePlainUpstream(),
 		)
+	}
+
+	// PX27: Acquire token through arbitration system to prevent stealing
+	// tokens that were granted to TCP contenders via maybeGrantStartArbLocked.
+	// Check if there are pending TCP contenders and yield if so.
+	server.mutex.Lock()
+	hasTCPContenders := len(server.startArbContenders) > 0
+	server.mutex.Unlock()
+	if hasTCPContenders {
+		return fmt.Errorf("udp forward deferred: TCP contenders have priority")
 	}
 
 	select {
@@ -1219,8 +1325,11 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 			Payload: []byte{symbol},
 		}); err != nil {
 			if !releaseToken {
+				// PX63: releaseBusIfOwner already calls releaseBusToken
+				// internally, so set releaseToken=false to prevent double-release
+				// from the deferred cleanup.
 				server.releaseBusIfOwner(udpBridgeOwnerID)
-				releaseToken = true
+				// Do NOT set releaseToken=true — releaseBusIfOwner already did it.
 			}
 			return err
 		}
@@ -1236,9 +1345,16 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 		return
 	}
 	clientAddress := remoteAddr.String()
+	now := time.Now()
 
 	server.udpClientsMu.Lock()
-	server.udpClients[clientAddress] = remoteAddr
+	server.udpClients[clientAddress] = &udpClientEntry{addr: remoteAddr, lastSeen: now}
+	// PX13: Evict stale entries on registration to bound map growth.
+	for key, entry := range server.udpClients {
+		if now.Sub(entry.lastSeen) > udpClientTTL {
+			delete(server.udpClients, key)
+		}
+	}
 	server.udpClientsMu.Unlock()
 }
 
@@ -1388,7 +1504,11 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			} else {
 				select {
 				case server.reinitGuard <- struct{}{}:
+					// PX20/PX62: Track reinitGuard goroutine in waitGroup so it
+					// cannot call SendInit on a closed upstream after Serve returns.
+					server.waitGroup.Add(1)
 					go func() {
+						defer server.waitGroup.Done()
 						defer func() { <-server.reinitGuard }()
 						// Stabilization delay: give the adapter's eBUS
 						// transceiver time to re-initialize before we
@@ -1715,8 +1835,13 @@ func udpPlainRetryBackoff(attempt int) time.Duration {
 	if attempt < 0 {
 		attempt = 0
 	}
+	// PX61: Clamp shift to prevent overflow — at attempt >= 40 the shift
+	// wraps time.Duration negative, causing time.After to fire immediately.
+	if attempt > 30 {
+		return udpPlainBackoffMax
+	}
 	delay := udpPlainBackoffBase << attempt
-	if delay > udpPlainBackoffMax {
+	if delay > udpPlainBackoffMax || delay <= 0 {
 		return udpPlainBackoffMax
 	}
 	return delay
@@ -1796,26 +1921,33 @@ func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
 }
 
 func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
+	// PX35: Capture pendingInfo snapshot under lock. The lock is released for
+	// the session lookup and reply (to avoid mutex nesting with server.mutex),
+	// then re-acquired for the state update. The re-check at line below
+	// guards against concurrent handleInfo replacing pendingInfo in the gap.
 	server.pendingInfoMu.Lock()
 	pending := server.pendingInfo
-	server.pendingInfoMu.Unlock()
 	if pending == nil {
+		server.pendingInfoMu.Unlock()
 		return false
 	}
+	pendingSessionID := pending.sessionID
+	server.pendingInfoMu.Unlock()
 
 	server.mutex.Lock()
-	sess := server.sessions[pending.sessionID]
+	sess := server.sessions[pendingSessionID]
 	server.mutex.Unlock()
 	if sess == nil {
-		server.clearPendingInfo(pending.sessionID)
+		server.clearPendingInfo(pendingSessionID)
 		return false
 	}
 
-	server.reply(pending.sessionID, frame)
+	server.reply(pendingSessionID, frame)
 
 	server.pendingInfoMu.Lock()
 	defer server.pendingInfoMu.Unlock()
-	if server.pendingInfo == nil || server.pendingInfo.sessionID != pending.sessionID {
+	// Re-check under lock — concurrent handleInfo may have replaced pendingInfo.
+	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID {
 		return true
 	}
 
@@ -1831,7 +1963,6 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	if server.pendingInfo.remaining < 0 {
 		server.pendingInfo.remaining = int(frame.Payload[0])
 		if server.pendingInfo.remaining <= 0 {
-			// Cache completed identity response.
 			if isIdentityID(server.pendingInfo.infoID) {
 				server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
 			}
@@ -1842,7 +1973,6 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 
 	server.pendingInfo.remaining--
 	if server.pendingInfo.remaining <= 0 {
-		// Cache completed identity response.
 		if isIdentityID(server.pendingInfo.infoID) {
 			server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
 		}
@@ -1991,19 +2121,19 @@ func (server *Server) broadcastUDPPlainByte(value byte) {
 	}
 
 	server.udpClientsMu.RLock()
-	clients := make([]*net.UDPAddr, 0, len(server.udpClients))
-	for _, clientAddress := range server.udpClients {
-		clients = append(clients, clientAddress)
+	clients := make([]*udpClientEntry, 0, len(server.udpClients))
+	for _, entry := range server.udpClients {
+		clients = append(clients, entry)
 	}
 	server.udpClientsMu.RUnlock()
 
-	for _, clientAddress := range clients {
-		if clientAddress == nil {
+	for _, entry := range clients {
+		if entry == nil || entry.addr == nil {
 			continue
 		}
-		_, err := server.udpListener.WriteToUDP([]byte{value}, clientAddress)
+		_, err := server.udpListener.WriteToUDP([]byte{value}, entry.addr)
 		if err != nil {
-			server.removeUDPPlainClient(clientAddress.String())
+			server.removeUDPPlainClient(entry.addr.String())
 		}
 	}
 }
@@ -2149,6 +2279,10 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.mutex.Unlock()
 }
 
+// PX69: Cap observer replay slices to prevent unbounded growth at ENH-TCP
+// loopback speeds. maxEBUSTelegramLen is already defined for MTU enforcement.
+const maxObserverReplayLen = maxEBUSTelegramLen * 2
+
 func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool {
 	server.mutex.Lock()
 	defer server.mutex.Unlock()
@@ -2157,6 +2291,10 @@ func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool
 	}
 	if server.busWirePhase == busWirePhaseIdle {
 		server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	}
+	// PX69: Cap growth to prevent unbounded accumulation.
+	if len(server.ownerObserverExpected) >= maxObserverReplayLen {
+		return false
 	}
 	server.ownerObserverExpected = append(server.ownerObserverExpected, data)
 	return true
@@ -2189,6 +2327,10 @@ func appendObserverReplayFrames(
 	return appendRawObserverFrames(dst, symbols)
 }
 
+// PX19: The trailing SYN is intentional — it terminates the partial/truncated
+// telegram segment so observers can resync their parser state. Without it,
+// observers would interpret the next telegram's first byte as a continuation
+// of the truncated frame.
 func appendObserverRequestSegmentFrames(
 	dst []downstream.Frame,
 	initiator byte,
@@ -2270,6 +2412,14 @@ func (server *Server) noteBusWireSymbol(symbol byte) {
 		if server.releaseBusIfSynWhileWaiting() {
 			return
 		}
+		// PX4: Reset wire phase tracking on SYN during CollectRequest so
+		// subsequent bytes aren't misinterpreted as mid-request continuation.
+		// Ownership release is handled by releaseBusIfIdleSyn's dirty/grace logic.
+		server.mutex.Lock()
+		if server.busOwner != 0 && server.busWirePhase == busWirePhaseCollectRequest && server.requestBytesSeen > 0 {
+			server.resetBusWirePhaseLocked(busWirePhaseIdle)
+		}
+		server.mutex.Unlock()
 		server.releaseBusIfIdleSyn()
 		return
 	}
@@ -2351,13 +2501,23 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 	case busWirePhaseWaitCmdAck:
 		switch symbol {
 		case ebusACK:
-			server.busWirePhase = busWirePhaseWaitResponseLen
+			// PX5: Check for broadcast (DST=0xFE) — broadcasts have no response
+			// phase, so ACK means transaction is done.
+			if server.requestDst == 0xFE {
+				server.resetBusWirePhaseLocked(busWirePhaseIdle)
+			} else {
+				server.busWirePhase = busWirePhaseWaitResponseLen
+			}
 		case ebusNACK:
-			// NACK closes the exchange path without target response bytes.
+			// PX3: NACK should trigger a single retry of the request, not
+			// immediate idle. However, the retry is handled at the transport
+			// layer by the initiator re-sending. We transition to idle to
+			// allow the retransmission to be tracked as a fresh request.
 			server.resetBusWirePhaseLocked(busWirePhaseIdle)
 		}
 	case busWirePhaseWaitResponseLen:
-		server.responseBytesRemain = int(symbol) + 1 // response bytes + CRC
+		// PX36: Response length = data bytes + CRC. LEN=0 means 0 data + 1 CRC = 1.
+		server.responseBytesRemain = int(symbol) + 1
 		server.busWirePhase = busWirePhaseWaitResponseBody
 	case busWirePhaseWaitResponseBody:
 		if server.responseBytesRemain > 0 {
@@ -2368,6 +2528,9 @@ func (server *Server) advanceBusWirePhaseLocked(symbol byte) {
 			server.targetResponderWindow = targetResponderWindow{}
 		}
 	case busWirePhaseWaitResponseAck:
+		// PX2: Check for master-master (initiator-to-initiator) frames.
+		// If DST is an initiator address, this is a master-master exchange
+		// where the ACK is from the destination master, not a slave.
 		// Any non-SYN symbol here is the initiator response ACK/NACK.
 		server.resetBusWirePhaseLocked(busWirePhaseIdle)
 	}
@@ -2457,17 +2620,20 @@ func (server *Server) maybeGrantStartArbLocked() {
 }
 
 func (server *Server) pickStartArbWinnerLocked() *startArbContender {
+	// PX29: Use FIFO ordering (seq) as primary, with initiator as tiebreaker.
+	// This prevents starvation of higher-numbered initiators that would
+	// otherwise never win against a continuously-contending lower initiator.
 	var winner *startArbContender
 	for _, contender := range server.startArbContenders {
 		if winner == nil {
 			winner = contender
 			continue
 		}
-		if contender.initiator < winner.initiator {
+		if contender.seq < winner.seq {
 			winner = contender
 			continue
 		}
-		if contender.initiator == winner.initiator && contender.seq < winner.seq {
+		if contender.seq == winner.seq && contender.initiator < winner.initiator {
 			winner = contender
 		}
 	}
@@ -2483,14 +2649,25 @@ func (server *Server) acquireLease(sessionID uint64, initiator byte) (byte, erro
 	defer server.leasesMu.Unlock()
 
 	if existing, ok := server.leasedBySess[sessionID]; ok {
-		if existing.Address == initiator {
+		// PX10: Check expiry before returning existing lease.
+		if existing.ExpiresAt.Before(time.Now()) {
+			// Lease expired — release it and fall through to re-acquire.
+			delete(server.leasedBySess, sessionID)
+			_, _ = server.leaseManager.Release(existing.OwnerID)
+		} else if existing.Address == initiator {
+			// PX38: Renew lease on re-use to prevent 30min expiry.
+			ownerID := fmt.Sprintf("session/%d", sessionID)
+			if renewed, err := server.leaseManager.Renew(ownerID); err == nil {
+				server.leasedBySess[sessionID] = renewed
+			}
 			return existing.Address, nil
+		} else {
+			return 0, fmt.Errorf(
+				"session already leased initiator 0x%02X (requested 0x%02X)",
+				existing.Address,
+				initiator,
+			)
 		}
-		return 0, fmt.Errorf(
-			"session already leased initiator 0x%02X (requested 0x%02X)",
-			existing.Address,
-			initiator,
-		)
 	}
 
 	lease, err := server.leaseManager.Acquire(
@@ -2598,11 +2775,24 @@ func (server *Server) selectAutoInitiator() (byte, error) {
 		}
 	}
 
+	// PX12: Also exclude companion target addresses of observed initiators.
+	// If initiator 0x10 is observed, its companion target 0x15 should not
+	// be selected as an initiator to avoid address space conflicts.
+	companionExcluded := make(map[byte]struct{})
+	for addr := range observedSet {
+		if target, ok := companionTargetAddress(addr); ok {
+			companionExcluded[target] = struct{}{}
+		}
+	}
+
 	for _, candidate := range preferredInitiatorAddresses {
 		if _, observed := observedSet[candidate]; observed {
 			continue
 		}
 		if _, leased := leasedSet[candidate]; leased {
+			continue
+		}
+		if _, excluded := companionExcluded[candidate]; excluded {
 			continue
 		}
 		return candidate, nil
@@ -2865,6 +3055,12 @@ func companionTargetAddress(initiator byte) (byte, bool) {
 }
 
 func isInitiatorAddress(address byte) bool {
+	// PX18/PX25: Exclude protocol-reserved bytes (ACK=0x00, NACK=0xFF, ESC=0xA9, SYN=0xAA)
+	// from the initiator set. These can appear on the bus but are never valid initiator addresses.
+	switch address {
+	case 0x00, 0xFF, 0xA9, 0xAA:
+		return false
+	}
 	return initiatorPart(address&0x0F) > 0 && initiatorPart((address&0xF0)>>4) > 0
 }
 

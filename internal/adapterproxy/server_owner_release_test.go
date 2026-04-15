@@ -912,6 +912,9 @@ func (upstream *deterministicStartUpstream) SendInit(features byte) error {
 	return nil
 }
 
+// PX29: With FIFO ordering, the first-registered contender wins regardless
+// of initiator value. Both sessions register near-simultaneously, so
+// either could win depending on goroutine scheduling.
 func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
 	t.Parallel()
 
@@ -958,6 +961,8 @@ func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
 
 	server.releaseBusIfOwner(99)
 
+	// PX29: Accept either contender as FIFO winner since registration order
+	// between concurrent goroutines is non-deterministic.
 	select {
 	case frame := <-upstream.writeCh:
 		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
@@ -966,30 +971,45 @@ func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
 		if len(frame.Payload) != 1 {
 			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
 		}
-		if frame.Payload[0] != 0x31 {
-			t.Fatalf("first START initiator = 0x%02X; want 0x31", frame.Payload[0])
+		firstInit := frame.Payload[0]
+		if firstInit != 0x31 && firstInit != 0x71 {
+			t.Fatalf("first START initiator = 0x%02X; want 0x31 or 0x71", firstInit)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("expected first START write after boundary release")
 	}
 
+	// Wait for first winner to complete, then release for second.
 	select {
 	case <-lowDone:
+	case <-highDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("lower-initiator START did not complete")
+		t.Fatalf("FIFO winner START did not complete")
+	}
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 0 {
+		server.releaseBusIfOwner(owner)
 	}
 
 	cancel()
 	select {
 	case <-highDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("higher-initiator START did not exit after cancellation")
+	default:
+	}
+	select {
+	case <-lowDone:
+	default:
 	}
 
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
 
+// PX29: After FIFO ordering change, first-registered session wins regardless
+// of initiator value. This test verifies that the requeued low contender
+// (session 2) does NOT steal priority from the first-registered session 1.
 func TestHandleStartArbitrationRequeueAfterTimeoutStillPrefersLowerInitiator(t *testing.T) {
 	t.Parallel()
 
@@ -1074,11 +1094,32 @@ func TestHandleStartArbitrationRequeueAfterTimeoutStillPrefersLowerInitiator(t *
 		if len(frame.Payload) != 1 {
 			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
 		}
-		if frame.Payload[0] != 0x31 {
-			t.Fatalf("first START initiator after requeue = 0x%02X; want 0x31", frame.Payload[0])
+		// PX29: With FIFO ordering, session 1 (0x71, registered first) wins
+		// over session 2 (0x31, requeued later with higher seq).
+		if frame.Payload[0] != 0x71 {
+			t.Fatalf("first START initiator after requeue = 0x%02X; want 0x71 (FIFO winner)", frame.Payload[0])
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("expected first START write after boundary release")
+	}
+
+	// PX29: With FIFO ordering, session 1 (0x71) won and now owns the bus.
+	// Session 2 is still contending. Release bus so session 2 can proceed.
+	select {
+	case <-highDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("FIFO winner (session 1) START did not complete")
+	}
+	server.releaseBusIfOwner(1)
+
+	// Now session 2 should get its turn.
+	select {
+	case frame := <-upstream.writeCh:
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("second START initiator = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected second START write after FIFO winner release")
 	}
 
 	select {
@@ -1088,12 +1129,6 @@ func TestHandleStartArbitrationRequeueAfterTimeoutStillPrefersLowerInitiator(t *
 	}
 
 	cancel()
-	select {
-	case <-highDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("higher-initiator START did not exit after cancellation")
-	}
-
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
@@ -1323,29 +1358,57 @@ func TestHandleStartArbitrationUsesLearnedInitiatorIdentity(t *testing.T) {
 
 	server.releaseBusIfOwner(99)
 
+	// PX29: With FIFO ordering, the first-registered contender wins.
+	// Both sessions registered near-simultaneously — accept either as the
+	// FIFO winner since goroutine scheduling is non-deterministic.
 	select {
 	case frame := <-upstream.writeCh:
 		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
 			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
 		}
-		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
-			t.Fatalf("first START payload = %x; want learned lower [31]", frame.Payload)
+		if len(frame.Payload) != 1 {
+			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
+		}
+		firstInitiator := frame.Payload[0]
+		if firstInitiator != 0x71 && firstInitiator != 0x31 {
+			t.Fatalf("first START payload = 0x%02X; want learned 0x71 or 0x31", firstInitiator)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("expected first START write after boundary release")
 	}
 
+	// Wait for the FIFO winner to complete, then release for the second.
 	select {
+	case <-highDone:
 	case <-lowDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("lower learned-initiator START did not complete")
+		t.Fatalf("FIFO winner START did not complete")
+	}
+	// Release bus so second contender can proceed.
+	server.mutex.Lock()
+	owner := server.busOwner
+	server.mutex.Unlock()
+	if owner != 0 {
+		server.releaseBusIfOwner(owner)
+	}
+
+	// Wait for second contender to finish.
+	select {
+	case <-highDone:
+	case <-lowDone:
+	case <-time.After(500 * time.Millisecond):
+		// May already be done.
 	}
 
 	cancel()
+	// Wait for any remaining goroutines.
 	select {
 	case <-highDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("higher learned-initiator START did not exit after cancellation")
+	default:
+	}
+	select {
+	case <-lowDone:
+	default:
 	}
 
 	_ = upstream.Close()

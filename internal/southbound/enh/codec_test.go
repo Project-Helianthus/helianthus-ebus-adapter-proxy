@@ -81,9 +81,13 @@ func TestENHParserKeepsStateAcrossChunkBoundaries(t *testing.T) {
 }
 
 func TestENHParserRecoversAfterMalformedSecondByte(t *testing.T) {
+	// PX64: When an invalid second byte is itself a valid first byte, the parser
+	// now treats it as the start of a new frame pair (no error returned).
+	// Test with a truly invalid second byte (not a valid first byte) to verify
+	// error recovery still works for non-first-byte invalids.
 	parser := &ENHParser{}
 	stream := bytes.NewReader([]byte{
-		0xC4, 0xC1, // malformed: second byte must match 10xxxxxx
+		0xC4, 0x40, // malformed: 0x40 is not enhByte2 or enhByte1
 		0xCA, 0xA5, // valid ENHReqStart + 0xA5
 	})
 
@@ -103,6 +107,34 @@ func TestENHParserRecoversAfterMalformedSecondByte(t *testing.T) {
 	}
 	if !reflect.DeepEqual(frame, expectedFrame) {
 		t.Fatalf("expected recovered frame %#v, got %#v", expectedFrame, frame)
+	}
+}
+
+func TestENHParserPX64ReabsorbsFirstByteOnMismatch(t *testing.T) {
+	// PX64: When invalid second byte IS a valid first byte, the parser reabsorbs
+	// it as a new first byte instead of returning an error.
+	parser := &ENHParser{}
+	stream := bytes.NewReader([]byte{
+		0xC4, 0xC8, // 0xC4 is first byte, 0xC8 is valid first byte (not enhByte2)
+		0xA0,       // valid second byte for 0xC8
+	})
+
+	// Should return the frame decoded from 0xC8+0xA0 (the reabsorbed pair).
+	frame, err := parser.Parse(stream)
+	if err != nil {
+		t.Fatalf("expected parse success (reabsorb), got %v", err)
+	}
+
+	command, data, decErr := DecodeENH(0xC8, 0xA0)
+	if decErr != nil {
+		t.Fatalf("DecodeENH failed: %v", decErr)
+	}
+	expectedFrame := downstream.Frame{
+		Command: byte(command),
+		Payload: []byte{data},
+	}
+	if !reflect.DeepEqual(frame, expectedFrame) {
+		t.Fatalf("expected frame %#v, got %#v", expectedFrame, frame)
 	}
 }
 

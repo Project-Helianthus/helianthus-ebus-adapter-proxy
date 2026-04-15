@@ -84,6 +84,14 @@ func (parser *ENHParser) Feed(payloadByte byte) (downstream.Frame, bool, error) 
 
 	if payloadByte&enhByteMask != enhByte2 {
 		parser.pending = false
+		// PX64: If the invalid byte is itself a valid first byte (enhByte1),
+		// treat it as the start of a new frame pair rather than discarding it.
+		// This prevents per-byte error cascades in corrupt streams.
+		if payloadByte&enhByteMask == enhByte1 {
+			parser.pending = true
+			parser.byte1 = payloadByte
+			return downstream.Frame{}, false, nil
+		}
 		return downstream.Frame{}, false, fmt.Errorf(
 			"%w: invalid second byte 0x%02X",
 			ErrMalformedFrame,

@@ -241,6 +241,10 @@ func (driver *Driver) reconnectLocked(cause error) error {
 		return err
 	}
 
+	// PX44: Reset parser state on reconnect to prevent stale escape-pending
+	// state from corrupting the first byte of the new connection.
+	resetIfSupported(driver.parser)
+
 	driver.reconnectAttempts++
 	if driver.hooks.OnReconnect != nil {
 		driver.hooks.OnReconnect(driver.reconnectAttempts, cause)

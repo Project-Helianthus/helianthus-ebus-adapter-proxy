@@ -241,6 +241,10 @@ func (driver *Driver) reconnectLocked(cause error) error {
 		return err
 	}
 
+	// PX30: Reset parser state on reconnect to prevent stale buffered bytes
+	// from being misinterpreted as the start of a fresh frame.
+	resetIfSupported(driver.parser)
+
 	driver.reconnectAttempts++
 	if driver.hooks.OnReconnect != nil {
 		driver.hooks.OnReconnect(driver.reconnectAttempts, cause)

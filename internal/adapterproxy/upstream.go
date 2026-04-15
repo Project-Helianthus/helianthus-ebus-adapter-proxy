@@ -49,8 +49,13 @@ func dialUpstream(
 		return dialUpstreamUDPPlain(ctx, address, timeout, readTimeout, writeTimeout)
 	case UpstreamTCPPlain:
 		return dialUpstreamTCPPlain(ctx, address, timeout, readTimeout, writeTimeout)
-	case UpstreamENH, UpstreamENS, "":
+	case UpstreamENH, "":
 		return dialUpstreamENH(ctx, address, timeout, readTimeout, writeTimeout)
+	case UpstreamENS:
+		// PX51/PX58: ENS codec cannot carry control frames (RESETTED, STARTED,
+		// FAILED) — it is a data-only transport. Reject ENS upstream config with
+		// a clear error instead of silently falling through to the ENH dialer.
+		return nil, fmt.Errorf("upstream transport %q is not supported: ENS cannot carry control frames (RESETTED/STARTED/FAILED); use ENH or a plain transport", transport)
 	default:
 		return nil, fmt.Errorf("unsupported upstream transport %q", transport)
 	}
@@ -75,9 +80,19 @@ func (client *upstreamClient) ReadFrame() (downstream.Frame, error) {
 	frame, err := client.parser.Parse(client.reader)
 	if err != nil {
 		client.parser.Reset()
+		return frame, err
 	}
 
-	return frame, err
+	// PX16/PX23: Reset parser after arbitration-terminal frames (STARTED,
+	// FAILED, RESETTED) per enh.md:128. The parser accumulates pending byte
+	// state that must be cleared when the adapter resets its own encoder.
+	cmd := southboundenh.ENHCommand(frame.Command)
+	switch cmd {
+	case southboundenh.ENHResStarted, southboundenh.ENHResFailed, southboundenh.ENHResResetted:
+		client.parser.Reset()
+	}
+
+	return frame, nil
 }
 
 func (client *upstreamClient) WriteFrame(frame downstream.Frame) error {
@@ -130,6 +145,14 @@ func dialUpstreamENH(
 		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}
 
+	// PX54: Apply default timeout for ENH upstream if none configured,
+	// to prevent indefinite blocking on a hung adapter.
+	if readTimeout <= 0 {
+		readTimeout = defaultENHIOTimeout
+	}
+	if writeTimeout <= 0 {
+		writeTimeout = defaultENHIOTimeout
+	}
 	return &upstreamClient{
 		conn:         conn,
 		reader:       bufio.NewReaderSize(conn, 4096),
@@ -138,6 +161,8 @@ func dialUpstreamENH(
 	}, nil
 }
 
+// PX41: Use a ring buffer for pending bytes to prevent unbounded growth
+// and avoid backing-array leaks from head-chop slicing.
 type udpPlainUpstreamClient struct {
 	conn         *net.UDPConn
 	readTimeout  time.Duration
@@ -146,8 +171,9 @@ type udpPlainUpstreamClient struct {
 	readMu  sync.Mutex
 	writeMu sync.Mutex
 
-	pending []byte
-	buffer  []byte
+	pending    []byte
+	pendingOff int // PX41: read offset into pending to avoid head-chop
+	buffer     []byte
 }
 
 const udpPlainReadBufferSize = 65535
@@ -195,14 +221,24 @@ func (client *udpPlainUpstreamClient) ReadFrame() (downstream.Frame, error) {
 	defer client.readMu.Unlock()
 
 	for {
-		if len(client.pending) > 0 {
-			value := client.pending[0]
-			client.pending = client.pending[1:]
+		// PX41: Use offset tracking to avoid O(n) head-chop on every byte.
+		if client.pendingOff < len(client.pending) {
+			value := client.pending[client.pendingOff]
+			client.pendingOff++
+			// Reclaim backing array when fully consumed.
+			if client.pendingOff == len(client.pending) {
+				client.pending = client.pending[:0]
+				client.pendingOff = 0
+			}
 			return downstream.Frame{
 				Command: byte(southboundenh.ENHResReceived),
 				Payload: []byte{value},
 			}, nil
 		}
+
+		// Reset pending for next datagram.
+		client.pending = client.pending[:0]
+		client.pendingOff = 0
 
 		if err := setReadDeadline(client.conn, client.readTimeout); err != nil {
 			return downstream.Frame{}, err
@@ -343,6 +379,12 @@ func (client *tcpPlainUpstreamClient) WriteFrame(frame downstream.Frame) error {
 func (client *tcpPlainUpstreamClient) SendInit(features byte) error {
 	return nil
 }
+
+// PX54/AT-03: Default I/O timeout for ENH upstream connections to prevent
+// indefinite blocking on a hung adapter. Plain transports (UDP/TCP) may
+// legitimately have long inter-telegram gaps, so they use the caller-provided
+// timeout (including zero = no deadline).
+const defaultENHIOTimeout = 30 * time.Second
 
 func setReadDeadline(connection net.Conn, timeout time.Duration) error {
 	if timeout <= 0 {

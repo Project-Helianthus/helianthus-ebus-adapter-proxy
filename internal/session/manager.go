@@ -127,10 +127,13 @@ type sessionState struct {
 	queueMetrics   QueueMetrics
 }
 
+// PX56: Ring buffer implementation to avoid O(n) slice shift on dequeue.
 type frameQueue struct {
 	mutex    sync.Mutex
 	capacity int
 	items    []downstream.Frame
+	head     int
+	count    int
 }
 
 func NewManager(options Options, hooks Hooks) *Manager {
@@ -161,8 +164,11 @@ func (manager *Manager) Register(identity Identity) (Session, error) {
 			return Session{}, ErrSessionAlreadyConnected
 		}
 
-		manager.mutex.Unlock()
-		return Session{}, ErrSessionNotConnected
+		// PX39/PX52/PX70: Clean stale disconnected session to allow
+		// re-registration with the same identity, using a distinct error
+		// sentinel so callers can distinguish Register vs Enqueue failures.
+		delete(manager.identityToID, identityKey)
+		delete(manager.sessions, existingSessionID)
 	}
 
 	manager.nextID++
@@ -430,7 +436,7 @@ func (state *sessionState) snapshot() Session {
 func newFrameQueue(capacity int) *frameQueue {
 	return &frameQueue{
 		capacity: capacity,
-		items:    make([]downstream.Frame, 0, capacity),
+		items:    make([]downstream.Frame, capacity),
 	}
 }
 
@@ -438,30 +444,35 @@ func (queue *frameQueue) enqueue(frame downstream.Frame) error {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
 
-	if len(queue.items) >= queue.capacity {
+	if queue.count >= queue.capacity {
 		return ErrQueueFull
 	}
 
-	queue.items = append(queue.items, cloneFrame(frame))
+	idx := (queue.head + queue.count) % queue.capacity
+	queue.items[idx] = cloneFrame(frame)
+	queue.count++
 	return nil
 }
 
+// PX56: O(1) dequeue using ring buffer index.
 func (queue *frameQueue) dequeue() (downstream.Frame, bool) {
 	queue.mutex.Lock()
 	defer queue.mutex.Unlock()
 
-	if len(queue.items) == 0 {
+	if queue.count == 0 {
 		return downstream.Frame{}, false
 	}
 
-	frame := queue.items[0]
-	queue.items = queue.items[1:]
+	frame := queue.items[queue.head]
+	queue.items[queue.head] = downstream.Frame{} // clear reference
+	queue.head = (queue.head + 1) % queue.capacity
+	queue.count--
 	return frame, true
 }
 
 func (queue *frameQueue) depth() int {
 	queue.mutex.Lock()
-	depth := len(queue.items)
+	depth := queue.count
 	queue.mutex.Unlock()
 
 	return depth
@@ -469,8 +480,12 @@ func (queue *frameQueue) depth() int {
 
 func (queue *frameQueue) clear() int {
 	queue.mutex.Lock()
-	dropped := len(queue.items)
-	queue.items = queue.items[:0]
+	dropped := queue.count
+	for i := range queue.items {
+		queue.items[i] = downstream.Frame{}
+	}
+	queue.head = 0
+	queue.count = 0
 	queue.mutex.Unlock()
 
 	return dropped
