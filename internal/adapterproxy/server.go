@@ -142,7 +142,7 @@ type Server struct {
 
 	pendingStartMu       sync.Mutex
 	pendingStart         *pendingStart
-	pendingStartSeq      uint64    // PX11: monotonic counter for pendingStart identity
+
 
 	pendingInfoMu  sync.Mutex
 	pendingInfo    *pendingInfo
@@ -161,7 +161,6 @@ type Server struct {
 
 type pendingStart struct {
 	sessionID     uint64
-	seq           uint64 // PX11: monotonic counter to reject stale STARTED
 	respCh        chan downstream.Frame
 	mode          pendingStartMode
 	initiator     byte
@@ -839,7 +838,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	server.pendingStartMu.Lock()
 	server.pendingStart = &pendingStart{
 		sessionID: sessionID,
-		seq:       server.nextPendingStartSeqLocked(),
+
 		respCh:    respCh,
 		mode:      pendingStartModeENH,
 		initiator: initiator,
@@ -894,8 +893,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		})
 		return
 	}
-	// CR7-P1: START sent successfully — clear stale markers so responses
-	// for THIS pending are not rejected by the stale heuristic.
+
 
 
 	select {
@@ -1056,7 +1054,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
 			sessionID: sessionID,
-			seq:       server.nextPendingStartSeqLocked(),
+	
 			respCh:    respCh,
 			mode:      pendingStartModeUDPPlain,
 			initiator: initiator,
@@ -1497,7 +1495,7 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 	}
 	server.pendingStart = &pendingStart{
 		sessionID: 0,
-		seq:       server.nextPendingStartSeqLocked(),
+
 		respCh:    respCh,
 		mode:      startMode,
 		initiator: initiator,
@@ -1937,12 +1935,6 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 	server.reply(pending.sessionID, failed)
 }
 
-// nextPendingStartSeqLocked returns a monotonic sequence number for
-// pendingStart identity. Must be called under pendingStartMu.
-func (server *Server) nextPendingStartSeqLocked() uint64 {
-	server.pendingStartSeq++
-	return server.pendingStartSeq
-}
 
 
 func (server *Server) isStartPending() bool {
@@ -2077,9 +2069,9 @@ func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
 
 func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	// PX35: Capture pendingInfo snapshot under lock. The lock is released for
-	// the session lookup and reply (to avoid mutex nesting with server.mutex),
-	// then re-acquired for the state update. The re-check at line below
-	// guards against concurrent handleInfo replacing pendingInfo in the gap.
+	// the session lookup (to avoid mutex nesting with server.mutex), then
+	// re-acquired for the seq re-check and reply. Reply is sent under
+	// pendingInfoMu to prevent concurrent handleInfo from stealing responses.
 	server.pendingInfoMu.Lock()
 	pending := server.pendingInfo
 	if pending == nil {
@@ -2149,10 +2141,8 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	return true
 }
 
-// CR5-P1: nilPendingStartLocked records stale-tracking metadata and nils
-// pendingStart. Must be called under pendingStartMu. All code paths that
-// nil pendingStart must use this to ensure deliverPendingStart's stale
-// heuristic works correctly.
+// nilPendingStartLocked nils pendingStart under pendingStartMu. All code
+// paths that clear pendingStart must use this for consistency.
 func (server *Server) nilPendingStartLocked() {
 	server.pendingStart = nil
 }

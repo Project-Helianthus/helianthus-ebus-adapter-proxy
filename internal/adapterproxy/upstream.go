@@ -50,9 +50,10 @@ func dialUpstream(
 	case UpstreamTCPPlain:
 		return dialUpstreamTCPPlain(ctx, address, timeout, readTimeout, writeTimeout)
 	case UpstreamENH, UpstreamENS, "":
-		// PX51/PX58: The ENS wire codec cannot carry control frames, but
 		// ens:// is historically an alias for the ENH-framed adapter path
-		// in ebusd and helianthus-ebusgo. Route both to the ENH dialer.
+		// in ebusd and helianthus-ebusgo. Both route to the ENH dialer.
+		// Note: the ENS wire codec itself cannot carry control frames
+		// (PX51/PX58), but this alias preserves CLI compatibility.
 		return dialUpstreamENH(ctx, address, timeout, readTimeout, writeTimeout)
 	default:
 		return nil, fmt.Errorf("unsupported upstream transport %q", transport)
