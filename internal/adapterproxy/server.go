@@ -2188,8 +2188,8 @@ func (server *Server) deliverPendingStartFromArbByte(byteValue byte) bool {
 func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	// PX35: Capture pendingInfo snapshot under lock. The lock is released for
 	// the session lookup (to avoid mutex nesting with server.mutex), then
-	// re-acquired for the seq re-check and reply. Reply is sent under
-	// pendingInfoMu to prevent concurrent handleInfo from stealing responses.
+	// re-acquired for the seq re-check and state mutation. Reply is sent
+	// AFTER releasing pendingInfoMu to prevent lock-order inversion.
 	server.pendingInfoMu.Lock()
 	pending := server.pendingInfo
 	if pending == nil {
@@ -2248,7 +2248,7 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 					server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
 				}
 				server.pendingInfo = nil
-				}
+			}
 		} else {
 			server.pendingInfo.remaining--
 			if server.pendingInfo.remaining <= 0 {
@@ -2256,7 +2256,7 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 					server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
 				}
 				server.pendingInfo = nil
-				}
+			}
 		}
 	}
 	// Release pendingInfoMu BEFORE calling reply to prevent lock-order
