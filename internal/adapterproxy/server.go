@@ -143,12 +143,10 @@ type Server struct {
 	pendingStartMu       sync.Mutex
 	pendingStart         *pendingStart
 	pendingStartSeq      uint64    // PX11: monotonic counter for pendingStart identity
-	pendingStartClearedSeq     uint64    // PX11: seq of last cleared pendingStart
-	pendingStartClearedAt      time.Time // PX11: when last pendingStart was cleared
-	pendingStartClearedSession uint64    // PX11/CR4: session of the cleared pending
 
-	pendingInfoMu sync.Mutex
-	pendingInfo   *pendingInfo
+	pendingInfoMu  sync.Mutex
+	pendingInfo    *pendingInfo
+	pendingInfoSeq uint64
 	infoCache     *adapterInfoCache
 
 	leasesMu     sync.Mutex
@@ -175,10 +173,14 @@ type pendingStart struct {
 
 type pendingInfo struct {
 	sessionID uint64
+	seq       uint64             // GH-P1: monotonic counter to reject stale responses
 	remaining int
 	infoID    byte
+	createdAt time.Time          // GH-P1: for timeout-based expiry
 	frames    []downstream.Frame // accumulated response frames for caching
 }
+
+const pendingInfoTimeout = 5 * time.Second
 
 type startArbContender struct {
 	sessionID uint64
@@ -518,6 +520,16 @@ func (server *Server) Serve(ctx context.Context) error {
 			}
 		}
 
+		// Inline-3/PX53: Rate-limit accepts on the real runtime path.
+		if server.cfg.AcceptRateLimit > 0 {
+			select {
+			case <-time.After(server.cfg.AcceptRateLimit):
+			case <-ctx.Done():
+				_ = connection.Close()
+				continue
+			}
+		}
+
 		sessionState := server.registerSession(connection)
 		server.waitGroup.Add(2)
 		go func() {
@@ -540,9 +552,12 @@ func (server *Server) Serve(ctx context.Context) error {
 	if server.udpListener != nil {
 		_ = server.udpListener.Close()
 	}
+	// GH-P1: Close upstream BEFORE waitGroup.Wait() so runUpstreamReader
+	// unblocks from ReadFrame and can exit. Otherwise shutdown stalls
+	// waiting for a goroutine that will never wake.
+	_ = upstream.Close()
 	server.closeSessions()
 	server.waitGroup.Wait()
-	_ = upstream.Close()
 	if server.wireLog != nil {
 		_ = server.wireLog.Close()
 	}
@@ -693,6 +708,18 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		if server.cfg.Debug {
 			log.Printf("session=%d auto_join_initiator=0x%02X", sessionID, initiator)
 		}
+	}
+
+	// GH-P1/PX25: Validate initiator address before lease acquisition.
+	// Rejects invalid nibble patterns (e.g. 0x22) that would cause
+	// unpredictable adapter behavior.
+	if !isInitiatorAddress(initiator) {
+		log.Printf("session=%d invalid_initiator=0x%02X", sessionID, initiator)
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+		return
 	}
 
 	// PX24/CR4-P1a/CR7-P2: Reject explicit initiator if recently observed on
@@ -860,7 +887,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 	}
 	// CR7-P1: START sent successfully — clear stale markers so responses
 	// for THIS pending are not rejected by the stale heuristic.
-	server.clearStaleStartWindow()
+
 
 	select {
 	case response := <-respCh:
@@ -1038,7 +1065,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			})
 			return
 		}
-		server.clearStaleStartWindow()
+	
 
 		select {
 		case response := <-respCh:
@@ -1140,10 +1167,13 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 	if existing := server.pendingInfo; existing != nil && existing.sessionID != sessionID {
 		evictSession = existing.sessionID
 	}
+	server.pendingInfoSeq++
 	server.pendingInfo = &pendingInfo{
 		sessionID: sessionID,
+		seq:       server.pendingInfoSeq,
 		remaining: -1,
 		infoID:    infoID,
+		createdAt: time.Now(),
 	}
 	server.pendingInfoMu.Unlock()
 
@@ -1302,6 +1332,8 @@ func (server *Server) runUDPPlainWriter(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-server.upstreamLost:
+			return
 		case datagram := <-server.udpQueue:
 			if len(datagram.payload) == 0 {
 				continue
@@ -1410,6 +1442,8 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	return nil
 }
 
+const maxUDPClients = 64 // hard cap to prevent unbounded map growth
+
 func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 	if remoteAddr == nil {
 		return
@@ -1418,13 +1452,19 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 	now := time.Now()
 
 	server.udpClientsMu.Lock()
-	server.udpClients[clientAddress] = &udpClientEntry{addr: remoteAddr, lastSeen: now}
-	// PX13: Evict stale entries on registration to bound map growth.
+	// PX13: Evict stale entries first.
 	for key, entry := range server.udpClients {
 		if now.Sub(entry.lastSeen) > udpClientTTL {
 			delete(server.udpClients, key)
 		}
 	}
+	// Inline-1/2: Cap UDP clients to prevent DoS via many source ports.
+	// Also avoids O(n²) churn from scanning the full map on every packet.
+	if len(server.udpClients) >= maxUDPClients {
+		server.udpClientsMu.Unlock()
+		return
+	}
+	server.udpClients[clientAddress] = &udpClientEntry{addr: remoteAddr, lastSeen: now}
 	server.udpClientsMu.Unlock()
 }
 
@@ -1456,7 +1496,7 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 		server.clearPendingStart(0)
 		return err
 	}
-	server.clearStaleStartWindow()
+
 
 	select {
 	case response := <-respCh:
@@ -1720,22 +1760,11 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		return false
 	}
 
-	// PX11/CR4-P1b: Reject stale STARTED meant for a previous pendingStart.
-	// Only reject when the current pending belongs to a DIFFERENT session than
-	// the cleared one (same session = legitimate rapid retry, not stale).
-	if pending.seq == server.pendingStartClearedSeq+1 &&
-		pending.sessionID != server.pendingStartClearedSession &&
-		!server.pendingStartClearedAt.IsZero() &&
-		time.Since(server.pendingStartClearedAt) < 100*time.Millisecond {
-		command := southboundenh.ENHCommand(frame.Command)
-		if command == southboundenh.ENHResStarted || command == southboundenh.ENHResFailed {
-			log.Printf("session=%d reject_stale_start_result cmd=0x%02X pending_seq=%d cleared_seq=%d cleared_session=%d age=%s",
-				pending.sessionID, frame.Command, pending.seq, server.pendingStartClearedSeq,
-				server.pendingStartClearedSession, time.Since(server.pendingStartClearedAt))
-			server.pendingStartMu.Unlock()
-			return true // consumed but not delivered
-		}
-	}
+	// PX11: The stale-response heuristic has been removed. The ENH protocol
+	// does not carry per-request tokens, so a time-based guard cannot
+	// distinguish stale from legitimate fast responses and risks eating
+	// valid results (GH-P1). The existing stale-absorb logic (below) handles
+	// the case where the adapter responds with a different initiator.
 
 	frameData := byte(0x00)
 	if len(frame.Payload) > 0 {
@@ -1893,23 +1922,13 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 	server.reply(pending.sessionID, failed)
 }
 
-// PX11: nextPendingStartSeqLocked returns a monotonic sequence number for
+// nextPendingStartSeqLocked returns a monotonic sequence number for
 // pendingStart identity. Must be called under pendingStartMu.
-// NOTE: Does NOT clear pendingStartClearedAt — the stale guard must remain
-// active until clearStaleStartWindow() is called after successful WriteFrame.
 func (server *Server) nextPendingStartSeqLocked() uint64 {
 	server.pendingStartSeq++
 	return server.pendingStartSeq
 }
 
-// CR7-P1: clearStaleStartWindow clears the stale-response markers AFTER
-// the new START has been successfully written upstream. Until the write
-// succeeds, old responses must still be filtered.
-func (server *Server) clearStaleStartWindow() {
-	server.pendingStartMu.Lock()
-	server.pendingStartClearedAt = time.Time{}
-	server.pendingStartMu.Unlock()
-}
 
 func (server *Server) isStartPending() bool {
 	server.pendingStartMu.Lock()
@@ -2052,7 +2071,18 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 		server.pendingInfoMu.Unlock()
 		return false
 	}
+	// GH-P1: Expire stale pending INFO that never received a response.
+	if !pending.createdAt.IsZero() && time.Since(pending.createdAt) > pendingInfoTimeout {
+		server.pendingInfo = nil
+		server.pendingInfoMu.Unlock()
+		server.reply(pending.sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+		return false
+	}
 	pendingSessionID := pending.sessionID
+	pendingSeq := pending.seq
 	server.pendingInfoMu.Unlock()
 
 	server.mutex.Lock()
@@ -2065,10 +2095,10 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 
 	server.pendingInfoMu.Lock()
 	defer server.pendingInfoMu.Unlock()
-	// Re-check under lock BEFORE reply — concurrent handleInfo may have
-	// replaced pendingInfo, and replying to the evicted session would
-	// reintroduce INFO response theft (PX60).
-	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID {
+	// GH-P1: Re-check under lock BEFORE reply using both sessionID and seq.
+	// This prevents stale responses from being misrouted after concurrent
+	// handleInfo replaces pendingInfo.
+	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID || server.pendingInfo.seq != pendingSeq {
 		return true
 	}
 
@@ -2109,12 +2139,7 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 // nil pendingStart must use this to ensure deliverPendingStart's stale
 // heuristic works correctly.
 func (server *Server) nilPendingStartLocked() {
-	if server.pendingStart != nil {
-		server.pendingStartClearedSeq = server.pendingStart.seq
-		server.pendingStartClearedSession = server.pendingStart.sessionID
-		server.pendingStartClearedAt = time.Now()
-		server.pendingStart = nil
-	}
+	server.pendingStart = nil
 }
 
 func (server *Server) clearPendingStart(sessionID uint64) {

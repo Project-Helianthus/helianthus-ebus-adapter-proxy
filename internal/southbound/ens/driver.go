@@ -323,6 +323,9 @@ func writeAll(writer io.Writer, payload []byte) error {
 		if err != nil {
 			return err
 		}
+		if written <= 0 {
+			return fmt.Errorf("short write: 0 bytes written")
+		}
 
 		remaining = remaining[written:]
 	}

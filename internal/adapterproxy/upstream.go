@@ -49,13 +49,11 @@ func dialUpstream(
 		return dialUpstreamUDPPlain(ctx, address, timeout, readTimeout, writeTimeout)
 	case UpstreamTCPPlain:
 		return dialUpstreamTCPPlain(ctx, address, timeout, readTimeout, writeTimeout)
-	case UpstreamENH, "":
+	case UpstreamENH, UpstreamENS, "":
+		// PX51/PX58: The ENS wire codec cannot carry control frames, but
+		// ens:// is historically an alias for the ENH-framed adapter path
+		// in ebusd and helianthus-ebusgo. Route both to the ENH dialer.
 		return dialUpstreamENH(ctx, address, timeout, readTimeout, writeTimeout)
-	case UpstreamENS:
-		// PX51/PX58: ENS codec cannot carry control frames (RESETTED, STARTED,
-		// FAILED) — it is a data-only transport. Reject ENS upstream config with
-		// a clear error instead of silently falling through to the ENH dialer.
-		return nil, fmt.Errorf("upstream transport %q is not supported: ENS cannot carry control frames (RESETTED/STARTED/FAILED); use ENH or a plain transport", transport)
 	default:
 		return nil, fmt.Errorf("unsupported upstream transport %q", transport)
 	}

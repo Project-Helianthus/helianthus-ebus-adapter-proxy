@@ -33,7 +33,8 @@ type Config struct {
 	WireLogPath                            string
 	WireLogMaxSize                         int64  // PX14/PX48: max wirelog file size in bytes (0 = no limit)
 	SourceAddressPolicy                    string // PX57: reservation mode override ("soft"/"disabled")
-	MaxConcurrentSessions                  int    // PX47: max northbound sessions (0 = no limit)
+	MaxConcurrentSessions                  int           // PX47: max northbound sessions (0 = no limit)
+	AcceptRateLimit                        time.Duration // PX53: min interval between accepts (0 = unlimited)
 	Debug                                  bool
 }
 
