@@ -42,23 +42,27 @@ func (logger *wireLogger) LogLine(format string, args ...any) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
-	// PX14/PX48/CR5: Rotate at or above limit (>= not >) to prevent
-	// exceeding the configured cap by one line.
-	if logger.maxSize > 0 && logger.written >= logger.maxSize {
-		logger.rotateLocked()
-	}
-
-	// CR-P2: Guard against nil writer after failed rotation.
+	// CR-P2: Guard against nil writer.
 	if logger.writer == nil {
 		return
 	}
 
+	// Pre-format the line to know its exact size before writing.
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
-	n1, _ := fmt.Fprintf(logger.writer, "%s ", timestamp)
-	n2, _ := fmt.Fprintf(logger.writer, format, args...)
-	n3, _ := fmt.Fprintln(logger.writer)
+	line := fmt.Sprintf("%s ", timestamp) + fmt.Sprintf(format, args...) + "\n"
+	lineLen := int64(len(line))
+
+	// Rotate BEFORE writing if this line would exceed the cap.
+	if logger.maxSize > 0 && logger.written+lineLen > logger.maxSize {
+		logger.rotateLocked()
+		if logger.writer == nil {
+			return
+		}
+	}
+
+	n, _ := logger.writer.WriteString(line)
 	_ = logger.writer.Flush()
-	logger.written += int64(n1 + n2 + n3)
+	logger.written += int64(n)
 }
 
 // PX14/PX48: rotateLocked renames the current file and opens a new one.

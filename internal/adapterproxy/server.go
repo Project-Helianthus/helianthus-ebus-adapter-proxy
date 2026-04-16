@@ -1212,8 +1212,11 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 	// atomically under the same lock to prevent three-way races.
 	server.pendingInfoMu.Lock()
 	var evictSession uint64
-	if existing := server.pendingInfo; existing != nil && existing.sessionID != sessionID {
+	if existing := server.pendingInfo; existing != nil {
 		evictSession = existing.sessionID
+		// Evict ANY existing pending INFO (same or different session).
+		// Same-session overlap can corrupt response correlation since INFO
+		// responses carry no request identifier.
 	}
 	server.pendingInfoSeq++
 	server.pendingInfo = &pendingInfo{
@@ -1225,7 +1228,7 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 	}
 	server.pendingInfoMu.Unlock()
 
-	// Send eviction error outside the lock to avoid blocking other callers.
+	// Send eviction error outside the lock.
 	if evictSession != 0 {
 		server.reply(evictSession, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
@@ -1406,19 +1409,11 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	if len(payload) == 0 {
 		return nil
 	}
-	// PX9/CR6: When forwarding through ENH upstream, reject UDP datagrams
-	// containing SYN (0xAA). The proxy's state machine treats received 0xAA
-	// as a bus SYN, triggering ownership release mid-transaction. ESC (0xA9)
-	// is NOT filtered because ENH encoding wraps each byte in a 2-byte pair,
-	// so 0xA9 never appears as a raw control byte on ENH transport.
-	// On wire-plain upstream, 0xAA is a valid physical SYN — no filtering.
-	if !server.isWirePlainUpstream() {
-		for _, b := range payload {
-			if b == ebusSyn {
-				return fmt.Errorf("udp datagram contains SYN byte 0xAA via ENH upstream")
-			}
-		}
-	}
+	// PX9: No payload-level byte filtering needed. ENH encoding wraps each
+	// logical byte in a 2-byte pair, so 0xAA (SYN) and 0xA9 (ESC) in the
+	// payload are encoded by the ENH encoder and never appear as raw control
+	// bytes on the wire. On wire-plain upstream, all bytes are physical bus
+	// symbols and pass through unmodified (including SYN for bus sync).
 	// PX28/PX46: Enforce maximum telegram length to prevent adapter FIFO
 	// truncation and unbounded forwarding under a single bus token.
 	if len(payload) > maxEBUSTelegramLen {
