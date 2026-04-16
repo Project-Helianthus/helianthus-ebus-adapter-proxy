@@ -117,22 +117,23 @@ func (listener *Listener) Serve(ctx context.Context) error {
 		}
 	}()
 
+	// CR5: Labeled loop so break/continue from nested selects exit correctly.
+acceptLoop:
 	for {
 		connection, err := listener.listener.Accept()
 		if err != nil {
 			if listener.isClosedError(err) || ctx.Err() != nil || listener.isClosed() {
-				break
+				break acceptLoop
 			}
 
 			listener.recordError(SessionInfo{}, err)
 			continue
 		}
 
-		// CR3-P1b: Check closed state BEFORE rate-limit sleep to prevent
-		// dispatching connections after Close() has returned.
+		// CR3-P1b: Check closed state BEFORE rate-limit sleep.
 		if listener.isClosed() {
 			_ = connection.Close()
-			break
+			break acceptLoop
 		}
 
 		// PX47: Enforce max concurrent sessions.
@@ -146,17 +147,17 @@ func (listener *Listener) Serve(ctx context.Context) error {
 			}
 		}
 
-		// PX53: Rate-limit accepts with context cancellation support.
+		// PX53/CR5: Rate-limit with proper loop exit on cancellation.
 		if listener.options.AcceptRateLimit > 0 {
 			select {
 			case <-time.After(listener.options.AcceptRateLimit):
 			case <-ctx.Done():
 				_ = connection.Close()
-				break
+				break acceptLoop
 			}
 			if listener.isClosed() {
 				_ = connection.Close()
-				break
+				break acceptLoop
 			}
 		}
 

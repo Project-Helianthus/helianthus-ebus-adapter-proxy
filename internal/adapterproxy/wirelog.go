@@ -43,8 +43,9 @@ func (logger *wireLogger) LogLine(format string, args ...any) {
 	logger.mu.Lock()
 	defer logger.mu.Unlock()
 
-	// PX14/PX48: Check rotation before writing.
-	if logger.maxSize > 0 && logger.written > logger.maxSize {
+	// PX14/PX48/CR5: Rotate at or above limit (>= not >) to prevent
+	// exceeding the configured cap by one line.
+	if logger.maxSize > 0 && logger.written >= logger.maxSize {
 		logger.rotateLocked()
 	}
 

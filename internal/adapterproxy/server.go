@@ -579,7 +579,7 @@ func (server *Server) unregisterSession(sessionID uint64) {
 
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
-		server.pendingStart = nil
+		server.nilPendingStartLocked()
 	}
 	server.pendingStartMu.Unlock()
 
@@ -923,7 +923,7 @@ func (server *Server) handleStartCancel(sessionID uint64) {
 	server.pendingStartMu.Lock()
 	pending := server.pendingStart
 	if pending != nil && pending.sessionID == sessionID {
-		server.pendingStart = nil
+		server.nilPendingStartLocked()
 	}
 	server.pendingStartMu.Unlock()
 
@@ -1516,7 +1516,7 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			// Use ErrorHost (not FAILED) to avoid false collision marking in handleStart.
 			server.pendingStartMu.Lock()
 			if ps := server.pendingStart; ps != nil {
-				server.pendingStart = nil
+				server.nilPendingStartLocked()
 				server.pendingStartMu.Unlock()
 				log.Printf("session=%d resetted_abort_pending_start initiator=0x%02X", ps.sessionID, ps.initiator)
 				abortFrame := downstream.Frame{
@@ -1760,7 +1760,7 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 			return true
 		}
 
-		server.pendingStart = nil
+		server.nilPendingStartLocked()
 		server.pendingStartMu.Unlock()
 		log.Printf(
 			"session=%d start_stale_absorb_expired requested=0x%02X adapter_won=0x%02X window=%s -> converting STARTED to FAILED",
@@ -1785,7 +1785,7 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 
 	// Clear pending once a terminal START result frame is consumed so that
 	// subsequent wire bytes are not dropped by the "start pending" fast-path.
-	server.pendingStart = nil
+	server.nilPendingStartLocked()
 	hadStaleAbsorb := pending.mode == pendingStartModeENH &&
 		pending.staleObserved &&
 		command == southboundenh.ENHResStarted &&
@@ -1847,7 +1847,7 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 		return
 	}
 
-	server.pendingStart = nil
+	server.nilPendingStartLocked()
 	winner := pending.staleWinner
 	server.pendingStartMu.Unlock()
 
@@ -1877,9 +1877,12 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 }
 
 // PX11: nextPendingStartSeqLocked returns a monotonic sequence number for
-// pendingStart identity. Must be called under pendingStartMu.
+// pendingStart identity and clears stale markers. Must be called under
+// pendingStartMu. Clearing stale markers here means: once a new START
+// has been sent upstream, any response is for THIS pending, not stale.
 func (server *Server) nextPendingStartSeqLocked() uint64 {
 	server.pendingStartSeq++
+	server.pendingStartClearedAt = time.Time{} // clear stale window
 	return server.pendingStartSeq
 }
 
@@ -2074,15 +2077,23 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	return true
 }
 
-func (server *Server) clearPendingStart(sessionID uint64) {
-	server.pendingStartMu.Lock()
-	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
-		// PX11/CR4: Record cleared seq+session+time so deliverPendingStart can
-		// reject stale STARTED frames that arrive for a re-created pending.
+// CR5-P1: nilPendingStartLocked records stale-tracking metadata and nils
+// pendingStart. Must be called under pendingStartMu. All code paths that
+// nil pendingStart must use this to ensure deliverPendingStart's stale
+// heuristic works correctly.
+func (server *Server) nilPendingStartLocked() {
+	if server.pendingStart != nil {
 		server.pendingStartClearedSeq = server.pendingStart.seq
 		server.pendingStartClearedSession = server.pendingStart.sessionID
 		server.pendingStartClearedAt = time.Now()
 		server.pendingStart = nil
+	}
+}
+
+func (server *Server) clearPendingStart(sessionID uint64) {
+	server.pendingStartMu.Lock()
+	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
+		server.nilPendingStartLocked()
 	}
 	server.pendingStartMu.Unlock()
 }
