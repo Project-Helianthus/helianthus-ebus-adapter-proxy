@@ -1240,6 +1240,10 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		Command: byte(southboundenh.ENHReqInfo),
 		Payload: []byte{infoID},
 	}
+
+	// Capture our seq before writing — we'll verify ownership after.
+	mySeq := server.pendingInfoSeq
+
 	if err := server.upstream.WriteFrame(infoFrame); err != nil {
 		server.clearPendingInfo(sessionID)
 		server.reply(sessionID, downstream.Frame{
@@ -1248,6 +1252,20 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		})
 		return
 	}
+
+	// Re-check ownership after write. If another session evicted us during
+	// WriteFrame, our upstream INFO request is orphaned — the response will
+	// be correlated against the new pending. Notify ourselves with ErrorHost.
+	server.pendingInfoMu.Lock()
+	if server.pendingInfo == nil || server.pendingInfo.seq != mySeq {
+		server.pendingInfoMu.Unlock()
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+		return
+	}
+	server.pendingInfoMu.Unlock()
 }
 
 func (server *Server) handleSend(sessionID uint64, data byte) {
