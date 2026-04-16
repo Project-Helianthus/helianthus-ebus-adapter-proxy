@@ -345,7 +345,7 @@ func validateEmulationTargetProfiles(
 		}
 
 		// AT-11/PX32: Reject all protocol control symbols as target addresses.
-		if isReservedTargetAddress(targetProfile.TargetAddress) {
+		if isReservedProtocolAddress(targetProfile.TargetAddress) {
 			validationErrors = append(validationErrors, ValidationError{
 				Code:    "address.invalid_reserved",
 				Field:   fmt.Sprintf("emulation.target_profiles[%d].target_address", index),
@@ -489,7 +489,7 @@ func validateAddressList(field string, addresses []uint8) ValidationErrors {
 	seenAddresses := make(map[uint8]struct{})
 
 	for index, address := range addresses {
-		if isReservedTargetAddress(address) {
+		if isReservedProtocolAddress(address) {
 			validationErrors = append(validationErrors, ValidationError{
 				Code:    "address.invalid_reserved",
 				Field:   fmt.Sprintf("%s[%d]", field, index),
@@ -539,7 +539,7 @@ func buildAddressSet(addresses []uint8) map[uint8]struct{} {
 }
 
 // AT-11/PX32: Protocol control symbols that cannot be used as target addresses.
-func isReservedTargetAddress(address uint8) bool {
+func isReservedProtocolAddress(address uint8) bool {
 	switch address {
 	case 0x00, 0xFF, 0xA9, 0xAA:
 		return true

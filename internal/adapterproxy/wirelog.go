@@ -15,7 +15,6 @@ type wireLogger struct {
 	path     string
 	maxSize  int64 // PX14/PX48: 0 = no rotation
 	written  int64
-	rotateN  int // CR4-P2a: disambiguate same-second rotations
 }
 
 func (logger *wireLogger) Close() error {
@@ -71,8 +70,8 @@ func (logger *wireLogger) rotateLocked() {
 	_ = logger.file.Close()
 
 	// AT-09/CR4-P2a: Use timestamp+counter suffix for uniqueness.
-	logger.rotateN++
-	rotatedPath := fmt.Sprintf("%s.%s.%d", logger.path, time.Now().UTC().Format("20060102-150405"), logger.rotateN)
+	// Copilot: Use nanosecond timestamp to avoid collision after restart.
+	rotatedPath := fmt.Sprintf("%s.%d", logger.path, time.Now().UnixNano())
 	if err := os.Rename(logger.path, rotatedPath); err != nil {
 		// CR6-P2b: Rename failed — reopen in append mode and seed written
 		// from the actual file size so rotation stays aligned.

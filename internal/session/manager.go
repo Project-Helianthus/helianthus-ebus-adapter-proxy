@@ -165,8 +165,7 @@ func (manager *Manager) Register(identity Identity) (Session, error) {
 		}
 
 		// PX39/PX52/PX70: Clean stale disconnected session to allow
-		// re-registration with the same identity, using a distinct error
-		// sentinel so callers can distinguish Register vs Enqueue failures.
+		// re-registration with the same identity.
 		delete(manager.identityToID, identityKey)
 		delete(manager.sessions, existingSessionID)
 	}

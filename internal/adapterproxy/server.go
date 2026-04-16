@@ -1895,6 +1895,8 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 
 // PX11: nextPendingStartSeqLocked returns a monotonic sequence number for
 // pendingStart identity. Must be called under pendingStartMu.
+// NOTE: Does NOT clear pendingStartClearedAt — the stale guard must remain
+// active until clearStaleStartWindow() is called after successful WriteFrame.
 func (server *Server) nextPendingStartSeqLocked() uint64 {
 	server.pendingStartSeq++
 	return server.pendingStartSeq

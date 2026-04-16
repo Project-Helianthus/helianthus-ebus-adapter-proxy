@@ -261,7 +261,7 @@ func TestBroadcastUDPPlainByteWritesToRegisteredClient(t *testing.T) {
 	server := &Server{
 		udpListener: serverConn,
 		udpClients: map[string]*udpClientEntry{
-			clientConn.LocalAddr().String(): {addr: clientConn.LocalAddr().(*net.UDPAddr), lastSeen: time.Now()},
+			clientConn.LocalAddr().String(): &udpClientEntry{addr: clientConn.LocalAddr().(*net.UDPAddr), lastSeen: time.Now()},
 		},
 	}
 
