@@ -143,8 +143,9 @@ type Server struct {
 	pendingStartMu       sync.Mutex
 	pendingStart         *pendingStart
 	pendingStartSeq      uint64    // PX11: monotonic counter for pendingStart identity
-	pendingStartClearedSeq uint64  // PX11: seq of last cleared pendingStart
-	pendingStartClearedAt  time.Time // PX11: when last pendingStart was cleared
+	pendingStartClearedSeq     uint64    // PX11: seq of last cleared pendingStart
+	pendingStartClearedAt      time.Time // PX11: when last pendingStart was cleared
+	pendingStartClearedSession uint64    // PX11/CR4: session of the cleared pending
 
 	pendingInfoMu sync.Mutex
 	pendingInfo   *pendingInfo
@@ -506,6 +507,17 @@ func (server *Server) Serve(ctx context.Context) error {
 			continue
 		}
 
+		// CR4-P2b: Enforce MaxConcurrentSessions at the adapter-proxy level.
+		if server.cfg.MaxConcurrentSessions > 0 {
+			server.mutex.Lock()
+			active := len(server.sessions)
+			server.mutex.Unlock()
+			if active >= server.cfg.MaxConcurrentSessions {
+				_ = connection.Close()
+				continue
+			}
+		}
+
 		sessionState := server.registerSession(connection)
 		server.waitGroup.Add(2)
 		go func() {
@@ -683,16 +695,19 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 	}
 
-	// PX24: Reject explicit initiator if recently observed on the bus from an
-	// external device. The lease system only tracks proxy-managed addresses;
-	// this check prevents bus collisions with third-party controllers.
-	if server.isObservedExternalInitiator(initiator) {
-		log.Printf("session=%d explicit_initiator_rejected_observed initiator=0x%02X", sessionID, initiator)
-		server.reply(sessionID, downstream.Frame{
-			Command: byte(southboundenh.ENHResFailed),
-			Payload: []byte{initiator},
-		})
-		return
+	// PX24/CR4-P1a: Reject explicit initiator if recently observed on the bus
+	// from an external device AND this session does not already own a lease for
+	// the same address (which would mean the observed traffic is from ourselves).
+	leaseAddr, hasLease := server.sessionLeaseAddress(sessionID)
+	if !(hasLease && leaseAddr == initiator) {
+		if server.isObservedExternalInitiator(initiator) {
+			log.Printf("session=%d explicit_initiator_rejected_observed initiator=0x%02X", sessionID, initiator)
+			server.reply(sessionID, downstream.Frame{
+				Command: byte(southboundenh.ENHResFailed),
+				Payload: []byte{initiator},
+			})
+			return
+		}
 	}
 
 	selectedInitiator, err := server.acquireLease(sessionID, initiator)
@@ -1688,18 +1703,18 @@ func (server *Server) deliverPendingStart(frame downstream.Frame) bool {
 		return false
 	}
 
-	// PX11: Reject stale STARTED that was meant for a previous pendingStart.
-	// If the current pending was created within 200ms of the last clear AND
-	// its seq is the immediate successor, this STARTED likely belongs to the
-	// cleared (timed-out) pending, not the current one.
+	// PX11/CR4-P1b: Reject stale STARTED meant for a previous pendingStart.
+	// Only reject when the current pending belongs to a DIFFERENT session than
+	// the cleared one (same session = legitimate rapid retry, not stale).
 	if pending.seq == server.pendingStartClearedSeq+1 &&
+		pending.sessionID != server.pendingStartClearedSession &&
 		!server.pendingStartClearedAt.IsZero() &&
-		time.Since(server.pendingStartClearedAt) < 200*time.Millisecond {
+		time.Since(server.pendingStartClearedAt) < 100*time.Millisecond {
 		command := southboundenh.ENHCommand(frame.Command)
 		if command == southboundenh.ENHResStarted || command == southboundenh.ENHResFailed {
-			log.Printf("session=%d reject_stale_start_result cmd=0x%02X pending_seq=%d cleared_seq=%d age=%s",
+			log.Printf("session=%d reject_stale_start_result cmd=0x%02X pending_seq=%d cleared_seq=%d cleared_session=%d age=%s",
 				pending.sessionID, frame.Command, pending.seq, server.pendingStartClearedSeq,
-				time.Since(server.pendingStartClearedAt))
+				server.pendingStartClearedSession, time.Since(server.pendingStartClearedAt))
 			server.pendingStartMu.Unlock()
 			return true // consumed but not delivered
 		}
@@ -2062,9 +2077,10 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 func (server *Server) clearPendingStart(sessionID uint64) {
 	server.pendingStartMu.Lock()
 	if server.pendingStart != nil && server.pendingStart.sessionID == sessionID {
-		// PX11: Record cleared seq+time so deliverPendingStart can reject
-		// stale STARTED frames that arrive after timeout for a re-created pending.
+		// PX11/CR4: Record cleared seq+session+time so deliverPendingStart can
+		// reject stale STARTED frames that arrive for a re-created pending.
 		server.pendingStartClearedSeq = server.pendingStart.seq
+		server.pendingStartClearedSession = server.pendingStart.sessionID
 		server.pendingStartClearedAt = time.Now()
 		server.pendingStart = nil
 	}

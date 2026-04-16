@@ -9,12 +9,13 @@ import (
 )
 
 type wireLogger struct {
-	mu      sync.Mutex
-	file    *os.File
-	writer  *bufio.Writer
-	path    string
-	maxSize int64 // PX14/PX48: 0 = no rotation
-	written int64
+	mu       sync.Mutex
+	file     *os.File
+	writer   *bufio.Writer
+	path     string
+	maxSize  int64 // PX14/PX48: 0 = no rotation
+	written  int64
+	rotateN  int // CR4-P2a: disambiguate same-second rotations
 }
 
 func (logger *wireLogger) Close() error {
@@ -68,9 +69,10 @@ func (logger *wireLogger) rotateLocked() {
 	_ = logger.writer.Flush()
 	_ = logger.file.Close()
 
-	// AT-09: Use timestamp suffix to avoid overwriting rotated files from
-	// previous process runs.
-	rotatedPath := fmt.Sprintf("%s.%s", logger.path, time.Now().UTC().Format("20060102-150405"))
+	// AT-09/CR4-P2a: Use timestamp+counter suffix for uniqueness across
+	// restarts and same-second rollovers.
+	logger.rotateN++
+	rotatedPath := fmt.Sprintf("%s.%s.%d", logger.path, time.Now().UTC().Format("20060102-150405"), logger.rotateN)
 	_ = os.Rename(logger.path, rotatedPath)
 
 	newFile, err := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
