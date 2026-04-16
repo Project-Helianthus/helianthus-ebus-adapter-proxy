@@ -70,11 +70,25 @@ func (logger *wireLogger) rotateLocked() {
 	_ = logger.writer.Flush()
 	_ = logger.file.Close()
 
-	// AT-09/CR4-P2a: Use timestamp+counter suffix for uniqueness across
-	// restarts and same-second rollovers.
+	// AT-09/CR4-P2a: Use timestamp+counter suffix for uniqueness.
 	logger.rotateN++
 	rotatedPath := fmt.Sprintf("%s.%s.%d", logger.path, time.Now().UTC().Format("20060102-150405"), logger.rotateN)
-	_ = os.Rename(logger.path, rotatedPath)
+	if err := os.Rename(logger.path, rotatedPath); err != nil {
+		// CR6-P2b: Rename failed — reopen in append mode and seed written
+		// from the actual file size so rotation stays aligned.
+		newFile, openErr := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if openErr != nil {
+			logger.file = nil
+			logger.writer = nil
+			return
+		}
+		logger.file = newFile
+		logger.writer = bufio.NewWriterSize(newFile, 16*1024)
+		if stat, statErr := newFile.Stat(); statErr == nil {
+			logger.written = stat.Size()
+		}
+		return
+	}
 
 	newFile, err := os.OpenFile(logger.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {

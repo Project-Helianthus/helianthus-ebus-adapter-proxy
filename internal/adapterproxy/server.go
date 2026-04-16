@@ -1309,14 +1309,16 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	if len(payload) == 0 {
 		return nil
 	}
-	// PX9: When forwarding through ENH upstream, reject UDP datagrams containing
-	// protocol control bytes (SYN=0xAA, ESC=0xA9). The proxy's own state machine
-	// would misinterpret 0xAA as SYN-release and 0xA9 as ENS escape. On wire-plain
-	// upstream, these bytes go directly to the bus and are valid physical symbols.
+	// PX9/CR6: When forwarding through ENH upstream, reject UDP datagrams
+	// containing SYN (0xAA). The proxy's state machine treats received 0xAA
+	// as a bus SYN, triggering ownership release mid-transaction. ESC (0xA9)
+	// is NOT filtered because ENH encoding wraps each byte in a 2-byte pair,
+	// so 0xA9 never appears as a raw control byte on ENH transport.
+	// On wire-plain upstream, 0xAA is a valid physical SYN — no filtering.
 	if !server.isWirePlainUpstream() {
 		for _, b := range payload {
-			if b == ebusSyn || b == 0xA9 {
-				return fmt.Errorf("udp datagram contains protocol control byte 0x%02X via ENH upstream", b)
+			if b == ebusSyn {
+				return fmt.Errorf("udp datagram contains SYN byte 0xAA via ENH upstream")
 			}
 		}
 	}
