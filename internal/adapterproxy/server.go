@@ -2063,14 +2063,16 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 		return false
 	}
 
-	server.reply(pendingSessionID, frame)
-
 	server.pendingInfoMu.Lock()
 	defer server.pendingInfoMu.Unlock()
-	// Re-check under lock — concurrent handleInfo may have replaced pendingInfo.
+	// Re-check under lock BEFORE reply — concurrent handleInfo may have
+	// replaced pendingInfo, and replying to the evicted session would
+	// reintroduce INFO response theft (PX60).
 	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID {
 		return true
 	}
+
+	server.reply(pendingSessionID, frame)
 
 	// Collect frames for identity caching.
 	if isIdentityID(server.pendingInfo.infoID) {
