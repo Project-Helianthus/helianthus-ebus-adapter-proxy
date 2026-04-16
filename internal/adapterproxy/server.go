@@ -694,7 +694,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		if !server.isWirePlainUpstream() {
 			// Forward best-effort cancellation upstream. The enhanced protocol does not
 			// mandate a response for START+SYN, so we must not block waiting for one.
-			_ = server.upstream.WriteFrame(downstream.Frame{
+			_ = server.writeUpstreamSerialized(downstream.Frame{
 				Command: byte(southboundenh.ENHReqStart),
 				Payload: []byte{initiator},
 			})
@@ -890,7 +890,7 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		Command: byte(southboundenh.ENHReqStart),
 		Payload: []byte{initiator},
 	}
-	if err := server.upstream.WriteFrame(startFrame); err != nil {
+	if err := server.writeUpstreamSerialized(startFrame); err != nil {
 		server.clearPendingStart(sessionID)
 		if !ownedBySession {
 			server.releaseLease(sessionID)
@@ -1243,7 +1243,7 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		Payload: []byte{infoID},
 	}
 
-	if err := server.upstream.WriteFrame(infoFrame); err != nil {
+	if err := server.writeUpstreamSerialized(infoFrame); err != nil {
 		server.clearPendingInfo(sessionID)
 		server.reply(sessionID, downstream.Frame{
 			Command: byte(southboundenh.ENHResErrorHost),
@@ -1565,7 +1565,7 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 	}
 	server.pendingStartMu.Unlock()
 
-	if err := server.upstream.WriteFrame(downstream.Frame{
+	if err := server.writeUpstreamSerialized(downstream.Frame{
 		Command: byte(southboundenh.ENHReqStart),
 		Payload: []byte{initiator},
 	}); err != nil {
@@ -2090,13 +2090,12 @@ func (server *Server) logWireTX(value byte) {
 	server.wireLog.LogLine("TX %02X", value)
 }
 
-// PX42: writeUpstreamSerialized serializes logWireTX + WriteFrame under
-// wireWriteMu so concurrent sessions' TX bytes appear in wirelog in the
-// same order as the actual wire writes.
+// writeUpstreamSerialized serializes ALL upstream writes under wireWriteMu.
+// TX logging only applies to SEND commands (data bytes on the wire).
 func (server *Server) writeUpstreamSerialized(frame downstream.Frame) error {
 	server.wireWriteMu.Lock()
 	defer server.wireWriteMu.Unlock()
-	if len(frame.Payload) == 1 {
+	if len(frame.Payload) == 1 && southboundenh.ENHCommand(frame.Command) == southboundenh.ENHReqSend {
 		server.logWireTX(frame.Payload[0])
 	}
 	return server.upstream.WriteFrame(frame)
@@ -2167,43 +2166,42 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	}
 
 	server.pendingInfoMu.Lock()
-	defer server.pendingInfoMu.Unlock()
-	// GH-P1: Re-check under lock BEFORE reply using both sessionID and seq.
-	// This prevents stale responses from being misrouted after concurrent
-	// handleInfo replaces pendingInfo.
+	// Re-check under lock using both sessionID and seq.
 	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID || server.pendingInfo.seq != pendingSeq {
+		server.pendingInfoMu.Unlock()
 		return true
 	}
-
-	server.reply(pendingSessionID, frame)
 
 	// Collect frames for identity caching.
 	if isIdentityID(server.pendingInfo.infoID) {
 		server.pendingInfo.frames = append(server.pendingInfo.frames, frame)
 	}
 
-	if len(frame.Payload) != 1 {
-		return true
-	}
-
-	if server.pendingInfo.remaining < 0 {
-		server.pendingInfo.remaining = int(frame.Payload[0])
-		if server.pendingInfo.remaining <= 0 {
-			if isIdentityID(server.pendingInfo.infoID) {
-				server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
-			}
-			server.pendingInfo = nil
+	// Track remaining and finalize cache before releasing the lock.
+	if len(frame.Payload) == 1 {
+		if server.pendingInfo.remaining < 0 {
+			server.pendingInfo.remaining = int(frame.Payload[0])
+			if server.pendingInfo.remaining <= 0 {
+				if isIdentityID(server.pendingInfo.infoID) {
+					server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
+				}
+				server.pendingInfo = nil
+				}
+		} else {
+			server.pendingInfo.remaining--
+			if server.pendingInfo.remaining <= 0 {
+				if isIdentityID(server.pendingInfo.infoID) {
+					server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
+				}
+				server.pendingInfo = nil
+				}
 		}
-		return true
 	}
+	// Release pendingInfoMu BEFORE calling reply to prevent lock-order
+	// inversion with server.mutex (handleInfo takes mutex then pendingInfoMu).
+	server.pendingInfoMu.Unlock()
 
-	server.pendingInfo.remaining--
-	if server.pendingInfo.remaining <= 0 {
-		if isIdentityID(server.pendingInfo.infoID) {
-			server.infoCache.put(server.pendingInfo.infoID, server.pendingInfo.frames)
-		}
-		server.pendingInfo = nil
-	}
+	server.reply(pendingSessionID, frame)
 	return true
 }
 

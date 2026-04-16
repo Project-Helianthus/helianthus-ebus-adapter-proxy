@@ -73,7 +73,7 @@ func (logger *wireLogger) rotateLocked() {
 	_ = logger.writer.Flush()
 	_ = logger.file.Close()
 
-	// AT-09/CR4-P2a: Use timestamp+counter suffix for uniqueness.
+	// Use nanosecond timestamp suffix for uniqueness across restarts.
 	// Use a nanosecond timestamp suffix to reduce rotation name collisions across rapid restarts.
 	rotatedPath := fmt.Sprintf("%s.%d", logger.path, time.Now().UnixNano())
 	if err := os.Rename(logger.path, rotatedPath); err != nil {
