@@ -521,19 +521,20 @@ func (server *Server) Serve(ctx context.Context) error {
 		}
 
 		// Inline-3/PX53: Rate-limit accepts on the real runtime path.
-		// CR-P2: Also abort on upstreamLost to prevent dispatching against dead upstream.
+		// CR-P2: Also abort on upstreamLost or ctx cancellation.
 		if server.cfg.AcceptRateLimit > 0 {
+			rateLimitAbort := false
 			select {
 			case <-time.After(server.cfg.AcceptRateLimit):
 			case <-ctx.Done():
 				_ = connection.Close()
-				continue
+				rateLimitAbort = true
 			case <-server.upstreamLost:
 				_ = connection.Close()
 				upstreamDied = true
-				break
+				rateLimitAbort = true
 			}
-			if upstreamDied {
+			if rateLimitAbort {
 				break
 			}
 		}
