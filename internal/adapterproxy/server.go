@@ -429,10 +429,27 @@ func (server *Server) Serve(ctx context.Context) error {
 		if server.cfg.Debug {
 			log.Printf("auto_join_warmup=%s", server.cfg.AutoJoinWarmup)
 		}
+		warmupCancelled := false
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			warmupCancelled = true
 		case <-time.After(server.cfg.AutoJoinWarmup):
+		}
+		// R1: If ctx was cancelled during warmup, fall through to the cleanup
+		// path instead of returning early — listener, upstream, and goroutines
+		// must be cleaned up properly.
+		if warmupCancelled {
+			_ = listener.Close()
+			if server.udpListener != nil {
+				_ = server.udpListener.Close()
+			}
+			_ = upstream.Close()
+			server.closeSessions()
+			server.waitGroup.Wait()
+			if server.wireLog != nil {
+				_ = server.wireLog.Close()
+			}
+			return ctx.Err()
 		}
 		if selected, err := server.selectAutoInitiator(); err == nil {
 			server.mutex.Lock()
@@ -1449,6 +1466,8 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 	// short timeout so the datagram is retried rather than dropped.
 	server.mutex.Lock()
 	hasTCPContenders := len(server.startArbContenders) > 0
+	// R4: Check if a TCP session was already granted arbitration.
+	tcpGranted := server.startArbGrantSession != 0
 	server.mutex.Unlock()
 	if hasTCPContenders {
 		select {
@@ -1456,6 +1475,12 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+
+	// R4: When a TCP session has been granted arbitration, UDP must not
+	// drain the bus token — doing so would starve the granted session.
+	if tcpGranted {
+		return fmt.Errorf("udp bridge: bus token reserved for granted TCP session")
 	}
 
 	select {
@@ -1477,6 +1502,11 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		if !isInitiatorAddress(initiator) {
 			return fmt.Errorf("udp bridge: invalid initiator 0x%02X", initiator)
 		}
+		// R3: Reject initiator observed on the bus from an external device,
+		// same guard that handleStart uses for TCP sessions (see ~line 758).
+		if server.isObservedExternalInitiator(initiator) {
+			return fmt.Errorf("udp bridge: initiator 0x%02X observed externally", initiator)
+		}
 		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
@@ -1484,6 +1514,10 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		releaseToken = false
 		payload = payload[1:]
 		if len(payload) == 0 {
+			// R5: Payload contained only the initiator byte — the bridge
+			// was started but there is nothing to send. Release ownership
+			// and bus token to avoid leaking them.
+			server.releaseBusIfOwner(udpBridgeOwnerID)
 			return nil
 		}
 	}
@@ -1609,6 +1643,12 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 func (server *Server) runUpstreamReader(ctx context.Context) {
 	defer server.waitGroup.Done()
 
+	// R2: Track consecutive timeouts to detect blackholed adapters
+	// (connected but unresponsive). 60 consecutive timeouts at ~500ms
+	// read deadline = ~30s of silence.
+	const maxConsecutiveTimeouts = 60
+	consecutiveTimeouts := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1619,6 +1659,16 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		frame, err := server.upstream.ReadFrame()
 		if err != nil {
 			if isTimeoutError(err) {
+				consecutiveTimeouts++
+				if consecutiveTimeouts >= maxConsecutiveTimeouts {
+					log.Printf("upstream_blackhole_detected consecutive_timeouts=%d", consecutiveTimeouts)
+					server.upstreamLostOnce.Do(func() {
+						if server.upstreamLost != nil {
+							close(server.upstreamLost)
+						}
+					})
+					return
+				}
 				continue
 			}
 			if errors.Is(err, io.EOF) || isClosedNetworkError(err) {
@@ -1637,6 +1687,9 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			}
 			continue
 		}
+
+		// R2: Reset consecutive timeout counter on any successful read.
+		consecutiveTimeouts = 0
 
 		switch southboundenh.ENHCommand(frame.Command) {
 		case southboundenh.ENHResResetted:
@@ -2169,8 +2222,17 @@ func (server *Server) deliverPendingInfo(frame downstream.Frame) bool {
 	// Re-check under lock using both sessionID and seq.
 	if server.pendingInfo == nil || server.pendingInfo.sessionID != pendingSessionID || server.pendingInfo.seq != pendingSeq {
 		server.pendingInfoMu.Unlock()
-		return true
+		// R7: Return false — the pending changed between snapshot and
+		// re-check, so this frame was not consumed. Returning true would
+		// silently drop a valid frame that other handlers (broadcast, etc.)
+		// could process.
+		return false
 	}
+
+	// R6: Refresh the timeout on each successfully delivered frame so that
+	// actively-arriving multi-frame INFO responses are not killed by the
+	// hard 5s cutoff from the original creation time.
+	server.pendingInfo.createdAt = time.Now()
 
 	// Collect frames for identity caching.
 	if isIdentityID(server.pendingInfo.infoID) {

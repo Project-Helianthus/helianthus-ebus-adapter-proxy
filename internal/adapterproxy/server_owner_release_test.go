@@ -3,6 +3,7 @@ package adapterproxy
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 	"time"
 
@@ -873,19 +874,25 @@ func TestDeliverPendingStartENHStartedMismatchExpiresBounded(t *testing.T) {
 }
 
 type deterministicStartUpstream struct {
-	readCh  chan downstream.Frame
-	writeCh chan downstream.Frame
+	readCh    chan downstream.Frame
+	writeCh   chan downstream.Frame
+	closeOnce sync.Once
+	closed    chan struct{}
 }
 
 func newDeterministicStartUpstream() *deterministicStartUpstream {
 	return &deterministicStartUpstream{
 		readCh:  make(chan downstream.Frame, 32),
 		writeCh: make(chan downstream.Frame, 32),
+		closed:  make(chan struct{}),
 	}
 }
 
 func (upstream *deterministicStartUpstream) Close() error {
-	close(upstream.readCh)
+	upstream.closeOnce.Do(func() {
+		close(upstream.closed)
+		close(upstream.readCh)
+	})
 	return nil
 }
 
@@ -898,11 +905,19 @@ func (upstream *deterministicStartUpstream) ReadFrame() (downstream.Frame, error
 }
 
 func (upstream *deterministicStartUpstream) WriteFrame(frame downstream.Frame) error {
+	select {
+	case <-upstream.closed:
+		return io.EOF
+	default:
+	}
 	upstream.writeCh <- frame
 	if southboundenh.ENHCommand(frame.Command) == southboundenh.ENHReqStart && len(frame.Payload) == 1 {
-		upstream.readCh <- downstream.Frame{
+		select {
+		case upstream.readCh <- downstream.Frame{
 			Command: byte(southboundenh.ENHResStarted),
 			Payload: []byte{frame.Payload[0]},
+		}:
+		case <-upstream.closed:
 		}
 	}
 	return nil
@@ -939,70 +954,73 @@ func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
+	// T5: Register session 1 first and wait, ensuring deterministic FIFO order.
 	highDone := make(chan struct{})
-	lowDone := make(chan struct{})
-
 	go func() {
 		defer close(highDone)
 		server.handleStart(ctx, 1, 0x71)
 	}()
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		_, has1 := server.startArbContenders[1]
+		return has1
+	}) {
+		t.Fatalf("expected session 1 contender before session 2")
+	}
+
+	lowDone := make(chan struct{})
 	go func() {
 		defer close(lowDone)
 		server.handleStart(ctx, 2, 0x31)
 	}()
-
 	if !waitUntil(300*time.Millisecond, func() bool {
 		server.mutex.Lock()
 		defer server.mutex.Unlock()
 		return len(server.startArbContenders) == 2
 	}) {
-		t.Fatalf("expected two arbitration contenders before boundary release")
+		t.Fatalf("expected two contenders before boundary release")
 	}
 
 	server.releaseBusIfOwner(99)
 
-	// PX29: Accept either contender as FIFO winner since registration order
-	// between concurrent goroutines is non-deterministic.
+	// FIFO: session 1 registered first → must win.
 	select {
 	case frame := <-upstream.writeCh:
 		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
 			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
 		}
-		if len(frame.Payload) != 1 {
-			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
-		}
-		firstInit := frame.Payload[0]
-		if firstInit != 0x31 && firstInit != 0x71 {
-			t.Fatalf("first START initiator = 0x%02X; want 0x31 or 0x71", firstInit)
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x71 {
+			t.Fatalf("FIFO winner = 0x%02X; want 0x71 (session 1)", frame.Payload[0])
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("expected first START write after boundary release")
 	}
 
-	// Wait for first winner to complete, then release for second.
 	select {
-	case <-lowDone:
 	case <-highDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("FIFO winner START did not complete")
+		t.Fatalf("session 1 START did not complete")
 	}
-	server.mutex.Lock()
-	owner := server.busOwner
-	server.mutex.Unlock()
-	if owner != 0 {
-		server.releaseBusIfOwner(owner)
+	server.releaseBusIfOwner(1)
+
+	// Session 2 should win next.
+	select {
+	case frame := <-upstream.writeCh:
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("second winner = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected second START")
+	}
+
+	select {
+	case <-lowDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("session 2 START did not complete")
 	}
 
 	cancel()
-	select {
-	case <-highDone:
-	default:
-	}
-	select {
-	case <-lowDone:
-	default:
-	}
-
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
@@ -1337,17 +1355,26 @@ func TestHandleStartArbitrationUsesLearnedInitiatorIdentity(t *testing.T) {
 	server.waitGroup.Add(1)
 	go server.runUpstreamReader(ctx)
 
+	// T5: Deterministic FIFO — register session 1 first.
 	highDone := make(chan struct{})
-	lowDone := make(chan struct{})
 	go func() {
 		defer close(highDone)
-		server.handleStart(ctx, 1, 0x00)
+		server.handleStart(ctx, 1, 0x00) // resolves to learned 0x71
 	}()
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		_, has1 := server.startArbContenders[1]
+		return has1
+	}) {
+		t.Fatalf("expected session 1 contender first")
+	}
+
+	lowDone := make(chan struct{})
 	go func() {
 		defer close(lowDone)
-		server.handleStart(ctx, 2, 0x00)
+		server.handleStart(ctx, 2, 0x00) // resolves to learned 0x31
 	}()
-
 	if !waitUntil(300*time.Millisecond, func() bool {
 		server.mutex.Lock()
 		defer server.mutex.Unlock()
@@ -1358,59 +1385,43 @@ func TestHandleStartArbitrationUsesLearnedInitiatorIdentity(t *testing.T) {
 
 	server.releaseBusIfOwner(99)
 
-	// PX29: With FIFO ordering, the first-registered contender wins.
-	// Both sessions registered near-simultaneously — accept either as the
-	// FIFO winner since goroutine scheduling is non-deterministic.
+	// FIFO: session 1 (learned 0x71) registered first → must win.
 	select {
 	case frame := <-upstream.writeCh:
 		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
 			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
 		}
-		if len(frame.Payload) != 1 {
-			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
-		}
-		firstInitiator := frame.Payload[0]
-		if firstInitiator != 0x71 && firstInitiator != 0x31 {
-			t.Fatalf("first START payload = 0x%02X; want learned 0x71 or 0x31", firstInitiator)
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x71 {
+			t.Fatalf("FIFO winner = 0x%02X; want 0x71 (session 1, first registered)", frame.Payload[0])
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatalf("expected first START write after boundary release")
 	}
 
-	// Wait for the FIFO winner to complete, then release for the second.
 	select {
 	case <-highDone:
-	case <-lowDone:
 	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("FIFO winner START did not complete")
+		t.Fatalf("session 1 START did not complete")
 	}
-	// Release bus so second contender can proceed.
-	server.mutex.Lock()
-	owner := server.busOwner
-	server.mutex.Unlock()
-	if owner != 0 {
-		server.releaseBusIfOwner(owner)
+	server.releaseBusIfOwner(1)
+
+	// Session 2 should win next.
+	select {
+	case frame := <-upstream.writeCh:
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("second winner = 0x%02X; want 0x31", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected second START")
 	}
 
-	// Wait for second contender to finish.
 	select {
-	case <-highDone:
 	case <-lowDone:
 	case <-time.After(500 * time.Millisecond):
-		// May already be done.
+		t.Fatalf("session 2 START did not complete")
 	}
 
 	cancel()
-	// Wait for any remaining goroutines.
-	select {
-	case <-highDone:
-	default:
-	}
-	select {
-	case <-lowDone:
-	default:
-	}
-
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
