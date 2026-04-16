@@ -1226,6 +1226,8 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		infoID:    infoID,
 		createdAt: time.Now(),
 	}
+	// Capture seq under lock before releasing — used for post-write ownership check.
+	mySeq := server.pendingInfoSeq
 	server.pendingInfoMu.Unlock()
 
 	// Send eviction error outside the lock.
@@ -1240,9 +1242,6 @@ func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 		Command: byte(southboundenh.ENHReqInfo),
 		Payload: []byte{infoID},
 	}
-
-	// Capture our seq before writing — we'll verify ownership after.
-	mySeq := server.pendingInfoSeq
 
 	if err := server.upstream.WriteFrame(infoFrame); err != nil {
 		server.clearPendingInfo(sessionID)
