@@ -538,6 +538,17 @@ func (server *Server) Serve(ctx context.Context) error {
 			}
 		}
 
+		// P2: Guard against registration after upstream loss.
+		select {
+		case <-server.upstreamLost:
+			_ = connection.Close()
+			upstreamDied = true
+		default:
+		}
+		if upstreamDied {
+			break
+		}
+
 		sessionState := server.registerSession(connection)
 		server.waitGroup.Add(2)
 		go func() {
@@ -953,6 +964,30 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 			Payload: []byte{0x00},
 		})
 		return
+	case <-server.upstreamLost:
+		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		server.releaseBusIfOwner(sessionID)
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		server.reply(sessionID, downstream.Frame{
+			Command: byte(southboundenh.ENHResErrorHost),
+			Payload: []byte{0x00},
+		})
+		return
+	case <-sess.done:
+		server.clearPendingStart(sessionID)
+		if !ownedBySession {
+			server.releaseLease(sessionID)
+		}
+		server.releaseBusIfOwner(sessionID)
+		if !ownedBySession {
+			server.releaseBusToken()
+		}
+		return
 	case <-ctx.Done():
 		server.clearPendingStart(sessionID)
 		if !ownedBySession {
@@ -1150,6 +1185,12 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	}
 }
 
+// handleInfo implements single-flight INFO semantics: only one INFO request
+// can be pending at a time. If a second session sends INFO while one is
+// pending, the first is evicted with ErrorHost. This is a deliberate
+// backpressure choice — the adapter's INFO response path is not multiplexed,
+// so concurrent INFO would corrupt the response stream. Clients that need
+// guaranteed INFO delivery should retry after ErrorHost.
 func (server *Server) handleInfo(sessionID uint64, infoID byte) {
 	server.mutex.Lock()
 	sess := server.sessions[sessionID]
@@ -1311,7 +1352,10 @@ func (server *Server) runUDPPlainReader(ctx context.Context) {
 			continue
 		}
 
-		server.registerUDPPlainClient(remoteAddr)
+		if !server.registerUDPPlainClient(remoteAddr) {
+			// Client not admitted (cap reached) — drop datagram.
+			continue
+		}
 		payload := append([]byte(nil), buffer[:n]...)
 		if server.cfg.Debug {
 			log.Printf(
@@ -1417,6 +1461,10 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 
 	if !server.isWirePlainUpstream() {
 		initiator := payload[0]
+		// P2: Validate initiator address before UDP-to-ENH bridge START.
+		if !isInitiatorAddress(initiator) {
+			return fmt.Errorf("udp bridge: invalid initiator 0x%02X", initiator)
+		}
 		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
@@ -1451,20 +1499,22 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 
 const maxUDPClients = 64 // hard cap to prevent unbounded map growth
 
-func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
+// registerUDPPlainClient registers or refreshes a UDP client. Returns true
+// if the client is admitted (existing or newly registered), false if rejected
+// (cap reached). Rejected clients' datagrams should be dropped.
+func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) bool {
 	if remoteAddr == nil {
-		return
+		return false
 	}
 	clientAddress := remoteAddr.String()
 	now := time.Now()
 
 	server.udpClientsMu.Lock()
-	// CR-P2b: Refresh existing clients BEFORE cap check so active clients
-	// don't get evicted as stale when the map is full.
+	// CR-P2b: Refresh existing clients BEFORE cap check.
 	if existing, ok := server.udpClients[clientAddress]; ok {
 		existing.lastSeen = now
 		server.udpClientsMu.Unlock()
-		return
+		return true
 	}
 	// PX13: Evict stale entries before checking cap.
 	for key, entry := range server.udpClients {
@@ -1472,13 +1522,14 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 			delete(server.udpClients, key)
 		}
 	}
-	// Inline-1/2: Cap UDP clients to prevent DoS via many source ports.
+	// Cap UDP clients. Unadmitted clients' datagrams are dropped.
 	if len(server.udpClients) >= maxUDPClients {
 		server.udpClientsMu.Unlock()
-		return
+		return false
 	}
 	server.udpClients[clientAddress] = &udpClientEntry{addr: remoteAddr, lastSeen: now}
 	server.udpClientsMu.Unlock()
+	return true
 }
 
 func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) error {
@@ -1525,6 +1576,9 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 		default:
 			return fmt.Errorf("upstream start unexpected response 0x%02X", response.Command)
 		}
+	case <-server.upstreamLost:
+		server.clearPendingStart(0)
+		return ErrUpstreamLost
 	case <-ctx.Done():
 		server.clearPendingStart(0)
 		return ctx.Err()
