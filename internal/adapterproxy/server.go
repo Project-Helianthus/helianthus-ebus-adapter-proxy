@@ -695,11 +695,21 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		}
 	}
 
-	// PX24/CR4-P1a: Reject explicit initiator if recently observed on the bus
-	// from an external device AND this session does not already own a lease for
-	// the same address (which would mean the observed traffic is from ourselves).
+	// PX24/CR4-P1a/CR7-P2: Reject explicit initiator if recently observed on
+	// the bus from an external device AND this session does not already own a
+	// non-expired lease for the same address.
 	leaseAddr, hasLease := server.sessionLeaseAddress(sessionID)
-	if !(hasLease && leaseAddr == initiator) {
+	hasActiveLease := hasLease && leaseAddr == initiator
+	if hasActiveLease {
+		// CR7-P2: Verify the lease hasn't expired — expired entries can
+		// linger in leasedBySess until periodic expiry runs.
+		server.leasesMu.Lock()
+		if existing, ok := server.leasedBySess[sessionID]; ok && existing.ExpiresAt.Before(time.Now()) {
+			hasActiveLease = false
+		}
+		server.leasesMu.Unlock()
+	}
+	if !hasActiveLease {
 		if server.isObservedExternalInitiator(initiator) {
 			log.Printf("session=%d explicit_initiator_rejected_observed initiator=0x%02X", sessionID, initiator)
 			server.reply(sessionID, downstream.Frame{
@@ -848,6 +858,9 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		})
 		return
 	}
+	// CR7-P1: START sent successfully — clear stale markers so responses
+	// for THIS pending are not rejected by the stale heuristic.
+	server.clearStaleStartWindow()
 
 	select {
 	case response := <-respCh:
@@ -1025,6 +1038,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			})
 			return
 		}
+		server.clearStaleStartWindow()
 
 		select {
 		case response := <-respCh:
@@ -1442,6 +1456,7 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 		server.clearPendingStart(0)
 		return err
 	}
+	server.clearStaleStartWindow()
 
 	select {
 	case response := <-respCh:
@@ -1879,13 +1894,19 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 }
 
 // PX11: nextPendingStartSeqLocked returns a monotonic sequence number for
-// pendingStart identity and clears stale markers. Must be called under
-// pendingStartMu. Clearing stale markers here means: once a new START
-// has been sent upstream, any response is for THIS pending, not stale.
+// pendingStart identity. Must be called under pendingStartMu.
 func (server *Server) nextPendingStartSeqLocked() uint64 {
 	server.pendingStartSeq++
-	server.pendingStartClearedAt = time.Time{} // clear stale window
 	return server.pendingStartSeq
+}
+
+// CR7-P1: clearStaleStartWindow clears the stale-response markers AFTER
+// the new START has been successfully written upstream. Until the write
+// succeeds, old responses must still be filtered.
+func (server *Server) clearStaleStartWindow() {
+	server.pendingStartMu.Lock()
+	server.pendingStartClearedAt = time.Time{}
+	server.pendingStartMu.Unlock()
 }
 
 func (server *Server) isStartPending() bool {
