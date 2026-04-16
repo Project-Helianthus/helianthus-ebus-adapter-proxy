@@ -521,12 +521,20 @@ func (server *Server) Serve(ctx context.Context) error {
 		}
 
 		// Inline-3/PX53: Rate-limit accepts on the real runtime path.
+		// CR-P2: Also abort on upstreamLost to prevent dispatching against dead upstream.
 		if server.cfg.AcceptRateLimit > 0 {
 			select {
 			case <-time.After(server.cfg.AcceptRateLimit):
 			case <-ctx.Done():
 				_ = connection.Close()
 				continue
+			case <-server.upstreamLost:
+				_ = connection.Close()
+				upstreamDied = true
+				break
+			}
+			if upstreamDied {
+				break
 			}
 		}
 
@@ -1452,14 +1460,20 @@ func (server *Server) registerUDPPlainClient(remoteAddr *net.UDPAddr) {
 	now := time.Now()
 
 	server.udpClientsMu.Lock()
-	// PX13: Evict stale entries first.
+	// CR-P2b: Refresh existing clients BEFORE cap check so active clients
+	// don't get evicted as stale when the map is full.
+	if existing, ok := server.udpClients[clientAddress]; ok {
+		existing.lastSeen = now
+		server.udpClientsMu.Unlock()
+		return
+	}
+	// PX13: Evict stale entries before checking cap.
 	for key, entry := range server.udpClients {
 		if now.Sub(entry.lastSeen) > udpClientTTL {
 			delete(server.udpClients, key)
 		}
 	}
 	// Inline-1/2: Cap UDP clients to prevent DoS via many source ports.
-	// Also avoids O(n²) churn from scanning the full map on every packet.
 	if len(server.udpClients) >= maxUDPClients {
 		server.udpClientsMu.Unlock()
 		return
