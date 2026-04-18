@@ -120,6 +120,10 @@ func (scheduler *AdaptiveScheduler) selectCandidate(
 
 func (scheduler *AdaptiveScheduler) staleRounds(state sessionState) uint64 {
 	if !state.seen {
+		// PX40: Clamp to prevent overflow when round wraps.
+		if scheduler.round == ^uint64(0) {
+			return ^uint64(0)
+		}
 		return scheduler.round + 1
 	}
 

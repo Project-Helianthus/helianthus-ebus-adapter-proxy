@@ -184,6 +184,20 @@ Deferred hardware proof:
 - This runbook does not claim hardware-backed ESERA passive validation for M5 merges.
 - Hardware validation remains deferred under issue `Project-Helianthus/helianthus-docs-ebus#241`.
 
+## Behavioral changes (PR #101 — PX1-PX70 audit remediation)
+
+The following user-visible behaviors changed in this release:
+
+- **Config validation**: `Serve()` now validates `ListenAddr` and `UpstreamAddr` are non-empty, and `SourceAddressPolicy` is `"soft"` or `"disabled"`. Previously, empty `ListenAddr` would silently bind to a random OS port.
+- **ENH default timeout**: ENH upstream connections now default to 30s read/write timeout when none is configured. Plain transports (UDP/TCP) are unchanged (no default timeout). This prevents indefinite blocking on hung adapters.
+- **ens:// alias**: `ens://` continues to work as an alias for the ENH-framed adapter path. The ENS wire codec is not used for upstream connections.
+- **Initiator validation**: Explicit START requests with invalid initiator nibble patterns (e.g. `0x22`) or protocol-reserved bytes (`0x00`, `0xFF`, `0xA9`, `0xAA`) are now rejected with `ErrorHost` instead of being forwarded to the adapter.
+- **Observed-address guard**: Explicit START requests for an initiator address recently observed on the bus from an external device are rejected with `FAILED` to prevent physical bus collisions. Sessions that already own a lease for that address are exempt.
+- **MaxConcurrentSessions**: New config field that caps concurrent TCP sessions. UDP clients are independently capped at 64.
+- **AcceptRateLimit**: New config field for minimum interval between TCP accepts.
+- **Wirelog rotation**: New `WireLogMaxSize` config field enables size-based log rotation with nanosecond-timestamped rotated files.
+- **FIFO arbitration**: TCP START arbitration now uses FIFO ordering instead of lowest-initiator-wins. This prevents starvation of higher-numbered initiators.
+
 ## Rollback quick steps
 
 1. Keep `ebusd` on direct endpoint (no rollback needed for this path if unchanged).

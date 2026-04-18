@@ -241,6 +241,10 @@ func (driver *Driver) reconnectLocked(cause error) error {
 		return err
 	}
 
+	// PX44: Reset parser state on reconnect to prevent stale escape-pending
+	// state from corrupting the first byte of the new connection.
+	resetIfSupported(driver.parser)
+
 	driver.reconnectAttempts++
 	if driver.hooks.OnReconnect != nil {
 		driver.hooks.OnReconnect(driver.reconnectAttempts, cause)
@@ -318,6 +322,9 @@ func writeAll(writer io.Writer, payload []byte) error {
 		written, err := writer.Write(remaining)
 		if err != nil {
 			return err
+		}
+		if written <= 0 {
+			return fmt.Errorf("short write: 0 bytes written")
 		}
 
 		remaining = remaining[written:]

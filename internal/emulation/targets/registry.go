@@ -162,7 +162,10 @@ func (registry *Registry) registerUnlocked(profile Profile) (Profile, error) {
 		return Profile{}, ErrTargetProfileNameRequired
 	}
 
-	if profile.TargetAddress == 0x00 || profile.TargetAddress == 0xFF {
+	// PX32: Reject protocol control symbols as target addresses.
+	// 0x00=ACK, 0xFF=NACK, 0xA9=ESC, 0xAA=SYN are all reserved.
+	switch profile.TargetAddress {
+	case 0x00, 0xFF, 0xA9, 0xAA:
 		return Profile{}, fmt.Errorf("%w: 0x%02X", ErrTargetAddressReserved, profile.TargetAddress)
 	}
 

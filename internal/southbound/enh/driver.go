@@ -241,6 +241,10 @@ func (driver *Driver) reconnectLocked(cause error) error {
 		return err
 	}
 
+	// PX30: Reset parser state on reconnect to prevent stale buffered bytes
+	// from being misinterpreted as the start of a fresh frame.
+	resetIfSupported(driver.parser)
+
 	driver.reconnectAttempts++
 	if driver.hooks.OnReconnect != nil {
 		driver.hooks.OnReconnect(driver.reconnectAttempts, cause)
@@ -318,6 +322,10 @@ func writeAll(writer io.Writer, payload []byte) error {
 		written, err := writer.Write(remaining)
 		if err != nil {
 			return err
+		}
+		// Guard against (0, nil) — prevents infinite spin.
+		if written <= 0 {
+			return fmt.Errorf("short write: 0 bytes written")
 		}
 
 		remaining = remaining[written:]
