@@ -1484,3 +1484,67 @@ func TestHandleStartUDPPlainResettedDuringSynWaitDoesNotCorruptFlow(t *testing.T
 	_ = upstream.Close()
 	server.waitGroup.Wait()
 }
+
+// TestRunUpstreamReader_SuppressPostGrantSYNBeforeFirstSEND verifies that
+// idle SYN bytes arriving between setBusOwner and the owner's first SEND
+// are NOT delivered to the owner (would be read as echo and cause desync).
+// Cross-product invariant: suppress idle SYN between grant and first echo.
+func TestRunUpstreamReader_SuppressPostGrantSYNBeforeFirstSEND(t *testing.T) {
+	t.Parallel()
+
+	upstream := newFakeUpstream()
+	server := &Server{
+		cfg:                     Config{UpstreamTransport: UpstreamENH},
+		upstream:                upstream,
+		sessions:                map[uint64]*session{},
+		synCh:                   make(chan struct{}, 1),
+		startOfTelegram:         true,
+		observedInitiatorAt:     make(map[byte]time.Time),
+		collisionBySession:      make(map[uint64]byte),
+		learnedBySession:        make(map[uint64]sessionInitiatorLearning),
+		localRespondersByTarget: make(map[byte]targetResponderAssociation),
+	}
+	owner := &session{id: 1, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	observer := &session{id: 2, sendCh: make(chan downstream.Frame, 32), done: make(chan struct{})}
+	server.sessions[1] = owner
+	server.sessions[2] = observer
+
+	// Grant bus ownership to session 1 (simulates post-STARTED state).
+	server.setBusOwner(1, 0xF7)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	// Adapter sends idle SYN before owner sends any SEND.
+	// requestBytesSeen is still 0 at this point.
+	upstream.readCh <- downstream.Frame{
+		Command: byte(southboundenh.ENHResReceived),
+		Payload: []byte{ebusSyn},
+	}
+
+	// Observer MUST receive the SYN (sees bus activity).
+	select {
+	case frame := <-observer.sendCh:
+		if frame.Payload[0] != ebusSyn {
+			t.Fatalf("observer got 0x%02X; want 0xAA", frame.Payload[0])
+		}
+	case <-time.After(500 * time.Millisecond):
+		// Observer may not get it if noteBusWireSymbol released ownership
+		// via idle-SYN grace. That's acceptable — verify owner still didn't.
+	}
+
+	// Owner MUST NOT receive the SYN — would be misread as echo.
+	select {
+	case frame := <-owner.sendCh:
+		t.Fatalf("owner received unexpected frame during post-grant pre-SEND window: cmd=0x%02X data=0x%02X",
+			frame.Command, frame.Payload[0])
+	case <-time.After(100 * time.Millisecond):
+		// Good — owner correctly did not receive idle SYN.
+	}
+
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}

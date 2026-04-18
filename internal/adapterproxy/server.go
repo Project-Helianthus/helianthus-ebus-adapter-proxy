@@ -117,10 +117,11 @@ type Server struct {
 	learnedBySession        map[uint64]sessionInitiatorLearning
 	localRespondersByTarget map[byte]targetResponderAssociation
 
-	busToken              chan struct{}
-	busOwner              uint64
-	busOwnerInitiator     byte
-	ownerObserverAtStart  bool
+	busToken                chan struct{}
+	busOwner                uint64
+	busOwnerInitiator       byte
+	awaitingFirstOwnerSend  bool // PX-SYN-RACE: true between setBusOwner and first handleSend by owner
+	ownerObserverAtStart    bool
 	ownerObserverExpected []byte
 	ownerObserverSeen     []byte
 	busDirty              bool
@@ -1805,6 +1806,20 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 					server.broadcastReceivedToOwner(frame, server.currentBusOwner())
 					continue
 				}
+
+				// PX-SYN-RACE: Suppress idle SYN delivered to owner between
+				// grant (setBusOwner) and first owner SEND. The owner's ENH
+				// client expects to see the echo of its own first SEND byte;
+				// delivering an idle SYN causes it to read SYN instead of
+				// the echo and desync. awaitingFirstOwnerSend is true only
+				// in this specific window. Observer sessions still see the
+				// SYN via broadcastExceptOwner.
+				if frame.Payload[0] == ebusSyn {
+					if owner, waiting := server.ownerAwaitingFirstSend(); waiting {
+						server.broadcastExceptOwner(frame, owner)
+						continue
+					}
+				}
 			}
 			server.broadcast(frame)
 		case southboundenh.ENHResInfo:
@@ -2394,6 +2409,19 @@ func (server *Server) currentBusOwner() uint64 {
 	return server.busOwner
 }
 
+// ownerAwaitingFirstSend returns (busOwner, true) if the bus is owned and
+// the owner has not yet sent its first SEND byte. Used to detect the
+// post-grant pre-first-SEND window where idle SYN must not be delivered
+// to the owner (would be misread as echo and cause desync).
+func (server *Server) ownerAwaitingFirstSend() (uint64, bool) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+	if server.busOwner == 0 || !server.awaitingFirstOwnerSend {
+		return 0, false
+	}
+	return server.busOwner, true
+}
+
 func (server *Server) broadcastReceivedToOwner(frame downstream.Frame, ownerID uint64) {
 	if ownerID == 0 {
 		return
@@ -2405,6 +2433,25 @@ func (server *Server) broadcastReceivedToOwner(frame downstream.Frame, ownerID u
 		return
 	}
 	server.enqueueOrClose(sess, frame, "broadcast_owner_only")
+}
+
+// broadcastExceptOwner delivers the frame to all sessions except the owner.
+// Used to suppress idle SYN from the owner between grant and first SEND
+// (PX-SYN-RACE) while still letting observer sessions see the bus activity.
+func (server *Server) broadcastExceptOwner(frame downstream.Frame, ownerID uint64) {
+	server.mutex.Lock()
+	sessions := make([]*session, 0, len(server.sessions))
+	for _, sess := range server.sessions {
+		if sess.id == ownerID {
+			continue
+		}
+		sessions = append(sessions, sess)
+	}
+	server.mutex.Unlock()
+
+	for _, sess := range sessions {
+		server.enqueueOrClose(sess, frame, "broadcast_except_owner")
+	}
 }
 
 func (server *Server) broadcastUDPPlainByte(value byte) {
@@ -2531,6 +2578,7 @@ func (server *Server) releaseBusIfOwner(sessionID uint64) {
 	}
 	server.busOwner = 0
 	server.busOwnerInitiator = 0
+	server.awaitingFirstOwnerSend = false
 	server.ownerObserverAtStart = false
 	server.ownerObserverExpected = nil
 	server.ownerObserverSeen = nil
@@ -2559,6 +2607,7 @@ func (server *Server) setBusOwner(sessionID uint64, initiator byte) {
 	server.mutex.Lock()
 	server.busOwner = sessionID
 	server.busOwnerInitiator = initiator
+	server.awaitingFirstOwnerSend = true // PX-SYN-RACE
 	server.ownerObserverAtStart = true
 	server.ownerObserverExpected = nil
 	server.ownerObserverSeen = nil
@@ -2581,6 +2630,8 @@ func (server *Server) queueOwnerObserverReplay(sessionID uint64, data byte) bool
 	if server.busOwner != sessionID {
 		return false
 	}
+	// PX-SYN-RACE: Owner is sending → no longer in post-grant pre-SEND window.
+	server.awaitingFirstOwnerSend = false
 	if server.busWirePhase == busWirePhaseIdle {
 		server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
 	}
