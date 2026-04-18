@@ -1644,11 +1644,14 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 func (server *Server) runUpstreamReader(ctx context.Context) {
 	defer server.waitGroup.Done()
 
-	// R2: Track consecutive timeouts to detect blackholed adapters
-	// (connected but unresponsive). 60 consecutive timeouts at ~500ms
-	// read deadline = ~30s of silence.
-	const maxConsecutiveTimeouts = 60
-	consecutiveTimeouts := 0
+	// R2/CR-BLACKHOLE: Detect blackholed adapter by wall-clock silence, not
+	// by consecutive read timeouts. A quiet bus with short read deadlines
+	// (e.g. 200ms) generates many legitimate timeouts that are NOT upstream
+	// loss. Only trip upstreamLost if no frame has been received for an
+	// extended period AND we have evidence the adapter was alive earlier
+	// (lastWireRXAtNano > 0).
+	const blackholeSilenceThreshold = 5 * time.Minute
+	blackholeLogged := false
 
 	for {
 		select {
@@ -1660,9 +1663,13 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 		frame, err := server.upstream.ReadFrame()
 		if err != nil {
 			if isTimeoutError(err) {
-				consecutiveTimeouts++
-				if consecutiveTimeouts >= maxConsecutiveTimeouts {
-					log.Printf("upstream_blackhole_detected consecutive_timeouts=%d", consecutiveTimeouts)
+				// Check wall-clock silence since last received byte.
+				lastRX := server.lastWireRXAtNano.Load()
+				if lastRX > 0 && time.Since(time.Unix(0, lastRX)) > blackholeSilenceThreshold {
+					if !blackholeLogged {
+						log.Printf("upstream_blackhole_detected silence=%s", time.Since(time.Unix(0, lastRX)))
+						blackholeLogged = true
+					}
 					server.upstreamLostOnce.Do(func() {
 						if server.upstreamLost != nil {
 							close(server.upstreamLost)
@@ -1689,8 +1696,8 @@ func (server *Server) runUpstreamReader(ctx context.Context) {
 			continue
 		}
 
-		// R2: Reset consecutive timeout counter on any successful read.
-		consecutiveTimeouts = 0
+		// R2/CR-BLACKHOLE: Reset blackhole log flag on any successful read.
+		blackholeLogged = false
 
 		switch southboundenh.ENHCommand(frame.Command) {
 		case southboundenh.ENHResResetted:
