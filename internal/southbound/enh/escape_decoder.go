@@ -168,8 +168,11 @@ const (
 	// AdminEventEscapeBudgetExhausted means the decoder saw the
 	// (MaxAbsorptionsPerEscapePair + 1)-th 0xAA in EscapeStatePending,
 	// exhausting the count-bounded absorption budget. The orphaned
-	// 0xA9 plus the 8 absorbed AAs are dropped; the current byte is
-	// re-processed in NORMAL state. Per v8 §5 / I4.
+	// 0xA9, the 8 absorbed AAs, AND the over-budget 0xAA are ALL
+	// dropped — emit nothing. Per v8 §5 / I4: only the timeout path
+	// re-processes the current byte; the count-bounded path drops
+	// everything so a raw AUTO-SYN cannot leak into the downstream
+	// classifier after declared escape failure.
 	AdminEventEscapeBudgetExhausted
 )
 
