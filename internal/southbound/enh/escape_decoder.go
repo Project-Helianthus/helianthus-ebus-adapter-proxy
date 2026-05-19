@@ -84,7 +84,8 @@ const (
 // escape failure. Per v8 §5 / I4. Mirrored from helianthus-ebusgo's
 // FrameAtomicV8MaxAaAbsorptionsPerEscapePair constant; duplicated here
 // only to keep this package free of cross-repo go-mod dependencies in
-// Step B1. Step B3 may consolidate via a shared library.
+// Step B1. Step B2 (telegram FSM shared library extraction) will
+// consolidate the constants into a single source of truth.
 const MaxAbsorptionsPerEscapePair = 8
 
 // EscapePendingTimeout is the wall-clock cap on EscapeStatePending.
@@ -278,14 +279,17 @@ func (d *EscapeDecoder) feedPending(b byte, now time.Time) (DecodedByte, bool, A
 			d.absorbedCount++
 			return DecodedByte{}, false, AdminEvent{}
 		}
-		// Budget exhausted. Drop the 0xA9 and all absorbed AAs;
-		// re-process this byte (the over-budget AA) in NORMAL state.
+		// Budget exhausted. Per v8 §5 / I4: drop the 0xA9, all
+		// absorbed AAs, AND this over-budget AA. Emit NOTHING. Only
+		// the timeout path (32 ms wall-clock cap above) re-processes
+		// the current byte; the count-exhausted path drops everything
+		// so an over-budget raw AUTO-SYN cannot leak into the
+		// downstream classifier after declared escape failure.
 		absorbed := d.absorbedCount
 		d.state = EscapeStateNormal
 		d.leadObservedAt = time.Time{}
 		d.absorbedCount = 0
-		decoded, hasDecoded, _ := d.feedNormal(b, now)
-		return decoded, hasDecoded, AdminEvent{
+		return DecodedByte{}, false, AdminEvent{
 			Kind:     AdminEventEscapeBudgetExhausted,
 			Duration: elapsed,
 			Absorbed: absorbed,

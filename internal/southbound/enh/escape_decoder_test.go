@@ -104,12 +104,15 @@ func TestEscapeAbsorbsMultipleAaInjections(t *testing.T) {
 	runSequence(t, steps)
 }
 
-// TestEscapeBudgetExhaustedDropsAndReprocesses verifies v8 §5 / I4:
-// after MaxAbsorptionsPerEscapePair (8) consecutive 0xAA absorptions,
-// the 9th 0xAA exhausts the budget. The orphaned 0xA9 + 8 absorbed AAs
-// are dropped; the 9th 0xAA is re-processed in NORMAL state and emerges
-// as (0xAA, was_escaped=false). Admin emits AdminEventEscapeBudgetExhausted.
-func TestEscapeBudgetExhaustedDropsAndReprocesses(t *testing.T) {
+// TestEscapeBudgetExhaustedDropsAllBytes verifies v8 §5 / I4: after
+// MaxAbsorptionsPerEscapePair (8) consecutive 0xAA absorptions, the
+// 9th 0xAA exhausts the budget. The orphaned 0xA9 + 8 absorbed AAs +
+// the over-budget 9th AA are ALL dropped (emit nothing). Admin emits
+// AdminEventEscapeBudgetExhausted. Only the timeout path re-processes
+// the current byte; the count-exhausted path drops everything so a
+// raw AUTO-SYN cannot leak into the downstream classifier after
+// declared escape failure.
+func TestEscapeBudgetExhaustedDropsAllBytes(t *testing.T) {
 	t.Parallel()
 	d := &EscapeDecoder{}
 	now := time.Unix(1_000_000_000, 0)
@@ -127,14 +130,11 @@ func TestEscapeBudgetExhaustedDropsAndReprocesses(t *testing.T) {
 			t.Fatalf("AA #%d: absorbedCount=%d want %d", i, d.AbsorbedCount(), i+1)
 		}
 	}
-	// 9th 0xAA exhausts the budget.
+	// 9th 0xAA exhausts the budget — drop everything, emit nothing.
 	now = now.Add(1 * time.Millisecond)
 	dec, has, adm := d.Feed(0xAA, now)
-	if !has {
-		t.Fatal("9th AA: expected re-processed in NORMAL → emits as plain byte")
-	}
-	if dec.Value != 0xAA || dec.WasEscaped {
-		t.Fatalf("9th AA re-processed: got (0x%02X, esc=%v), want (0xAA, esc=false)", dec.Value, dec.WasEscaped)
+	if has {
+		t.Fatalf("9th AA: hasDecoded=true unexpected (should be dropped), decoded=%v", dec)
 	}
 	if adm.Kind != AdminEventEscapeBudgetExhausted {
 		t.Fatalf("9th AA admin: got %v, want AdminEventEscapeBudgetExhausted", adm.Kind)
@@ -144,6 +144,135 @@ func TestEscapeBudgetExhaustedDropsAndReprocesses(t *testing.T) {
 	}
 	if d.State() != EscapeStateNormal {
 		t.Fatalf("9th AA: decoder state %v, want NORMAL", d.State())
+	}
+	// Subsequent bytes should be processed normally in NORMAL state.
+	now = now.Add(1 * time.Millisecond)
+	dec, has, adm = d.Feed(0x42, now)
+	if !has || dec.Value != 0x42 || dec.WasEscaped {
+		t.Fatalf("post-exhaustion plain byte: got (0x%02X, esc=%v, has=%v), want (0x42, esc=false, has=true)",
+			dec.Value, dec.WasEscaped, has)
+	}
+	if adm.Kind != AdminEventNone {
+		t.Fatalf("post-exhaustion admin: got %v, want None", adm.Kind)
+	}
+}
+
+// TestEscapeExactlyEightAbsorptionsThenCompletionStillValid verifies
+// the boundary case: exactly 8 AAs absorbed (full budget), then a
+// completion byte (0x00 or 0x01) arrives. The escape pair must still
+// decode successfully — the 8 absorbed AAs are within budget, not
+// over it. Per v8 §5 / I4: "absorb up to 8."
+func TestEscapeExactlyEightAbsorptionsThenCompletionStillValid(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		completion byte
+		wantValue  byte
+	}{
+		{"completion 0x01 decodes to logical 0xAA", 0x01, 0xAA},
+		{"completion 0x00 decodes to logical 0xA9", 0x00, 0xA9},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := &EscapeDecoder{}
+			now := time.Unix(1_000_000_000, 0)
+			d.Feed(0xA9, now)
+			for i := 0; i < 8; i++ {
+				now = now.Add(1 * time.Millisecond)
+				if _, has, adm := d.Feed(0xAA, now); has || adm.Kind != AdminEventNone {
+					t.Fatalf("AA #%d unexpected emit/admin (has=%v, adm=%v)", i, has, adm.Kind)
+				}
+			}
+			if d.AbsorbedCount() != 8 {
+				t.Fatalf("absorbedCount = %d, want 8", d.AbsorbedCount())
+			}
+			now = now.Add(1 * time.Millisecond)
+			dec, has, adm := d.Feed(tc.completion, now)
+			if !has {
+				t.Fatalf("completion %#02x after 8 absorptions: expected emit, got none", tc.completion)
+			}
+			if dec.Value != tc.wantValue || !dec.WasEscaped {
+				t.Fatalf("completion %#02x: got (0x%02X, esc=%v), want (0x%02X, esc=true)",
+					tc.completion, dec.Value, dec.WasEscaped, tc.wantValue)
+			}
+			if adm.Kind != AdminEventNone {
+				t.Fatalf("completion admin: got %v, want None", adm.Kind)
+			}
+			if d.State() != EscapeStateNormal {
+				t.Fatalf("post-completion state: %v, want NORMAL", d.State())
+			}
+		})
+	}
+}
+
+// TestEscapeLeadFollowedByEscapeLeadIsMalformed verifies that 0xA9
+// followed by another 0xA9 (without the second-byte completion) is a
+// malformed escape: the original 0xA9 is dropped, the second 0xA9 is
+// dropped too, admin emits AdminEventEscapeRecovery. Per v8 §5
+// non-fabrication: do not emit either as raw because neither was a
+// real escape pair start.
+//
+// Note: the strict reading of the v8 §5 pseudocode treats the second
+// 0xA9 as "any byte other than 0x00/0x01/0xAA-within-budget", so it
+// falls into the malformed branch and is dropped along with the first.
+// A more permissive reading might re-process the second 0xA9 as a
+// fresh escape lead. The current implementation chose the strict
+// interpretation; this test pins that choice.
+func TestEscapeLeadFollowedByEscapeLeadIsMalformed(t *testing.T) {
+	t.Parallel()
+	d := &EscapeDecoder{}
+	now := time.Unix(1_000_000_000, 0)
+	d.Feed(0xA9, now)
+	now = now.Add(2 * time.Millisecond)
+	dec, has, adm := d.Feed(0xA9, now)
+	if has {
+		t.Fatalf("0xA9-after-0xA9: emit unexpected, got %v", dec)
+	}
+	if adm.Kind != AdminEventEscapeRecovery {
+		t.Fatalf("0xA9-after-0xA9 admin: got %v, want AdminEventEscapeRecovery", adm.Kind)
+	}
+	if d.State() != EscapeStateNormal {
+		t.Fatalf("post-malformed state: %v, want NORMAL (decoder does NOT treat second 0xA9 as fresh lead)", d.State())
+	}
+}
+
+// TestPendingEscapeAtTransportResetClearsState verifies that calling
+// Reset() while the decoder is mid-escape (in EscapeStatePending)
+// correctly clears all state without emitting anything. Useful when
+// the proxy receives a transport RESETTED event mid-escape-pair.
+//
+// Contract: Reset is fire-and-forget — no admin event, no emitted
+// byte. Callers wishing to surface "we abandoned a pending escape on
+// reset" should emit that admin signal at the call site.
+func TestPendingEscapeAtTransportResetClearsState(t *testing.T) {
+	t.Parallel()
+	d := &EscapeDecoder{}
+	now := time.Unix(1_000_000_000, 0)
+	d.Feed(0xA9, now)
+	d.Feed(0xAA, now.Add(1*time.Millisecond)) // absorbed
+	d.Feed(0xAA, now.Add(2*time.Millisecond)) // absorbed
+	if d.State() != EscapeStatePending {
+		t.Fatalf("pre-reset state: %v, want PENDING", d.State())
+	}
+	if d.AbsorbedCount() != 2 {
+		t.Fatalf("pre-reset absorbed: %d, want 2", d.AbsorbedCount())
+	}
+	// Reset (simulating transport RESETTED).
+	d.Reset()
+	if d.State() != EscapeStateNormal {
+		t.Fatalf("post-reset state: %v, want NORMAL", d.State())
+	}
+	if d.AbsorbedCount() != 0 {
+		t.Fatalf("post-reset absorbed: %d, want 0", d.AbsorbedCount())
+	}
+	// Decoder must function normally after reset; a fresh escape pair
+	// from immediately after reset must decode correctly.
+	d.Feed(0xA9, now.Add(100*time.Millisecond))
+	dec, has, _ := d.Feed(0x01, now.Add(101*time.Millisecond))
+	if !has || dec.Value != 0xAA || !dec.WasEscaped {
+		t.Fatalf("post-reset fresh escape: got (0x%02X, esc=%v, has=%v), want (0xAA, esc=true, has=true)",
+			dec.Value, dec.WasEscaped, has)
 	}
 }
 
