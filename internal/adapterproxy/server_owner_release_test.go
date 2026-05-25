@@ -557,6 +557,41 @@ func TestTargetResponderWindowRejectsLateResponderBytesAndCounts(t *testing.T) {
 	}
 }
 
+func TestHandleSendRejectsNonOwnerNonResponderDuringActiveTransaction(t *testing.T) {
+	t.Parallel()
+
+	upstream := &recordingUpstream{}
+	sessionState := &session{id: 2, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})}
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 1), done: make(chan struct{})},
+		2: sessionState,
+	}
+	server.setBusOwner(1, 0x71)
+	server.mutex.Lock()
+	server.resetBusWirePhaseLocked(busWirePhaseCollectRequest)
+	server.mutex.Unlock()
+
+	server.handleSend(2, 0xB5)
+
+	select {
+	case frame := <-sessionState.sendCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHResErrorHost {
+			t.Fatalf("non-owner command = 0x%02X; want ENHResErrorHost", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x00 {
+			t.Fatalf("non-owner payload = %x; want [00]", frame.Payload)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected non-owner rejection")
+	}
+
+	if got := upstream.snapshot(); len(got) != 0 {
+		t.Fatalf("upstream writes = % X; want none for non-owner", got)
+	}
+}
+
 func TestTargetResponderExperimentalChildModeDisabledByDefault(t *testing.T) {
 	t.Parallel()
 
@@ -927,7 +962,7 @@ func (upstream *deterministicStartUpstream) SendInit(features byte) error {
 	return nil
 }
 
-// PX29: With FIFO ordering, the first-registered contender wins regardless
+// PX05: With FIFO ordering, the first-registered contender wins regardless
 // of initiator value. Both sessions register near-simultaneously, so
 // either could win depending on goroutine scheduling.
 func TestHandleStartArbitrationSameBoundaryUsesFIFOAcrossInitiatorPriorities(t *testing.T) {
@@ -1025,7 +1060,7 @@ func TestHandleStartArbitrationSameBoundaryUsesFIFOAcrossInitiatorPriorities(t *
 	server.waitGroup.Wait()
 }
 
-// PX29: After FIFO ordering change, first-registered session wins regardless
+// PX07: After FIFO ordering change, first-registered session wins regardless
 // of initiator value. This test verifies that the requeued low contender
 // (session 2) does NOT steal priority from the first-registered session 1.
 func TestHandleStartArbitrationRequeueAfterTimeoutKeepsFIFOAheadOfLowerInitiator(t *testing.T) {
@@ -1112,7 +1147,7 @@ func TestHandleStartArbitrationRequeueAfterTimeoutKeepsFIFOAheadOfLowerInitiator
 		if len(frame.Payload) != 1 {
 			t.Fatalf("first START payload len = %d; want 1", len(frame.Payload))
 		}
-		// PX29: With FIFO ordering, session 1 (0x71, registered first) wins
+		// PX07: With FIFO ordering, session 1 (0x71, registered first) wins
 		// over session 2 (0x31, requeued later with higher seq).
 		if frame.Payload[0] != 0x71 {
 			t.Fatalf("first START initiator after requeue = 0x%02X; want 0x71 (FIFO winner)", frame.Payload[0])
@@ -1121,7 +1156,7 @@ func TestHandleStartArbitrationRequeueAfterTimeoutKeepsFIFOAheadOfLowerInitiator
 		t.Fatalf("expected first START write after boundary release")
 	}
 
-	// PX29: With FIFO ordering, session 1 (0x71) won and now owns the bus.
+	// PX07: With FIFO ordering, session 1 (0x71) won and now owns the bus.
 	// Session 2 is still contending. Release bus so session 2 can proceed.
 	select {
 	case <-highDone:
