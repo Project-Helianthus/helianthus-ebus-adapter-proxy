@@ -162,8 +162,9 @@ PASS: ha integration dual-topology smoke completed for proxy profile <enh|ens>
 Run matrix gate validation using both inventories. `T01..T88` remains the primary transport gate. `PX01..PX12` is a required adjunct for proxy wire-semantics behavior.
 
 ```bash
+./scripts/run_proxy_semantics_matrix.py --output-dir artifacts/proxy-semantics/<run-id>
 TRANSPORT_MATRIX_REPORT=artifacts/transport-matrix-index.json \
-PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics-matrix-index.json \
+PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics/<run-id>/index.json \
 ./scripts/transport_gate.sh
 ```
 

@@ -26,7 +26,7 @@ required_patterns=(
 	"FAIL: gateway readiness dual-topology path \\.\\.\\."
 	"PASS: ha integration dual-topology smoke completed for proxy profile <enh\\|ens>"
 	"TRANSPORT_MATRIX_REPORT=artifacts/transport-matrix-index.json"
-	"PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics-matrix-index.json"
+	"PROXY_SEMANTICS_MATRIX_REPORT=artifacts/proxy-semantics/<run-id>/index.json"
 	"transport gate: PASS \\(pass=\\.\\.\\., xfail=\\.\\.\\., xpass=\\.\\.\\., blocked=\\.\\.\\., total=88\\)\\."
 	"proxy semantics gate: PASS \\(pass=\\.\\.\\., xfail=\\.\\.\\., xpass=0, blocked=\\.\\.\\., total=12\\)\\."
 	"Project-Helianthus/helianthus-docs-ebus#241"

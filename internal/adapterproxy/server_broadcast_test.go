@@ -1266,15 +1266,15 @@ func TestRunUpstreamReaderResettedReleasesBusOwner(t *testing.T) {
 		sessions: map[uint64]*session{
 			1: {id: 1, sendCh: make(chan downstream.Frame, 4), done: make(chan struct{})},
 		},
-		synCh:                  make(chan struct{}, 1),
-		busToken:               make(chan struct{}, 1),
-		reinitGuard:            make(chan struct{}, 1),
-		infoCache:              newAdapterInfoCache(),
-		observedInitiatorAt:    make(map[byte]time.Time),
-		collisionBySession:     make(map[uint64]byte),
-		learnedBySession:       make(map[uint64]sessionInitiatorLearning),
+		synCh:                   make(chan struct{}, 1),
+		busToken:                make(chan struct{}, 1),
+		reinitGuard:             make(chan struct{}, 1),
+		infoCache:               newAdapterInfoCache(),
+		observedInitiatorAt:     make(map[byte]time.Time),
+		collisionBySession:      make(map[uint64]byte),
+		learnedBySession:        make(map[uint64]sessionInitiatorLearning),
 		localRespondersByTarget: make(map[byte]targetResponderAssociation),
-		startArbContenders:     make(map[uint64]*startArbContender),
+		startArbContenders:      make(map[uint64]*startArbContender),
 	}
 	// Session 1 owns the bus.
 	server.setBusOwner(1, 0x10)
