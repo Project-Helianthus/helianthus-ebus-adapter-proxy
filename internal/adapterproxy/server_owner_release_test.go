@@ -930,7 +930,7 @@ func (upstream *deterministicStartUpstream) SendInit(features byte) error {
 // PX29: With FIFO ordering, the first-registered contender wins regardless
 // of initiator value. Both sessions register near-simultaneously, so
 // either could win depending on goroutine scheduling.
-func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
+func TestHandleStartArbitrationSameBoundaryUsesFIFOAcrossInitiatorPriorities(t *testing.T) {
 	t.Parallel()
 
 	upstream := newDeterministicStartUpstream()
@@ -1028,7 +1028,7 @@ func TestHandleStartArbitrationSameBoundaryPrefersLowerInitiator(t *testing.T) {
 // PX29: After FIFO ordering change, first-registered session wins regardless
 // of initiator value. This test verifies that the requeued low contender
 // (session 2) does NOT steal priority from the first-registered session 1.
-func TestHandleStartArbitrationRequeueAfterTimeoutStillPrefersLowerInitiator(t *testing.T) {
+func TestHandleStartArbitrationRequeueAfterTimeoutKeepsFIFOAheadOfLowerInitiator(t *testing.T) {
 	t.Parallel()
 
 	upstream := newDeterministicStartUpstream()

@@ -212,6 +212,124 @@ func TestForwardUDPPlainDatagramBridgesStartForENHUpstream(t *testing.T) {
 	server.waitGroup.Wait()
 }
 
+func TestForwardUDPPlainDatagramParticipatesInStartArbitrationFIFO(t *testing.T) {
+	upstream := newDeterministicStartUpstream()
+	server := NewServer(Config{UpstreamTransport: UpstreamENH})
+	server.upstream = upstream
+	server.leaseManager = nil
+	server.sessions = map[uint64]*session{
+		1: {id: 1, sendCh: make(chan downstream.Frame, 8), done: make(chan struct{})},
+	}
+	server.setBusOwner(99, 0x10)
+
+	select {
+	case <-server.busToken:
+	default:
+		t.Fatalf("expected initial bus token")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.waitGroup.Add(1)
+	go server.runUpstreamReader(ctx)
+
+	tcpDone := make(chan struct{})
+	go func() {
+		defer close(tcpDone)
+		server.handleStart(ctx, 1, 0x71)
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		_, hasTCP := server.startArbContenders[1]
+		return hasTCP
+	}) {
+		t.Fatalf("expected TCP contender before UDP datagram")
+	}
+
+	udpDone := make(chan error, 1)
+	go func() {
+		udpDone <- server.forwardUDPPlainDatagram(ctx, []byte{0x31, 0x15})
+	}()
+
+	if !waitUntil(300*time.Millisecond, func() bool {
+		server.mutex.Lock()
+		defer server.mutex.Unlock()
+		_, hasTCP := server.startArbContenders[1]
+		_, hasUDP := server.startArbContenders[udpBridgeOwnerID]
+		return hasTCP && hasUDP
+	}) {
+		t.Fatalf("expected TCP and UDP contenders before boundary release")
+	}
+
+	server.releaseBusIfOwner(99)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("first upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x71 {
+			t.Fatalf("first START payload = %x; want [71] for FIFO TCP winner", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected TCP START before UDP bridge")
+	}
+
+	select {
+	case <-tcpDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("TCP START did not complete")
+	}
+
+	select {
+	case frame := <-upstream.writeCh:
+		t.Fatalf("unexpected UDP write before TCP owner release: cmd=0x%02X payload=%x", frame.Command, frame.Payload)
+	default:
+	}
+
+	server.releaseBusIfOwner(1)
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqStart {
+			t.Fatalf("second upstream command = 0x%02X; want ENHReqStart", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x31 {
+			t.Fatalf("second START payload = %x; want [31] for UDP bridge", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected UDP bridge START after TCP owner release")
+	}
+
+	select {
+	case frame := <-upstream.writeCh:
+		if southboundenh.ENHCommand(frame.Command) != southboundenh.ENHReqSend {
+			t.Fatalf("third upstream command = 0x%02X; want ENHReqSend", frame.Command)
+		}
+		if len(frame.Payload) != 1 || frame.Payload[0] != 0x15 {
+			t.Fatalf("UDP payload write = %x; want [15]", frame.Payload)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected UDP payload after UDP bridge START")
+	}
+
+	select {
+	case err := <-udpDone:
+		if err != nil {
+			t.Fatalf("UDP datagram forward error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("UDP datagram forward did not complete")
+	}
+
+	server.releaseBusIfOwner(udpBridgeOwnerID)
+	cancel()
+	_ = upstream.Close()
+	server.waitGroup.Wait()
+}
+
 func TestForwardUDPPlainDatagramBridgeStartTimeoutFallback(t *testing.T) {
 	t.Parallel()
 

@@ -82,17 +82,17 @@ type Server struct {
 	// entries in the wirelog match actual wire ordering across concurrent sessions.
 	wireWriteMu sync.Mutex
 	wireLog     *wireLogger
-	synCh   chan struct{}
+	synCh       chan struct{}
 
-	udpListener    *net.UDPConn
-	udpClientsMu   sync.RWMutex
-	udpClients     map[string]*udpClientEntry
-	udpQueue       chan udpDatagram
+	udpListener  *net.UDPConn
+	udpClientsMu sync.RWMutex
+	udpClients   map[string]*udpClientEntry
+	udpQueue     chan udpDatagram
 
-	upstreamFeatures    atomic.Uint32
-	reinitGuard         chan struct{}  // buffered(1), limits re-INIT to one in-flight
-	initSentAtNano      atomic.Int64  // UnixNano of last SendInit; 0 = no pending INIT
-	lastWireRXAtNano    atomic.Int64
+	upstreamFeatures atomic.Uint32
+	reinitGuard      chan struct{} // buffered(1), limits re-INIT to one in-flight
+	initSentAtNano   atomic.Int64  // UnixNano of last SendInit; 0 = no pending INIT
+	lastWireRXAtNano atomic.Int64
 
 	backpressureDrops   atomic.Uint64
 	backpressureCloses  atomic.Uint64
@@ -117,38 +117,37 @@ type Server struct {
 	learnedBySession        map[uint64]sessionInitiatorLearning
 	localRespondersByTarget map[byte]targetResponderAssociation
 
-	busToken                chan struct{}
-	busOwner                uint64
-	busOwnerInitiator       byte
-	awaitingFirstOwnerSend  bool // PX-SYN-RACE: true between setBusOwner and first handleSend by owner
-	ownerObserverAtStart    bool
-	ownerObserverExpected []byte
-	ownerObserverSeen     []byte
-	busDirty              bool
-	busOwned              time.Time
-	busWirePhase          busWirePhase
-	requestBytesSeen      int
-	requestDataLength     int
-	requestSrc            byte
-	requestDst            byte
-	requestPB             byte
-	requestSB             byte
-	requestLEN            byte
-	requestHeaderCaptured bool
-	responseBytesRemain   int
-	targetResponderWindow targetResponderWindow
-	startArbSeq           uint64
-	startArbGrantSession  uint64
-	startArbContenders    map[uint64]*startArbContender
+	busToken               chan struct{}
+	busOwner               uint64
+	busOwnerInitiator      byte
+	awaitingFirstOwnerSend bool // PX-SYN-RACE: true between setBusOwner and first handleSend by owner
+	ownerObserverAtStart   bool
+	ownerObserverExpected  []byte
+	ownerObserverSeen      []byte
+	busDirty               bool
+	busOwned               time.Time
+	busWirePhase           busWirePhase
+	requestBytesSeen       int
+	requestDataLength      int
+	requestSrc             byte
+	requestDst             byte
+	requestPB              byte
+	requestSB              byte
+	requestLEN             byte
+	requestHeaderCaptured  bool
+	responseBytesRemain    int
+	targetResponderWindow  targetResponderWindow
+	startArbSeq            uint64
+	startArbGrantSession   uint64
+	startArbContenders     map[uint64]*startArbContender
 
-	pendingStartMu       sync.Mutex
-	pendingStart         *pendingStart
-
+	pendingStartMu sync.Mutex
+	pendingStart   *pendingStart
 
 	pendingInfoMu  sync.Mutex
 	pendingInfo    *pendingInfo
 	pendingInfoSeq uint64
-	infoCache     *adapterInfoCache
+	infoCache      *adapterInfoCache
 
 	leasesMu     sync.Mutex
 	leaseManager *sourcepolicy.LeaseManager
@@ -173,7 +172,7 @@ type pendingStart struct {
 
 type pendingInfo struct {
 	sessionID uint64
-	seq       uint64             // GH-P1: monotonic counter to reject stale responses
+	seq       uint64 // GH-P1: monotonic counter to reject stale responses
 	remaining int
 	infoID    byte
 	createdAt time.Time          // GH-P1: for timeout-based expiry
@@ -329,7 +328,7 @@ func NewServer(cfg Config) *Server {
 		reinitGuard:             make(chan struct{}, 1),
 		// PX7/PX66/CR-P1: Use close-based broadcast so all goroutines
 		// that select on upstreamLost are notified (not just one receiver).
-		upstreamLost:            make(chan struct{}),
+		upstreamLost: make(chan struct{}),
 	}
 	server.busToken <- struct{}{}
 
@@ -923,8 +922,6 @@ func (server *Server) handleStart(ctx context.Context, sessionID uint64, initiat
 		return
 	}
 
-
-
 	select {
 	case response := <-respCh:
 		server.clearPendingStart(sessionID)
@@ -1055,7 +1052,15 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 	ownedBySession := func() bool {
 		server.mutex.Lock()
 		defer server.mutex.Unlock()
-		return server.busOwner == sessionID
+		if server.busOwner != sessionID {
+			return false
+		}
+		// Match the ENH upstream path: a session may reuse ownership only for
+		// a bounded window, otherwise lower-latency restarts can starve peers.
+		if !server.busOwned.IsZero() && time.Since(server.busOwned) > maxOwnershipDuration {
+			return false
+		}
+		return true
 	}()
 
 	if ownedBySession {
@@ -1067,12 +1072,13 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		return
 	}
 
+	// If this session held the token past the bounded ownership window,
+	// release it before rejoining the shared FIFO arbitration queue.
+	server.releaseBusIfOwner(sessionID)
+
 	waitStart := time.Now()
-	select {
-	case <-server.busToken:
-	case <-ctx.Done():
-		return
-	case <-sess.done:
+	if !server.waitForStartArbitration(ctx, sess, sessionID, initiator) {
+		server.releaseLease(sessionID)
 		return
 	}
 	if server.cfg.Debug {
@@ -1107,7 +1113,7 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 		server.pendingStartMu.Lock()
 		server.pendingStart = &pendingStart{
 			sessionID: sessionID,
-	
+
 			respCh:    respCh,
 			mode:      pendingStartModeUDPPlain,
 			initiator: initiator,
@@ -1125,7 +1131,6 @@ func (server *Server) handleStartUDPPlain(ctx context.Context, sessionID uint64,
 			})
 			return
 		}
-	
 
 		select {
 		case response := <-respCh:
@@ -1463,40 +1468,6 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		)
 	}
 
-	// PX27/CR-P1b: Yield to TCP contenders if any are pending, but use a
-	// short timeout so the datagram is retried rather than dropped.
-	server.mutex.Lock()
-	hasTCPContenders := len(server.startArbContenders) > 0
-	// R4: Check if a TCP session was already granted arbitration.
-	tcpGranted := server.startArbGrantSession != 0
-	server.mutex.Unlock()
-	if hasTCPContenders {
-		select {
-		case <-time.After(50 * time.Millisecond):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	// R4: When a TCP session has been granted arbitration, UDP must not
-	// drain the bus token — doing so would starve the granted session.
-	if tcpGranted {
-		return fmt.Errorf("udp bridge: bus token reserved for granted TCP session")
-	}
-
-	select {
-	case <-server.busToken:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	releaseToken := true
-	defer func() {
-		if releaseToken {
-			server.releaseBusToken()
-		}
-	}()
-
 	if !server.isWirePlainUpstream() {
 		initiator := payload[0]
 		// P2: Validate initiator address before UDP-to-ENH bridge START.
@@ -1508,6 +1479,21 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		if server.isObservedExternalInitiator(initiator) {
 			return fmt.Errorf("udp bridge: initiator 0x%02X observed externally", initiator)
 		}
+	}
+
+	if err := server.waitForUDPBridgeArbitration(ctx, payload[0]); err != nil {
+		return err
+	}
+
+	releaseToken := true
+	defer func() {
+		if releaseToken {
+			server.releaseBusToken()
+		}
+	}()
+
+	if !server.isWirePlainUpstream() {
+		initiator := payload[0]
 		if err := server.startUDPPlainBridge(ctx, initiator); err != nil {
 			return err
 		}
@@ -1542,6 +1528,35 @@ func (server *Server) forwardUDPPlainDatagram(ctx context.Context, payload []byt
 		log.Printf("udp_plain_forward done len=%d", len(payload))
 	}
 	return nil
+}
+
+func (server *Server) waitForUDPBridgeArbitration(ctx context.Context, arbitrationSymbol byte) error {
+	server.mutex.Lock()
+	grantCh := server.registerStartArbContenderLocked(udpBridgeOwnerID, arbitrationSymbol)
+	server.mutex.Unlock()
+
+	defer func() {
+		server.mutex.Lock()
+		server.unregisterStartArbContenderLocked(udpBridgeOwnerID)
+		server.mutex.Unlock()
+	}()
+
+	select {
+	case <-grantCh:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-server.upstreamLost:
+		return ErrUpstreamLost
+	}
+
+	select {
+	case <-server.busToken:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-server.upstreamLost:
+		return ErrUpstreamLost
+	}
 }
 
 const maxUDPClients = 64 // hard cap to prevent unbounded map growth
@@ -1607,7 +1622,6 @@ func (server *Server) startUDPPlainBridge(ctx context.Context, initiator byte) e
 		server.clearPendingStart(0)
 		return err
 	}
-
 
 	select {
 	case response := <-respCh:
@@ -2075,8 +2089,6 @@ func (server *Server) expirePendingStartStale(expected *pendingStart) {
 
 	server.reply(pending.sessionID, failed)
 }
-
-
 
 func (server *Server) isStartPending() bool {
 	server.pendingStartMu.Lock()
@@ -2932,6 +2944,9 @@ func (server *Server) waitForStartArbitration(
 }
 
 func (server *Server) registerStartArbContenderLocked(sessionID uint64, initiator byte) chan struct{} {
+	if server.startArbContenders == nil {
+		server.startArbContenders = make(map[uint64]*startArbContender)
+	}
 	server.startArbSeq++
 	contender := &startArbContender{
 		sessionID: sessionID,

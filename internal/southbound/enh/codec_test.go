@@ -116,7 +116,7 @@ func TestENHParserPX64ReabsorbsFirstByteOnMismatch(t *testing.T) {
 	parser := &ENHParser{}
 	stream := bytes.NewReader([]byte{
 		0xC4, 0xC8, // 0xC4 is first byte, 0xC8 is valid first byte (not enhByte2)
-		0xA0,       // valid second byte for 0xC8
+		0xA0, // valid second byte for 0xC8
 	})
 
 	// Should return the frame decoded from 0xC8+0xA0 (the reabsorbed pair).

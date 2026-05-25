@@ -16,9 +16,9 @@ Case inventory:
 | `PX02` | stale `STARTED` absorb expires via bounded fail path |
 | `PX03` | `SYN` while waiting for command `ACK` reopens arbitration immediately |
 | `PX04` | `SYN` while waiting for target response bytes reopens arbitration immediately |
-| `PX05` | lower initiator wins same-boundary competition |
-| `PX06` | queued higher initiator loses when lower initiator arrives before next round closes |
-| `PX07` | requeue-after-timeout by former owner still wins by lower initiator priority |
+| `PX05` | same-boundary competition is resolved by FIFO registration order, not initiator priority |
+| `PX06` | queued higher initiator keeps its FIFO turn when a lower initiator arrives before the next round closes |
+| `PX07` | requeue-after-timeout receives a new FIFO position and cannot steal priority from an older contender |
 | `PX08` | equal-initiator FIFO ordering is preserved |
 | `PX09` | local target observes request only from echoed `RECEIVED` path, never from owner `SEND` intent |
 | `PX10` | local emulated target response inside responder window remains coherent |

@@ -29,10 +29,10 @@ type Hooks struct {
 }
 
 type Options struct {
-	ReadTimeout       time.Duration
-	ParserFactory     ParserFactory
-	MaxSessions       int           // PX47: max concurrent sessions (0 = unlimited)
-	AcceptRateLimit   time.Duration // PX53: minimum interval between accepts (0 = unlimited)
+	ReadTimeout     time.Duration
+	ParserFactory   ParserFactory
+	MaxSessions     int           // PX47: max concurrent sessions (0 = unlimited)
+	AcceptRateLimit time.Duration // PX53: minimum interval between accepts (0 = unlimited)
 }
 
 type SessionInfo struct {

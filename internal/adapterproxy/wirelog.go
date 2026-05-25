@@ -9,12 +9,12 @@ import (
 )
 
 type wireLogger struct {
-	mu       sync.Mutex
-	file     *os.File
-	writer   *bufio.Writer
-	path     string
-	maxSize  int64 // PX14/PX48: 0 = no rotation
-	written  int64
+	mu      sync.Mutex
+	file    *os.File
+	writer  *bufio.Writer
+	path    string
+	maxSize int64 // PX14/PX48: 0 = no rotation
+	written int64
 }
 
 func (logger *wireLogger) Close() error {

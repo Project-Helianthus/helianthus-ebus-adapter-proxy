@@ -112,9 +112,9 @@ func TestXR_UpstreamLoss_GracefulShutdown_NoHang(t *testing.T) {
 	defer cancel()
 
 	serveDone := make(chan error, 1)
+	server.waitGroup.Add(1)
 	go func() {
 		// Run the full Serve accept loop + cleanup.
-		server.waitGroup.Add(1)
 		go server.runUpstreamReader(ctx)
 
 		// Simulate accept loop running briefly.
