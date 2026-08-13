@@ -1,10 +1,23 @@
 # helianthus-ebus-adapter-proxy
 
-`helianthus-ebus-adapter-proxy` provides a shared proxy path between one southbound eBUS adapter connection and multiple northbound client sessions (ENH/ENS), including deterministic write arbitration for pass-through and emulated traffic.
+> **Deprecated — read-only historical reference.** The standalone multiplexing/proxy
+> function is now integrated into the eBUS runtime transport path:
+> [`helianthus-ebusgateway/internal/adaptermux`](https://github.com/Project-Helianthus/helianthus-ebusgateway/tree/main/internal/adaptermux)
+> wraps transports provided by
+> [`helianthus-ebusgo`](https://github.com/Project-Helianthus/helianthus-ebusgo).
+> Do not start new deployments or feature work from this repository.
 
-## Purpose and Scope
+This repository is retained to preserve the standalone proxy's historical
+implementation, operational material, and compatibility evidence. For active
+runtime work, use
+[`helianthus-ebusgateway`](https://github.com/Project-Helianthus/helianthus-ebusgateway);
+for eBUS transport/protocol work, use
+[`helianthus-ebusgo`](https://github.com/Project-Helianthus/helianthus-ebusgo).
 
-### What belongs in this repository
+## Historical Scope
+
+The following describes the archived standalone implementation; it is not a
+placement guide for new work.
 
 - Southbound ENH/ENS adapter drivers (`internal/southbound/*`).
 - Northbound ENH/ENS multi-session listeners (`internal/northbound/*`).
@@ -14,26 +27,29 @@
 - Emulation target registry/profile wiring (`internal/emulation/targets`).
 - Compatibility/smoke tooling and operations runbook (`scripts/*`, `OPERATIONS_RUNBOOK.md`).
 
-### What does not belong in this repository
+## Current Status
 
-- Gateway API/runtime serving (belongs to `helianthus-ebusgateway`).
-- Home Assistant integration entity model (belongs to `helianthus-ha-integration`).
-- Home Assistant add-on packaging (belongs to `helianthus-ha-addon`).
+- **Read-only / historical:** no new users, deployments, or feature work belong here.
+- The maintained multiplexing implementation is the gateway's internal
+  `adaptermux` runtime package, built on `helianthus-ebusgo` transports.
+- Historical smoke helpers, the VR90 emulation profile wiring, and technical
+  documents remain available for reference and migration research.
 
-## Status and Maturity
-
-- Active proxy foundation with deterministic test coverage.
-- Includes issue-aligned smoke helpers for compatibility, gateway direct-proxy checks, and HA dual-topology checks.
-- Built-in VR90 emulation profile wiring is available and disabled by default.
-
-## Helianthus Dependency Chain
+## Active Runtime Path
 
 ```text
-adapter endpoint/ebusd -> helianthus-ebus-adapter-proxy -> helianthus-ebusgateway -> helianthus-ha-integration/ha-addon
-        (io edge)                 (arbitration + proxy)         (api runtime)            (operator surfaces)
+adapter endpoint/ebusd -> helianthus-ebusgo transports -> helianthus-ebusgateway/internal/adaptermux -> gateway runtime
+        (io edge)                (transport implementation)       (multiplexing)            (operator surface)
 ```
 
-## Quickstart (copy/paste)
+For current user-facing integrations and packaging, continue from the gateway
+to [`helianthus-ha-integration`](https://github.com/Project-Helianthus/helianthus-ha-integration)
+and [`helianthus-ha-addon`](https://github.com/Project-Helianthus/helianthus-ha-addon).
+
+## Historical Quickstart and Validation
+
+The commands below are preserved solely to reproduce or inspect the archived
+standalone proxy. They are not supported deployment instructions.
 
 ### 1) Clone and baseline validation
 
