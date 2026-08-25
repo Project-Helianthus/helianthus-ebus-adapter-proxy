@@ -1,29 +1,35 @@
 # AGENTS
 
-This repository is part of the **Helianthus Multi-Protocol HVAC Gateway Platform**.
+## Repository status
 
-## Dual-AI Operating Model
+**DEPRECATED — read-only historical compatibility reference.** Do not add new
+deployments, runtime features, or protocol capabilities here. Current Helianthus
+multiplexing belongs in
+[helianthus-ebusgateway/internal/adaptermux](https://github.com/Project-Helianthus/helianthus-ebusgateway/tree/main/internal/adaptermux),
+built on [helianthus-ebusgo](https://github.com/Project-Helianthus/helianthus-ebusgo)
+transports.
 
-All development follows the dual-AI orchestrator protocol defined in the workspace-root [`AGENTS.md`](../AGENTS.md):
+This repository may receive only narrowly scoped maintenance, security, or
+historical-compatibility fixes. Preserve its archived behavior unless the issue
+states a concrete compatibility or security requirement.
 
-- **Orchestrator:** Claude Code — orchestration, hard dev (complexity 7–10), angry tester, deep consultant
-- **Co-Pilot:** Codex — adversarial planning, easy dev (complexity 1–6), code review, second opinions
-- Phases: Adversarial Planning → Smart Routing → Dual Code Review
-- Hard rules: one issue/PR per repo, squash+merge only, doc-gate, transport-gate, MCP-first
+## Working rules
 
-See the root AGENTS.md for the full protocol, routing tables, system prompts, and invariants.
+1. Work from an issue-specific branch named `issue/<number>-<slug>`; keep one active issue and PR per repository.
+2. Keep each change small, reviewable, and limited to its issue acceptance criteria. Do not use this repository as a starting point for active runtime work.
+3. Do not perform deployments, live-adapter activity, credential changes, or irreversible operations without explicit operator approval at the time of action.
+4. Keep terminology inclusive and avoid unrelated rewrites.
+5. For externally visible behavior, update the public [eBUS documentation repository](https://github.com/Project-Helianthus/helianthus-docs-ebus) in the same change cycle.
+6. For transport or protocol behavior, run the full T01..T88 transport matrix and record its report. An owner-approved exception must state its reason.
+7. Address blocking review findings against the exact PR head before merge consideration. Use squash merge only when all required checks and reviews pass.
 
----
+## Validation
 
-## Repo-Specific Rules
+Run the checks applicable to the changed files. For Go or operational changes,
+the repository CI entry point is `./scripts/ci_local.sh`; it includes the
+project's formatting, terminology, build, test, lint, and applicable transport
+gates. Documentation-only changes require at least Markdown/link validation and
+`git diff --check`.
 
-These instructions apply to the entire repository.
-
-1. Keep changes targeted to the requested issue.
-2. Prefer small, composable packages under `internal/`.
-3. Always run `gofmt ./...` before finishing.
-4. Validate with `./scripts/ci_local.sh` (local CI is authoritative if GitHub Actions minutes are unavailable).
-5. React (emoji) to every review comment and reply with status when actioned.
-6. Keep repository terminology inclusive and consistent.
-7. If a change modifies externally visible behavior, update `helianthus-docs-ebus` alongside the code change (doc-gate).
-8. Transport/protocol changes require a full 88-case runtime matrix pass (`TRANSPORT_MATRIX_REPORT=<index.json>`), unless explicitly overridden by owner approval (`TRANSPORT_GATE_OWNER_OVERRIDE=OVERRIDE_TRANSPORT_GATE_BY_OWNER` with a reason).
+These instructions are self-contained: they require no workspace-root file,
+parent checkout, local path convention, or private URL.
