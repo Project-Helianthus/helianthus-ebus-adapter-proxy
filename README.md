@@ -1,6 +1,6 @@
-# helianthus-ebus-adapter-proxy
+# **DEPRECATED** — helianthus-ebus-adapter-proxy
 
-> **Deprecated — read-only historical reference.** The standalone multiplexing/proxy
+> **DEPRECATED — read-only historical reference.** The standalone multiplexing/proxy
 > function is now integrated into the eBUS runtime transport path:
 > [`helianthus-ebusgateway/internal/adaptermux`](https://github.com/Project-Helianthus/helianthus-ebusgateway/tree/main/internal/adaptermux)
 > wraps transports provided by
